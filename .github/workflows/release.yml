@@ -1,0 +1,50 @@
+name: Build & Release Windows
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      - name: Create MSIX installer
+        run: dart run msix:create
+
+      - name: Zip release folder
+        run: Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "billcat-windows.zip"
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=$($env:GITHUB_REF -replace 'refs/tags/', '')" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "BillCat ${{ steps.version.outputs.VERSION }} - Windows POS"
+          body: |
+            ## What's new
+            See commit history for changes.
+
+            ## Install
+            - **New install**: download `billcat.msix` and double-click
+            - **Existing users**: update banner will appear in the app automatically
+
+            > If Windows blocks the install: Settings → Apps → Advanced app settings → Allow apps from anywhere
+          files: |
+            build/windows/x64/runner/Release/billcat.msix
+            billcat-windows.zip
