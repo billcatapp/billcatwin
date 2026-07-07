@@ -104,6 +104,35 @@ class _BillCatAppState extends State<BillCatApp> {
           colorSchemeSeed: const Color(0xFF1A3A5F),
           useMaterial3: true,
         ),
+        // Lay the app out on a fixed-width design canvas (macOS reference
+        // window: 1512 logical px) and scale to the actual window, so the
+        // layout density matches across OS display scale factors.
+        builder: (context, child) {
+          const designWidth = 1512.0;
+          final mq = MediaQuery.of(context);
+          if (child == null ||
+              mq.size.width <= 0 ||
+              mq.size.width >= designWidth) {
+            return child ?? const SizedBox.shrink();
+          }
+          final scale = mq.size.width / designWidth;
+          final designHeight = mq.size.height / scale;
+          return MediaQuery(
+            data: mq.copyWith(size: Size(designWidth, designHeight)),
+            child: Transform.scale(
+              scale: scale,
+              alignment: Alignment.topLeft,
+              child: OverflowBox(
+                alignment: Alignment.topLeft,
+                minWidth: designWidth,
+                maxWidth: designWidth,
+                minHeight: designHeight,
+                maxHeight: designHeight,
+                child: child,
+              ),
+            ),
+          );
+        },
         home: Supabase.instance.client.auth.currentUser != null
             ? const BillingScreen()
             : const LoginScreen(),

@@ -1346,7 +1346,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
   Widget _buildCustomerBar(CartProvider cart) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
       decoration: const BoxDecoration(
         border: Border(bottom: BorderSide(color: AppColors.border)),
       ),
@@ -1669,7 +1669,7 @@ class _BillingScreenState extends State<BillingScreen> {
           // Table header
           Container(
             padding: const EdgeInsets.symmetric(
-                horizontal: 24, vertical: 12),
+                horizontal: 20, vertical: 12),
             color: AppColors.surfaceVariant,
             child: Row(
               children: [
@@ -10426,9 +10426,8 @@ class _CartRowState extends State<_CartRow> {
               ],
             ),
           ),
-          const SizedBox(width: 8),
           SizedBox(
-            width: 82,
+            width: 90,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
@@ -10439,10 +10438,14 @@ class _CartRowState extends State<_CartRow> {
               ],
             ),
           ),
-          const SizedBox(width: 8),
-          GestureDetector(
-            onTap: () => widget.cart.removeItem(widget.item.product.id),
-            child: Icon(Icons.close_rounded, size: 18, color: AppColors.textMuted.withValues(alpha: 0.5)),
+          SizedBox(
+            width: 28,
+            child: Center(
+              child: GestureDetector(
+                onTap: () => widget.cart.removeItem(widget.item.product.id),
+                child: Icon(Icons.close_rounded, size: 18, color: AppColors.textMuted.withValues(alpha: 0.5)),
+              ),
+            ),
           ),
         ],
       ),
