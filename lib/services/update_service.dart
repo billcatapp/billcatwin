@@ -11,8 +11,11 @@ import 'package:package_info_plus/package_info_plus.dart';
 //   "mandatory": false
 // }
 class UpdateService {
+  // Windows-specific feed: the Mac app reads version.json in this bucket and
+  // both platforms consume the same download_url field, so each platform
+  // needs its own feed file.
   static const String feedUrl =
-      'https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/public/billcat-updates/version.json';
+      'https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/public/billcat-updates/version-windows.json';
 
   /// Returns an [UpdateInfo] if a newer version exists, null otherwise.
   /// Throws [UpdateCheckError] with a human-readable message on failure.
