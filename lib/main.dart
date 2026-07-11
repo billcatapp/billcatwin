@@ -119,15 +119,12 @@ class _BillCatAppState extends State<BillCatApp> {
           final designHeight = mq.size.height / scale;
           return MediaQuery(
             data: mq.copyWith(size: Size(designWidth, designHeight)),
-            child: Transform.scale(
-              scale: scale,
+            child: FittedBox(
+              fit: BoxFit.fill,
               alignment: Alignment.topLeft,
-              child: OverflowBox(
-                alignment: Alignment.topLeft,
-                minWidth: designWidth,
-                maxWidth: designWidth,
-                minHeight: designHeight,
-                maxHeight: designHeight,
+              child: SizedBox(
+                width: designWidth,
+                height: designHeight,
                 child: child,
               ),
             ),
