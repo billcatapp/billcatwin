@@ -1007,13 +1007,13 @@ class _BillingScreenState extends State<BillingScreen> {
                 _bulkPrintQtys = { for (final p in _products) p.id: p.stock > 0 ? p.stock : 1 };
                 _bulkPrintSelected = {}; // start empty — user adds via search
                 _bulkPrinters = ['System Default'];
-                Process.run('lpstat', ['-p']).then((r) {
-                  final list = <String>['System Default'];
-                  for (final line in r.stdout.toString().split('\n')) {
-                    if (line.startsWith('printer ')) { final n = line.split(' ')[1]; if (n.isNotEmpty) list.add(n); }
-                  }
+                Printing.listPrinters().then((printers) {
+                  final list = <String>[
+                    'System Default',
+                    ...printers.map((p) => p.name),
+                  ];
                   if (mounted) setState(() => _bulkPrinters = list);
-                });
+                }).catchError((_) {});
                 _showBulkPrintDialog();
               },
               child: Container(
@@ -6368,26 +6368,39 @@ end tell
                 Expanded(child: ElevatedButton.icon(
                   onPressed: () async {
                     Navigator.pop(ctx);
-                    final tmp = await Directory.systemTemp.createTemp('billcat_bulk_');
-                    final pdfFile = File('${tmp.path}/Barcodes.pdf');
-                    await pdfFile.writeAsBytes(bytes);
-                    final sheetW = marginMm * 2 + labelsPerRow * labelW + (labelsPerRow - 1) * gapMm;
-                    final sheetH = labelH;
                     final targetPrinter = (printerName != null && printerName != 'System Default') ? printerName : null;
-                    if (targetPrinter != null) {
-                      final wPt = (sheetW / 25.4 * 72).round();
-                      final hPt = (sheetH / 25.4 * 72).round();
-                      final result = await Process.run('lpr', ['-P', targetPrinter, '-o', 'fit-to-page=false', '-o', 'media=Custom.${wPt}x$hPt', '-o', 'scaling=100', pdfFile.path]);
-                      if (result.exitCode != 0 && mounted) _showToast('Print failed: ${result.stderr}', isError: true);
-                    } else {
-                      await Process.run('osascript', ['-e',
-'tell application "Preview" to activate\n'
-'tell application "Preview" to open POSIX file "${pdfFile.path}"\n'
-'delay 1.5\n'
-'tell application "System Events" to keystroke "p" using command down',
-                      ]);
+                    try {
+                      Printer? target;
+                      final printers = await Printing.listPrinters();
+                      if (targetPrinter != null) {
+                        for (final pr in printers) {
+                          if (pr.name == targetPrinter) { target = pr; break; }
+                        }
+                      }
+                      if (target == null) {
+                        for (final pr in printers) {
+                          if (pr.isDefault) { target = pr; break; }
+                        }
+                      }
+                      if (target != null) {
+                        final ok = await Printing.directPrintPdf(
+                            printer: target,
+                            format: pageFormat,
+                            onLayout: (_) async => bytes);
+                        if (mounted) {
+                          _showToast(ok ? 'Sent to ${target.name}' : 'Print failed',
+                              isError: !ok);
+                        }
+                      } else {
+                        // No printer resolved — fall back to the system dialog
+                        await Printing.layoutPdf(
+                            format: pageFormat,
+                            onLayout: (_) async => bytes,
+                            name: 'Barcodes');
+                      }
+                    } catch (e) {
+                      if (mounted) _showToast('Print failed: $e', isError: true);
                     }
-                    if (mounted) _showToast('Sent to ${targetPrinter ?? 'printer'}');
                   },
                   icon: const Icon(Icons.print_rounded, size: 15),
                   label: Text('Print', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600)),
