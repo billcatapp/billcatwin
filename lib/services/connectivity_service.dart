@@ -84,6 +84,7 @@ class ConnectivityService extends ChangeNotifier {
           for (final p in unsyncedProducts) {
             await LocalDbService.markProductSynced(p.id);
           }
+          debugPrint('PUSH: products ok (${unsyncedProducts.length} rows)');
         } catch (e) {
           debugPrint('Product sync error: $e');
         }
@@ -133,6 +134,7 @@ class ConnectivityService extends ChangeNotifier {
           for (final c in unsyncedCustomers) {
             await LocalDbService.markCustomerSynced(c.id);
           }
+          debugPrint('PUSH: customers ok (${unsyncedCustomers.length} rows)');
         } catch (e) {
           debugPrint('Customer sync error: $e');
         }
@@ -186,7 +188,11 @@ class ConnectivityService extends ChangeNotifier {
 
   Future<void> pullFromCloud() async {
     final userId = Supabase.instance.client.auth.currentUser?.id;
-    if (userId == null) return;
+    if (userId == null) {
+      debugPrint('PULL: skipped — no logged-in user');
+      return;
+    }
+    debugPrint('PULL: starting for user $userId');
     final client = Supabase.instance.client;
     try {
       final productRows = await client
@@ -209,7 +215,10 @@ class ConnectivityService extends ChangeNotifier {
               }))
           .toList();
       await LocalDbService.insertProductsSynced(products);
-    } catch (_) {}
+      debugPrint('PULL: products ok (${products.length} rows)');
+    } catch (e) {
+      debugPrint('PULL: products FAILED: $e');
+    }
 
     try {
       final txRows = await client
@@ -236,7 +245,10 @@ class ConnectivityService extends ChangeNotifier {
           .toList();
       await LocalDbService.insertTransactionsSynced(txs);
       await LocalDbService.reconcileTransactionsWithCloud(txs.map((t) => t.id).toSet());
-    } catch (_) {}
+      debugPrint('PULL: transactions ok (${txs.length} rows)');
+    } catch (e) {
+      debugPrint('PULL: transactions FAILED: $e');
+    }
 
     try {
       final custRows = await client
@@ -253,7 +265,10 @@ class ConnectivityService extends ChangeNotifier {
               ))
           .toList();
       await LocalDbService.insertCustomersSynced(customers);
-    } catch (_) {}
+      debugPrint('PULL: customers ok (${customers.length} rows)');
+    } catch (e) {
+      debugPrint('PULL: customers FAILED: $e');
+    }
 
     try {
       final catRows = await client
@@ -262,7 +277,10 @@ class ConnectivityService extends ChangeNotifier {
           .eq('user_id', userId);
       final cats = (catRows as List).map((r) => r['name'] as String).toList();
       await LocalDbService.insertCategoriesSynced(cats);
-    } catch (_) {}
+      debugPrint('PULL: categories ok (${cats.length} rows)');
+    } catch (e) {
+      debugPrint('PULL: categories FAILED: $e');
+    }
 
     try {
       final settingsRow = await client
@@ -282,7 +300,10 @@ class ConnectivityService extends ChangeNotifier {
         );
         if (settings.isNotEmpty) await LocalDbService.saveSettings(settings);
       }
-    } catch (_) {}
+      debugPrint('PULL: settings ok');
+    } catch (e) {
+      debugPrint('PULL: settings FAILED: $e');
+    }
 
     notifyListeners();
   }

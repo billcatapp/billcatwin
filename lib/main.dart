@@ -36,7 +36,11 @@ void main() {
     }
     await ConnectivityService.instance.init();
     if (currentUser != null) {
-      ConnectivityService.instance.pullFromCloud();
+      // Pull cloud data, then push anything still unsynced locally so the
+      // two sides re-converge even if a previous push was lost cloud-side.
+      ConnectivityService.instance
+          .pullFromCloud()
+          .then((_) => ConnectivityService.instance.syncNow());
     }
     runApp(const BillCatApp());
   }, (error, _) {
