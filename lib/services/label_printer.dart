@@ -149,6 +149,25 @@ class LabelPrinter {
     return sendRaw(printerName, buf.toString());
   }
 
+  /// Whether [printerName] looks like a TSPL-compatible (TSC-engine) label
+  /// printer. Zebra (ZPL), Godex (EZPL), Dymo/Brother and office printers
+  /// speak different languages, so they take the standard driver path.
+  static bool isTsplCompatible(String printerName) {
+    final n = printerName.toLowerCase();
+    const tsplHints = [
+      'tsc', 'tt0', 'te2', 'ttp', 'tdp', 'ttc',
+      'bar code printer', 'barcode printer',
+      'xprinter', 'idprt', 'hprt', 'gainscha', 'gprinter', 'rongta',
+    ];
+    const nonTsplHints = [
+      'zebra', 'zdesigner', 'godex', 'dymo', 'brother', 'citizen',
+      'sato', 'honeywell', 'intermec', 'datamax', 'argox',
+      'hp ', 'canon', 'epson', 'microsoft', 'onenote', 'fax', 'pdf',
+    ];
+    if (nonTsplHints.any(n.contains)) return false;
+    return tsplHints.any(n.contains);
+  }
+
   /// TSPL built-in fonts are ASCII-only; map common currency symbols.
   static String _ascii(String s) {
     switch (s) {

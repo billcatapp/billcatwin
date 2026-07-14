@@ -6391,7 +6391,8 @@ end tell
                       }
                       if (target != null) {
                         bool ok;
-                        if (Platform.isWindows) {
+                        if (Platform.isWindows &&
+                            LabelPrinter.isTsplCompatible(target.name)) {
                           // Native TSPL: the app owns label size/gap/columns,
                           // no printer driver stock configuration needed.
                           final labels = <LabelData>[];
@@ -7251,7 +7252,8 @@ end tell
                       }
                       if (target != null) {
                         bool ok;
-                        if (Platform.isWindows) {
+                        if (Platform.isWindows &&
+                            LabelPrinter.isTsplCompatible(target.name)) {
                           // Native TSPL: the app owns label size/gap/columns,
                           // no printer driver stock configuration needed.
                           ok = LabelPrinter.printBarcodeLabels(
