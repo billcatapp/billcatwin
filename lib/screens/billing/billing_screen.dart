@@ -15,6 +15,7 @@ import '../../models/product.dart';
 import '../../models/transaction_record.dart';
 import '../../providers/cart_provider.dart';
 import '../../services/connectivity_service.dart';
+import '../../services/label_printer.dart';
 import '../../services/local_db_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../services/supabase_service.dart';
@@ -6389,10 +6390,31 @@ end tell
                         }
                       }
                       if (target != null) {
-                        final ok = await Printing.directPrintPdf(
-                            printer: target,
-                            format: pageFormat,
-                            onLayout: (_) async => bytes);
+                        bool ok;
+                        if (Platform.isWindows) {
+                          // Native TSPL: the app owns label size/gap/columns,
+                          // no printer driver stock configuration needed.
+                          final labels = <LabelData>[];
+                          for (final p in products) {
+                            final count = qtys[p.id] ?? 1;
+                            for (int i = 0; i < count; i++) {
+                              labels.add(LabelData(sku: p.sku, price: p.price));
+                            }
+                          }
+                          ok = LabelPrinter.printBarcodeLabels(
+                            printerName: target.name,
+                            labels: labels,
+                            labelWmm: labelW,
+                            labelHmm: labelH,
+                            perRow: labelsPerRow,
+                            currencySymbol: _currencySymbol,
+                          );
+                        } else {
+                          ok = await Printing.directPrintPdf(
+                              printer: target,
+                              format: pageFormat,
+                              onLayout: (_) async => bytes);
+                        }
                         if (mounted) {
                           _showToast(ok ? 'Sent to ${target.name}' : 'Print failed',
                               isError: !ok);
@@ -7228,10 +7250,25 @@ end tell
                         }
                       }
                       if (target != null) {
-                        final ok = await Printing.directPrintPdf(
-                            printer: target,
-                            format: sheetFormat,
-                            onLayout: (_) async => bytes);
+                        bool ok;
+                        if (Platform.isWindows) {
+                          // Native TSPL: the app owns label size/gap/columns,
+                          // no printer driver stock configuration needed.
+                          ok = LabelPrinter.printBarcodeLabels(
+                            printerName: target.name,
+                            labels: List.filled(
+                                quantity, LabelData(sku: p.sku, price: p.price)),
+                            labelWmm: labelW,
+                            labelHmm: labelH,
+                            perRow: labelsPerRow,
+                            currencySymbol: _currencySymbol,
+                          );
+                        } else {
+                          ok = await Printing.directPrintPdf(
+                              printer: target,
+                              format: sheetFormat,
+                              onLayout: (_) async => bytes);
+                        }
                         if (mounted) {
                           _showToast(ok ? 'Sent to ${target.name}' : 'Print failed',
                               isError: !ok);
