@@ -5432,28 +5432,30 @@ class _BillingScreenState extends State<BillingScreen> {
           ? 'Receipt-${tx.invoiceNumber}'
           : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
 
-      final tmp = await Directory.systemTemp.createTemp('billcat_');
-      final pdfFile = File('${tmp.path}/$receiptName.pdf');
-      await pdfFile.writeAsBytes(pdfBytes);
-      final ProcessResult result;
       if (toPrinter) {
-        // lpr sends directly to the selected printer silently — no UI opens
-        final args = <String>[];
+        // Send directly to the selected printer silently — no UI opens
+        Printer? target;
+        final printers = await Printing.listPrinters();
         if (_selectedPrinter != 'System Default' && _selectedPrinter != 'PDF Export' && _selectedPrinter.isNotEmpty) {
-          args.addAll(['-P', _selectedPrinter]);
+          for (final pr in printers) {
+            if (pr.name == _selectedPrinter) { target = pr; break; }
+          }
         }
-        args.add(pdfFile.path);
-        result = await Process.run('lpr', args);
+        if (target == null) {
+          for (final pr in printers) {
+            if (pr.isDefault) { target = pr; break; }
+          }
+        }
+        if (target != null) {
+          final ok = await Printing.directPrintPdf(
+              printer: target, onLayout: (_) async => pdfBytes, name: receiptName);
+          if (!ok && mounted) _showToast('Could not print', isError: true);
+        } else {
+          await Printing.layoutPdf(onLayout: (_) async => pdfBytes, name: receiptName);
+        }
       } else {
-        result = await Process.run('osascript', ['-e',
-  'tell application "Preview" to activate\n'
-  'tell application "Preview" to open POSIX file "${pdfFile.path}"\n'
-  'delay 1\n'
-  'tell application "System Events" to keystroke "p" using command down',
-]);
-      }
-      if (result.exitCode != 0 && mounted) {
-        _showToast('Could not print: ${result.stderr}', isError: true);
+        // Open the system print dialog with the PDF
+        await Printing.layoutPdf(onLayout: (_) async => pdfBytes, name: receiptName);
       }
     } catch (e) {
       if (mounted) _showToast('Could not open PDF: $e', isError: true);
@@ -5680,8 +5682,11 @@ class _BillingScreenState extends State<BillingScreen> {
         '$invoiceLink',
       );
       final url = 'https://web.whatsapp.com/send?phone=$normalized&text=$message';
-      // Reuse existing WhatsApp Web tab in Chrome if open, else open new tab
-      final appleScript = '''
+      if (Platform.isWindows) {
+        await Process.run('cmd', ['/c', 'start', '', url]);
+      } else {
+        // Reuse existing WhatsApp Web tab in Chrome if open, else open new tab
+        final appleScript = '''
 tell application "Google Chrome"
   set didReuse to false
   repeat with w in windows
@@ -5708,10 +5713,11 @@ tell application "Google Chrome"
   activate
 end tell
 ''';
-      final result = await Process.run('osascript', ['-e', appleScript]);
-      if (result.exitCode != 0) {
-        // Fallback if Chrome isn't running
-        await Process.run('open', [url]);
+        final result = await Process.run('osascript', ['-e', appleScript]);
+        if (result.exitCode != 0) {
+          // Fallback if Chrome isn't running
+          await Process.run('open', [url]);
+        }
       }
 
       if (mounted) _showToast('Opening WhatsApp Web...');
@@ -6889,16 +6895,16 @@ end tell
         builder: (ctx, setLocal) {
           // Load printers on first render so saved printer is pre-selected
           if (availablePrinters.length <= 1) {
-            Process.run('lpstat', ['-p']).then((r) {
-              final list = <String>['System Default'];
-              for (final line in r.stdout.toString().split('\n')) {
-                if (line.startsWith('printer ')) { final n = line.split(' ')[1]; if (n.isNotEmpty) list.add(n); }
-              }
+            Printing.listPrinters().then((printers) {
+              final list = <String>[
+                'System Default',
+                ...printers.map((p) => p.name),
+              ];
               if (ctx.mounted) setLocal(() {
                 availablePrinters = list;
                 if (list.contains(_barcodePrinter)) selectedDialogPrinter = _barcodePrinter;
               });
-            });
+            }).catchError((_) {});
           }
           return Dialog(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
@@ -7200,35 +7206,45 @@ end tell
                 Expanded(child: ElevatedButton.icon(
                   onPressed: () async {
                     Navigator.pop(ctx);
-                    final tmp = await Directory.systemTemp.createTemp('billcat_barcode_');
-                    final pdfFile = File('${tmp.path}/Barcode-${p.sku}.pdf');
-                    await pdfFile.writeAsBytes(bytes);
                     // Sheet dimensions: side margins + perRow stickers + gaps
                     const gapMm = 0.5;
                     const marginMm = 2.0;
                     final sheetW = marginMm * 2 + labelsPerRow * labelW + (labelsPerRow - 1) * gapMm;
                     final sheetH = labelH;
+                    final sheetFormat = PdfPageFormat(
+                        sheetW * PdfPageFormat.mm, sheetH * PdfPageFormat.mm);
                     final targetPrinter = (printerName != null && printerName != 'System Default') ? printerName : null;
-                    final wPt = (sheetW / 25.4 * 72).round();
-                    final hPt = (sheetH / 25.4 * 72).round();
-                    if (targetPrinter != null) {
-                      await Process.run('lpr', [
-                        '-P', targetPrinter,
-                        '-o', 'fit-to-page=false',
-                        '-o', 'media=Custom.${wPt}x$hPt',
-                        '-o', 'scaling=100',
-                        pdfFile.path,
-                      ]);
-                    } else {
-                      // No printer selected — open Preview as fallback
-                      await Process.run('osascript', ['-e',
-'tell application "Preview" to activate\n'
-'tell application "Preview" to open POSIX file "${pdfFile.path}"\n'
-'delay 1.5\n'
-'tell application "System Events" to keystroke "p" using command down',
-                      ]);
+                    try {
+                      Printer? target;
+                      final printers = await Printing.listPrinters();
+                      if (targetPrinter != null) {
+                        for (final pr in printers) {
+                          if (pr.name == targetPrinter) { target = pr; break; }
+                        }
+                      }
+                      if (target == null) {
+                        for (final pr in printers) {
+                          if (pr.isDefault) { target = pr; break; }
+                        }
+                      }
+                      if (target != null) {
+                        final ok = await Printing.directPrintPdf(
+                            printer: target,
+                            format: sheetFormat,
+                            onLayout: (_) async => bytes);
+                        if (mounted) {
+                          _showToast(ok ? 'Sent to ${target.name}' : 'Print failed',
+                              isError: !ok);
+                        }
+                      } else {
+                        await Printing.layoutPdf(
+                            format: sheetFormat,
+                            onLayout: (_) async => bytes,
+                            name: 'Barcode-${p.sku}');
+                      }
+                    } catch (e) {
+                      if (mounted) _showToast('Print failed: $e', isError: true);
                     }
-                    if (mounted) _showToast('Sent to ${targetPrinter ?? 'printer'}');
                   },
                   icon: const Icon(Icons.print_rounded, size: 15),
                   label: Text('Print', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600)),
@@ -7313,15 +7329,8 @@ end tell
     }
 
     final bytes = await doc.save();
-    final tmp = await Directory.systemTemp.createTemp('billcat_barcodes_');
-    final pdfFile = File('${tmp.path}/Barcodes.pdf');
-    await pdfFile.writeAsBytes(bytes);
-    await Process.run('osascript', ['-e',
-  'tell application "Preview" to activate\n'
-  'tell application "Preview" to open POSIX file "${pdfFile.path}"\n'
-  'delay 1\n'
-  'tell application "System Events" to keystroke "p" using command down',
-]);
+    // Open the system print dialog with the generated sheet
+    await Printing.layoutPdf(onLayout: (_) async => bytes, name: 'Barcodes');
   }
 
   void _confirmDeleteProduct(Product p) {
