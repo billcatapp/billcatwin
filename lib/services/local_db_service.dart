@@ -39,7 +39,7 @@ class LocalDbService {
     final dbPath = await _appSupportPath();
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 8,
+      version: 9,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try { await db.execute('ALTER TABLE products ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
@@ -73,6 +73,9 @@ class LocalDbService {
           try { await db.execute('ALTER TABLE transactions ADD COLUMN invoice_number TEXT'); } catch (_) {}
           try { await db.execute('ALTER TABLE customers ADD COLUMN address TEXT'); } catch (_) {}
         }
+        if (oldVersion < 9) {
+          try { await db.execute("ALTER TABLE products ADD COLUMN barcode_no TEXT NOT NULL DEFAULT ''"); } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -91,6 +94,7 @@ class LocalDbService {
         emoji TEXT NOT NULL,
         sku TEXT NOT NULL,
         stock INTEGER NOT NULL,
+        barcode_no TEXT NOT NULL DEFAULT '',
         synced INTEGER NOT NULL DEFAULT 0,
         deleted INTEGER NOT NULL DEFAULT 0
       )
@@ -269,8 +273,31 @@ class LocalDbService {
     await database.update('products', {
       'name': p.name, 'price': p.price, 'buying_price': p.buyingPrice,
       'tax_percent': p.taxPercent, 'category': p.category,
-      'emoji': p.emoji, 'sku': p.sku, 'stock': p.stock, 'synced': 0,
+      'emoji': p.emoji, 'sku': p.sku, 'stock': p.stock,
+      'barcode_no': p.barcodeNo, 'synced': 0,
     }, where: 'id = ?', whereArgs: [p.id]);
+  }
+
+  static Future<String> getNextBarcodeNo() async {
+    final database = await db;
+    final rows = await database.rawQuery(
+      "SELECT MAX(CAST(barcode_no AS INTEGER)) as m FROM products WHERE barcode_no != ''");
+    final maxVal = rows.first['m'];
+    // EAN-13: 12-digit input (200 prefix + 9-digit sequence), library adds check digit
+    final next = (maxVal == null ? 200000000000 : (maxVal as int)) + 1;
+    return next.toString().padLeft(12, '0');
+  }
+
+  static Future<void> assignMissingBarcodeNos() async {
+    final database = await db;
+    // Only assign to products with a truly empty barcode_no — never overwrite existing
+    final rows = await database.query('products',
+      columns: ['id'], where: "barcode_no = '' OR barcode_no IS NULL");
+    for (final row in rows) {
+      final next = await getNextBarcodeNo();
+      await database.update('products', {'barcode_no': next},
+        where: 'id = ?', whereArgs: [row['id']]);
+    }
   }
 
   static Future<void> deleteProduct(String id) async {

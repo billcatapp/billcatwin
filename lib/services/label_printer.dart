@@ -123,12 +123,20 @@ class LabelPrinter {
         final cellX = (col * (labelWmm + _colGapMm) * _dpmm).round();
         final cellW = (labelWmm * _dpmm).round();
         final sku = _tsplSafe(label.sku);
+        final barcodeVal =
+            _tsplSafe(label.barcode.isNotEmpty ? label.barcode : label.sku);
 
-        // Code 128 set B: 11 dots/char + start/stop overhead at narrow=2.
-        final barcodeW = ((sku.length + 2) * 11 + 13) * 2;
+        // 12-digit numeric → EAN-13 (95 modules incl. check digit the
+        // printer appends); anything else → Code 128 set B.
+        final isEan = barcodeVal.length == 12 &&
+            barcodeVal.codeUnits.every((c) => c >= 0x30 && c <= 0x39);
+        final symbology = isEan ? 'EAN13' : '128';
+        final barcodeW =
+            isEan ? 95 * 2 : ((barcodeVal.length + 2) * 11 + 13) * 2;
         final barcodeH = (labelHmm * _dpmm * 0.42).round();
         final bx = cellX + ((cellW - barcodeW) / 2).round().clamp(0, cellW);
-        buf.write('BARCODE $bx,${2 * _dpmm},"128",$barcodeH,0,0,2,2,"$sku"\r\n');
+        buf.write(
+            'BARCODE $bx,${2 * _dpmm},"$symbology",$barcodeH,0,0,2,2,"$barcodeVal"\r\n');
 
         // SKU line, centred (font 2 is 12x20 dots).
         final skuW = sku.length * 12;
@@ -190,7 +198,11 @@ class LabelPrinter {
 class LabelData {
   final String sku;
   final double price;
-  const LabelData({required this.sku, required this.price});
+
+  /// Value encoded in the barcode; falls back to [sku] when empty.
+  final String barcode;
+
+  const LabelData({required this.sku, required this.price, this.barcode = ''});
 }
 
 final class _DocInfo1 extends Struct {

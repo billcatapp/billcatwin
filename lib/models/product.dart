@@ -9,6 +9,7 @@ class Product {
   final String emoji;
   final String sku;
   final int stock;
+  final String barcodeNo;
 
   const Product({
     required this.id,
@@ -21,6 +22,7 @@ class Product {
     required this.emoji,
     required this.sku,
     required this.stock,
+    this.barcodeNo = '',
   });
 
   Map<String, dynamic> toMap() => {
@@ -34,6 +36,7 @@ class Product {
     'emoji': emoji,
     'sku': sku,
     'stock': stock,
+    'barcode_no': barcodeNo,
     'synced': 0,
   };
 
@@ -48,13 +51,15 @@ class Product {
     emoji: m['emoji'] as String,
     sku: m['sku'] as String,
     stock: m['stock'] as int,
+    barcodeNo: (m['barcode_no'] as String?) ?? '',
   );
 
-  Product copyWith({int? stock, String? description}) => Product(
+  Product copyWith({int? stock, String? description, String? barcodeNo}) => Product(
     id: id, name: name, description: description ?? this.description,
     price: price, buyingPrice: buyingPrice,
     taxPercent: taxPercent, category: category,
     emoji: emoji, sku: sku, stock: stock ?? this.stock,
+    barcodeNo: barcodeNo ?? this.barcodeNo,
   );
 }
 

@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:io';
 import 'dart:math' show max;
 import 'dart:typed_data';
@@ -31,104 +31,104 @@ import '../auth/login_screen.dart';
 const _defaultProducts = <Product>[];
 
 
-// ── Currency data ────────────────────────────────────────────────────────────
+// â”€â”€ Currency data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 typedef _Currency = ({String flag, String code, String name, String symbol});
 
 const List<_Currency> _currencies = [
-  (flag: '🇮🇳', code: 'INR', name: 'Indian Rupee',           symbol: '₹'),
-  (flag: '🇺🇸', code: 'USD', name: 'US Dollar',               symbol: '\$'),
-  (flag: '🇪🇺', code: 'EUR', name: 'Euro',                    symbol: '€'),
-  (flag: '🇬🇧', code: 'GBP', name: 'British Pound',           symbol: '£'),
-  (flag: '🇯🇵', code: 'JPY', name: 'Japanese Yen',            symbol: '¥'),
-  (flag: '🇨🇳', code: 'CNY', name: 'Chinese Yuan',            symbol: '¥'),
-  (flag: '🇦🇺', code: 'AUD', name: 'Australian Dollar',       symbol: 'A\$'),
-  (flag: '🇨🇦', code: 'CAD', name: 'Canadian Dollar',         symbol: 'C\$'),
-  (flag: '🇨🇭', code: 'CHF', name: 'Swiss Franc',             symbol: 'Fr'),
-  (flag: '🇸🇬', code: 'SGD', name: 'Singapore Dollar',        symbol: 'S\$'),
-  (flag: '🇭🇰', code: 'HKD', name: 'Hong Kong Dollar',        symbol: 'HK\$'),
-  (flag: '🇳🇿', code: 'NZD', name: 'New Zealand Dollar',      symbol: 'NZ\$'),
-  (flag: '🇰🇷', code: 'KRW', name: 'South Korean Won',        symbol: '₩'),
-  (flag: '🇳🇴', code: 'NOK', name: 'Norwegian Krone',         symbol: 'kr'),
-  (flag: '🇸🇪', code: 'SEK', name: 'Swedish Krona',           symbol: 'kr'),
-  (flag: '🇩🇰', code: 'DKK', name: 'Danish Krone',            symbol: 'kr'),
-  (flag: '🇲🇽', code: 'MXN', name: 'Mexican Peso',            symbol: 'MX\$'),
-  (flag: '🇿🇦', code: 'ZAR', name: 'South African Rand',      symbol: 'R'),
-  (flag: '🇧🇷', code: 'BRL', name: 'Brazilian Real',          symbol: 'R\$'),
-  (flag: '🇦🇪', code: 'AED', name: 'UAE Dirham',              symbol: 'د.إ'),
-  (flag: '🇸🇦', code: 'SAR', name: 'Saudi Riyal',             symbol: '﷼'),
-  (flag: '🇹🇭', code: 'THB', name: 'Thai Baht',               symbol: '฿'),
-  (flag: '🇮🇩', code: 'IDR', name: 'Indonesian Rupiah',       symbol: 'Rp'),
-  (flag: '🇲🇾', code: 'MYR', name: 'Malaysian Ringgit',       symbol: 'RM'),
-  (flag: '🇵🇭', code: 'PHP', name: 'Philippine Peso',         symbol: '₱'),
-  (flag: '🇵🇰', code: 'PKR', name: 'Pakistani Rupee',         symbol: '₨'),
-  (flag: '🇧🇩', code: 'BDT', name: 'Bangladeshi Taka',        symbol: '৳'),
-  (flag: '🇱🇰', code: 'LKR', name: 'Sri Lankan Rupee',        symbol: '₨'),
-  (flag: '🇳🇵', code: 'NPR', name: 'Nepalese Rupee',          symbol: '₨'),
-  (flag: '🇹🇷', code: 'TRY', name: 'Turkish Lira',            symbol: '₺'),
-  (flag: '🇷🇺', code: 'RUB', name: 'Russian Ruble',           symbol: '₽'),
-  (flag: '🇵🇱', code: 'PLN', name: 'Polish Zloty',            symbol: 'zł'),
-  (flag: '🇨🇿', code: 'CZK', name: 'Czech Koruna',            symbol: 'Kč'),
-  (flag: '🇭🇺', code: 'HUF', name: 'Hungarian Forint',        symbol: 'Ft'),
-  (flag: '🇷🇴', code: 'RON', name: 'Romanian Leu',            symbol: 'lei'),
-  (flag: '🇺🇦', code: 'UAH', name: 'Ukrainian Hryvnia',       symbol: '₴'),
-  (flag: '🇮🇱', code: 'ILS', name: 'Israeli New Shekel',      symbol: '₪'),
-  (flag: '🇰🇼', code: 'KWD', name: 'Kuwaiti Dinar',           symbol: 'KD'),
-  (flag: '🇧🇭', code: 'BHD', name: 'Bahraini Dinar',          symbol: 'BD'),
-  (flag: '🇶🇦', code: 'QAR', name: 'Qatari Riyal',            symbol: 'QR'),
-  (flag: '🇴🇲', code: 'OMR', name: 'Omani Rial',              symbol: 'OMR'),
-  (flag: '🇯🇴', code: 'JOD', name: 'Jordanian Dinar',         symbol: 'JD'),
-  (flag: '🇪🇬', code: 'EGP', name: 'Egyptian Pound',          symbol: 'E£'),
-  (flag: '🇳🇬', code: 'NGN', name: 'Nigerian Naira',          symbol: '₦'),
-  (flag: '🇰🇪', code: 'KES', name: 'Kenyan Shilling',         symbol: 'KSh'),
-  (flag: '🇬🇭', code: 'GHS', name: 'Ghanaian Cedi',           symbol: '₵'),
-  (flag: '🇹🇿', code: 'TZS', name: 'Tanzanian Shilling',      symbol: 'TSh'),
-  (flag: '🇺🇬', code: 'UGX', name: 'Ugandan Shilling',        symbol: 'USh'),
-  (flag: '🇪🇹', code: 'ETB', name: 'Ethiopian Birr',          symbol: 'Br'),
-  (flag: '🇦🇷', code: 'ARS', name: 'Argentine Peso',          symbol: 'AR\$'),
-  (flag: '🇨🇱', code: 'CLP', name: 'Chilean Peso',            symbol: 'CL\$'),
-  (flag: '🇨🇴', code: 'COP', name: 'Colombian Peso',          symbol: 'CO\$'),
-  (flag: '🇵🇪', code: 'PEN', name: 'Peruvian Sol',            symbol: 'S/'),
-  (flag: '🇻🇳', code: 'VND', name: 'Vietnamese Dong',         symbol: '₫'),
-  (flag: '🇹🇼', code: 'TWD', name: 'Taiwan Dollar',           symbol: 'NT\$'),
-  (flag: '🇮🇷', code: 'IRR', name: 'Iranian Rial',            symbol: '﷼'),
-  (flag: '🇲🇦', code: 'MAD', name: 'Moroccan Dirham',         symbol: 'MAD'),
-  (flag: '🇩🇿', code: 'DZD', name: 'Algerian Dinar',          symbol: 'دج'),
-  (flag: '🇹🇳', code: 'TND', name: 'Tunisian Dinar',          symbol: 'DT'),
-  (flag: '🇮🇸', code: 'ISK', name: 'Icelandic Króna',         symbol: 'kr'),
-  (flag: '🇭🇷', code: 'HRK', name: 'Croatian Kuna',           symbol: 'kn'),
-  (flag: '🇷🇸', code: 'RSD', name: 'Serbian Dinar',           symbol: 'din'),
-  (flag: '🇧🇬', code: 'BGN', name: 'Bulgarian Lev',           symbol: 'лв'),
-  (flag: '🇲🇲', code: 'MMK', name: 'Myanmar Kyat',            symbol: 'K'),
-  (flag: '🇰🇭', code: 'KHR', name: 'Cambodian Riel',          symbol: '៛'),
-  (flag: '🇱🇦', code: 'LAK', name: 'Lao Kip',                 symbol: '₭'),
-  (flag: '🇲🇳', code: 'MNT', name: 'Mongolian Tugrik',        symbol: '₮'),
-  (flag: '🇦🇲', code: 'AMD', name: 'Armenian Dram',           symbol: '֏'),
-  (flag: '🇬🇪', code: 'GEL', name: 'Georgian Lari',           symbol: '₾'),
-  (flag: '🇦🇿', code: 'AZN', name: 'Azerbaijani Manat',       symbol: '₼'),
-  (flag: '🇰🇿', code: 'KZT', name: 'Kazakhstani Tenge',       symbol: '₸'),
-  (flag: '🇺🇿', code: 'UZS', name: 'Uzbekistani Sum',         symbol: 'лв'),
-  (flag: '🇹🇲', code: 'TMT', name: 'Turkmenistani Manat',     symbol: 'T'),
-  (flag: '🇧🇾', code: 'BYN', name: 'Belarusian Ruble',        symbol: 'Br'),
-  (flag: '🇲🇩', code: 'MDL', name: 'Moldovan Leu',            symbol: 'L'),
-  (flag: '🇦🇱', code: 'ALL', name: 'Albanian Lek',            symbol: 'L'),
-  (flag: '🇲🇰', code: 'MKD', name: 'Macedonian Denar',        symbol: 'ден'),
-  (flag: '🇧🇦', code: 'BAM', name: 'Bosnia Mark',             symbol: 'KM'),
-  (flag: '🇲🇹', code: 'MTL', name: 'Maltese Lira',            symbol: 'Lm'),
-  (flag: '🇵🇦', code: 'PAB', name: 'Panamanian Balboa',       symbol: 'B/.'),
-  (flag: '🇨🇷', code: 'CRC', name: 'Costa Rican Colón',       symbol: '₡'),
-  (flag: '🇬🇹', code: 'GTQ', name: 'Guatemalan Quetzal',      symbol: 'Q'),
-  (flag: '🇧🇴', code: 'BOB', name: 'Bolivian Boliviano',      symbol: 'Bs.'),
-  (flag: '🇵🇾', code: 'PYG', name: 'Paraguayan Guaraní',      symbol: '₲'),
-  (flag: '🇺🇾', code: 'UYU', name: 'Uruguayan Peso',          symbol: 'UY\$'),
-  (flag: '🇪🇨', code: 'USD', name: 'Ecuadorian (USD)',         symbol: '\$'),
-  (flag: '🇨🇺', code: 'CUP', name: 'Cuban Peso',              symbol: '₱'),
-  (flag: '🇩🇴', code: 'DOP', name: 'Dominican Peso',          symbol: 'RD\$'),
-  (flag: '🇯🇲', code: 'JMD', name: 'Jamaican Dollar',         symbol: 'J\$'),
-  (flag: '🇹🇹', code: 'TTD', name: 'Trinidad Dollar',         symbol: 'TT\$'),
-  (flag: '🇧🇧', code: 'BBD', name: 'Barbadian Dollar',        symbol: 'Bds\$'),
-  (flag: '🇫🇯', code: 'FJD', name: 'Fijian Dollar',           symbol: 'FJ\$'),
-  (flag: '🇵🇬', code: 'PGK', name: 'Papua New Guinea Kina',   symbol: 'K'),
+  (flag: 'ðŸ‡®ðŸ‡³', code: 'INR', name: 'Indian Rupee',           symbol: 'â‚¹'),
+  (flag: 'ðŸ‡ºðŸ‡¸', code: 'USD', name: 'US Dollar',               symbol: '\$'),
+  (flag: 'ðŸ‡ªðŸ‡º', code: 'EUR', name: 'Euro',                    symbol: 'â‚¬'),
+  (flag: 'ðŸ‡¬ðŸ‡§', code: 'GBP', name: 'British Pound',           symbol: 'Â£'),
+  (flag: 'ðŸ‡¯ðŸ‡µ', code: 'JPY', name: 'Japanese Yen',            symbol: 'Â¥'),
+  (flag: 'ðŸ‡¨ðŸ‡³', code: 'CNY', name: 'Chinese Yuan',            symbol: 'Â¥'),
+  (flag: 'ðŸ‡¦ðŸ‡º', code: 'AUD', name: 'Australian Dollar',       symbol: 'A\$'),
+  (flag: 'ðŸ‡¨ðŸ‡¦', code: 'CAD', name: 'Canadian Dollar',         symbol: 'C\$'),
+  (flag: 'ðŸ‡¨ðŸ‡­', code: 'CHF', name: 'Swiss Franc',             symbol: 'Fr'),
+  (flag: 'ðŸ‡¸ðŸ‡¬', code: 'SGD', name: 'Singapore Dollar',        symbol: 'S\$'),
+  (flag: 'ðŸ‡­ðŸ‡°', code: 'HKD', name: 'Hong Kong Dollar',        symbol: 'HK\$'),
+  (flag: 'ðŸ‡³ðŸ‡¿', code: 'NZD', name: 'New Zealand Dollar',      symbol: 'NZ\$'),
+  (flag: 'ðŸ‡°ðŸ‡·', code: 'KRW', name: 'South Korean Won',        symbol: 'â‚©'),
+  (flag: 'ðŸ‡³ðŸ‡´', code: 'NOK', name: 'Norwegian Krone',         symbol: 'kr'),
+  (flag: 'ðŸ‡¸ðŸ‡ª', code: 'SEK', name: 'Swedish Krona',           symbol: 'kr'),
+  (flag: 'ðŸ‡©ðŸ‡°', code: 'DKK', name: 'Danish Krone',            symbol: 'kr'),
+  (flag: 'ðŸ‡²ðŸ‡½', code: 'MXN', name: 'Mexican Peso',            symbol: 'MX\$'),
+  (flag: 'ðŸ‡¿ðŸ‡¦', code: 'ZAR', name: 'South African Rand',      symbol: 'R'),
+  (flag: 'ðŸ‡§ðŸ‡·', code: 'BRL', name: 'Brazilian Real',          symbol: 'R\$'),
+  (flag: 'ðŸ‡¦ðŸ‡ª', code: 'AED', name: 'UAE Dirham',              symbol: 'Ø¯.Ø¥'),
+  (flag: 'ðŸ‡¸ðŸ‡¦', code: 'SAR', name: 'Saudi Riyal',             symbol: 'ï·¼'),
+  (flag: 'ðŸ‡¹ðŸ‡­', code: 'THB', name: 'Thai Baht',               symbol: 'à¸¿'),
+  (flag: 'ðŸ‡®ðŸ‡©', code: 'IDR', name: 'Indonesian Rupiah',       symbol: 'Rp'),
+  (flag: 'ðŸ‡²ðŸ‡¾', code: 'MYR', name: 'Malaysian Ringgit',       symbol: 'RM'),
+  (flag: 'ðŸ‡µðŸ‡­', code: 'PHP', name: 'Philippine Peso',         symbol: 'â‚±'),
+  (flag: 'ðŸ‡µðŸ‡°', code: 'PKR', name: 'Pakistani Rupee',         symbol: 'â‚¨'),
+  (flag: 'ðŸ‡§ðŸ‡©', code: 'BDT', name: 'Bangladeshi Taka',        symbol: 'à§³'),
+  (flag: 'ðŸ‡±ðŸ‡°', code: 'LKR', name: 'Sri Lankan Rupee',        symbol: 'â‚¨'),
+  (flag: 'ðŸ‡³ðŸ‡µ', code: 'NPR', name: 'Nepalese Rupee',          symbol: 'â‚¨'),
+  (flag: 'ðŸ‡¹ðŸ‡·', code: 'TRY', name: 'Turkish Lira',            symbol: 'â‚º'),
+  (flag: 'ðŸ‡·ðŸ‡º', code: 'RUB', name: 'Russian Ruble',           symbol: 'â‚½'),
+  (flag: 'ðŸ‡µðŸ‡±', code: 'PLN', name: 'Polish Zloty',            symbol: 'zÅ‚'),
+  (flag: 'ðŸ‡¨ðŸ‡¿', code: 'CZK', name: 'Czech Koruna',            symbol: 'KÄ'),
+  (flag: 'ðŸ‡­ðŸ‡º', code: 'HUF', name: 'Hungarian Forint',        symbol: 'Ft'),
+  (flag: 'ðŸ‡·ðŸ‡´', code: 'RON', name: 'Romanian Leu',            symbol: 'lei'),
+  (flag: 'ðŸ‡ºðŸ‡¦', code: 'UAH', name: 'Ukrainian Hryvnia',       symbol: 'â‚´'),
+  (flag: 'ðŸ‡®ðŸ‡±', code: 'ILS', name: 'Israeli New Shekel',      symbol: 'â‚ª'),
+  (flag: 'ðŸ‡°ðŸ‡¼', code: 'KWD', name: 'Kuwaiti Dinar',           symbol: 'KD'),
+  (flag: 'ðŸ‡§ðŸ‡­', code: 'BHD', name: 'Bahraini Dinar',          symbol: 'BD'),
+  (flag: 'ðŸ‡¶ðŸ‡¦', code: 'QAR', name: 'Qatari Riyal',            symbol: 'QR'),
+  (flag: 'ðŸ‡´ðŸ‡²', code: 'OMR', name: 'Omani Rial',              symbol: 'OMR'),
+  (flag: 'ðŸ‡¯ðŸ‡´', code: 'JOD', name: 'Jordanian Dinar',         symbol: 'JD'),
+  (flag: 'ðŸ‡ªðŸ‡¬', code: 'EGP', name: 'Egyptian Pound',          symbol: 'EÂ£'),
+  (flag: 'ðŸ‡³ðŸ‡¬', code: 'NGN', name: 'Nigerian Naira',          symbol: 'â‚¦'),
+  (flag: 'ðŸ‡°ðŸ‡ª', code: 'KES', name: 'Kenyan Shilling',         symbol: 'KSh'),
+  (flag: 'ðŸ‡¬ðŸ‡­', code: 'GHS', name: 'Ghanaian Cedi',           symbol: 'â‚µ'),
+  (flag: 'ðŸ‡¹ðŸ‡¿', code: 'TZS', name: 'Tanzanian Shilling',      symbol: 'TSh'),
+  (flag: 'ðŸ‡ºðŸ‡¬', code: 'UGX', name: 'Ugandan Shilling',        symbol: 'USh'),
+  (flag: 'ðŸ‡ªðŸ‡¹', code: 'ETB', name: 'Ethiopian Birr',          symbol: 'Br'),
+  (flag: 'ðŸ‡¦ðŸ‡·', code: 'ARS', name: 'Argentine Peso',          symbol: 'AR\$'),
+  (flag: 'ðŸ‡¨ðŸ‡±', code: 'CLP', name: 'Chilean Peso',            symbol: 'CL\$'),
+  (flag: 'ðŸ‡¨ðŸ‡´', code: 'COP', name: 'Colombian Peso',          symbol: 'CO\$'),
+  (flag: 'ðŸ‡µðŸ‡ª', code: 'PEN', name: 'Peruvian Sol',            symbol: 'S/'),
+  (flag: 'ðŸ‡»ðŸ‡³', code: 'VND', name: 'Vietnamese Dong',         symbol: 'â‚«'),
+  (flag: 'ðŸ‡¹ðŸ‡¼', code: 'TWD', name: 'Taiwan Dollar',           symbol: 'NT\$'),
+  (flag: 'ðŸ‡®ðŸ‡·', code: 'IRR', name: 'Iranian Rial',            symbol: 'ï·¼'),
+  (flag: 'ðŸ‡²ðŸ‡¦', code: 'MAD', name: 'Moroccan Dirham',         symbol: 'MAD'),
+  (flag: 'ðŸ‡©ðŸ‡¿', code: 'DZD', name: 'Algerian Dinar',          symbol: 'Ø¯Ø¬'),
+  (flag: 'ðŸ‡¹ðŸ‡³', code: 'TND', name: 'Tunisian Dinar',          symbol: 'DT'),
+  (flag: 'ðŸ‡®ðŸ‡¸', code: 'ISK', name: 'Icelandic KrÃ³na',         symbol: 'kr'),
+  (flag: 'ðŸ‡­ðŸ‡·', code: 'HRK', name: 'Croatian Kuna',           symbol: 'kn'),
+  (flag: 'ðŸ‡·ðŸ‡¸', code: 'RSD', name: 'Serbian Dinar',           symbol: 'din'),
+  (flag: 'ðŸ‡§ðŸ‡¬', code: 'BGN', name: 'Bulgarian Lev',           symbol: 'Ð»Ð²'),
+  (flag: 'ðŸ‡²ðŸ‡²', code: 'MMK', name: 'Myanmar Kyat',            symbol: 'K'),
+  (flag: 'ðŸ‡°ðŸ‡­', code: 'KHR', name: 'Cambodian Riel',          symbol: 'áŸ›'),
+  (flag: 'ðŸ‡±ðŸ‡¦', code: 'LAK', name: 'Lao Kip',                 symbol: 'â‚­'),
+  (flag: 'ðŸ‡²ðŸ‡³', code: 'MNT', name: 'Mongolian Tugrik',        symbol: 'â‚®'),
+  (flag: 'ðŸ‡¦ðŸ‡²', code: 'AMD', name: 'Armenian Dram',           symbol: 'Ö'),
+  (flag: 'ðŸ‡¬ðŸ‡ª', code: 'GEL', name: 'Georgian Lari',           symbol: 'â‚¾'),
+  (flag: 'ðŸ‡¦ðŸ‡¿', code: 'AZN', name: 'Azerbaijani Manat',       symbol: 'â‚¼'),
+  (flag: 'ðŸ‡°ðŸ‡¿', code: 'KZT', name: 'Kazakhstani Tenge',       symbol: 'â‚¸'),
+  (flag: 'ðŸ‡ºðŸ‡¿', code: 'UZS', name: 'Uzbekistani Sum',         symbol: 'Ð»Ð²'),
+  (flag: 'ðŸ‡¹ðŸ‡²', code: 'TMT', name: 'Turkmenistani Manat',     symbol: 'T'),
+  (flag: 'ðŸ‡§ðŸ‡¾', code: 'BYN', name: 'Belarusian Ruble',        symbol: 'Br'),
+  (flag: 'ðŸ‡²ðŸ‡©', code: 'MDL', name: 'Moldovan Leu',            symbol: 'L'),
+  (flag: 'ðŸ‡¦ðŸ‡±', code: 'ALL', name: 'Albanian Lek',            symbol: 'L'),
+  (flag: 'ðŸ‡²ðŸ‡°', code: 'MKD', name: 'Macedonian Denar',        symbol: 'Ð´ÐµÐ½'),
+  (flag: 'ðŸ‡§ðŸ‡¦', code: 'BAM', name: 'Bosnia Mark',             symbol: 'KM'),
+  (flag: 'ðŸ‡²ðŸ‡¹', code: 'MTL', name: 'Maltese Lira',            symbol: 'Lm'),
+  (flag: 'ðŸ‡µðŸ‡¦', code: 'PAB', name: 'Panamanian Balboa',       symbol: 'B/.'),
+  (flag: 'ðŸ‡¨ðŸ‡·', code: 'CRC', name: 'Costa Rican ColÃ³n',       symbol: 'â‚¡'),
+  (flag: 'ðŸ‡¬ðŸ‡¹', code: 'GTQ', name: 'Guatemalan Quetzal',      symbol: 'Q'),
+  (flag: 'ðŸ‡§ðŸ‡´', code: 'BOB', name: 'Bolivian Boliviano',      symbol: 'Bs.'),
+  (flag: 'ðŸ‡µðŸ‡¾', code: 'PYG', name: 'Paraguayan GuaranÃ­',      symbol: 'â‚²'),
+  (flag: 'ðŸ‡ºðŸ‡¾', code: 'UYU', name: 'Uruguayan Peso',          symbol: 'UY\$'),
+  (flag: 'ðŸ‡ªðŸ‡¨', code: 'USD', name: 'Ecuadorian (USD)',         symbol: '\$'),
+  (flag: 'ðŸ‡¨ðŸ‡º', code: 'CUP', name: 'Cuban Peso',              symbol: 'â‚±'),
+  (flag: 'ðŸ‡©ðŸ‡´', code: 'DOP', name: 'Dominican Peso',          symbol: 'RD\$'),
+  (flag: 'ðŸ‡¯ðŸ‡²', code: 'JMD', name: 'Jamaican Dollar',         symbol: 'J\$'),
+  (flag: 'ðŸ‡¹ðŸ‡¹', code: 'TTD', name: 'Trinidad Dollar',         symbol: 'TT\$'),
+  (flag: 'ðŸ‡§ðŸ‡§', code: 'BBD', name: 'Barbadian Dollar',        symbol: 'Bds\$'),
+  (flag: 'ðŸ‡«ðŸ‡¯', code: 'FJD', name: 'Fijian Dollar',           symbol: 'FJ\$'),
+  (flag: 'ðŸ‡µðŸ‡¬', code: 'PGK', name: 'Papua New Guinea Kina',   symbol: 'K'),
 ];
 
 class BillingScreen extends StatefulWidget {
@@ -227,7 +227,7 @@ class _BillingScreenState extends State<BillingScreen> {
   String _receiptFooter = 'Thank you for your purchase!';
   String _taxLabel = 'GST';
   String _taxRateDisplay = '0';
-  String _currencySymbol = '₹';
+  String _currencySymbol = 'â‚¹';
   String _currencyCode = 'INR';
   String _dialCode = '+91'; // default India
   String _invoiceLayout = 'Classic';
@@ -264,7 +264,7 @@ class _BillingScreenState extends State<BillingScreen> {
   bool _updateDismissed = false;
   bool _isCheckingUpdate = false;
   String _currentVersion = '';
-  double? _downloadProgress; // null=idle, 0–1=downloading, 1.0=done
+  double? _downloadProgress; // null=idle, 0â€“1=downloading, 1.0=done
   String _downloadedPath = '';
 
   // Owner / Staff access
@@ -288,7 +288,7 @@ class _BillingScreenState extends State<BillingScreen> {
   String _editTaxLabel = 'VAT';
   String _editTaxRate = '0';
   String _editCurrencyCode = 'INR';
-  String _editCurrencySymbol = '₹';
+  String _editCurrencySymbol = 'â‚¹';
   String _editDialCode = '+91';
   String _editPaperSize = 'A4';
   bool _editAutoPrint = false;
@@ -494,7 +494,23 @@ class _BillingScreenState extends State<BillingScreen> {
     }
   }
 
+  // Matches stored 12-digit EAN-13 against scanner output (12 or 13 digits)
+  bool _barcodeMatches(String stored, String scanned) {
+    if (stored.isEmpty) return false;
+    if (stored == scanned) return true;
+    // Scanner sends full 13-digit EAN-13 (stored is the 12-digit input)
+    if (scanned.length == 13 && scanned.startsWith(stored)) return true;
+    // Scanner configured as UPC-A: strips leading '0' from EAN-13 before sending
+    // e.g. stored=000000100009, EAN-13=0000001000092, scanner sends=000001000092
+    if (scanned.length == 12) {
+      final withLeadingZero = '0$scanned';
+      if (withLeadingZero.startsWith(stored)) return true;
+    }
+    return false;
+  }
+
   Future<void> _loadProducts() async {
+    await LocalDbService.assignMissingBarcodeNos();
     final local = await LocalDbService.getProducts();
     final savedCats = await LocalDbService.getCategories();
     if (mounted) setState(() {
@@ -516,7 +532,7 @@ class _BillingScreenState extends State<BillingScreen> {
     final today     = DateTime.now();
     final yesterday = today.subtract(const Duration(days: 1));
 
-    // Week: Mon–today
+    // Week: Monâ€“today
     final weekStart = today.subtract(Duration(days: today.weekday - 1));
     // Month: 1st of current month
     final monthStart = DateTime(today.year, today.month, 1);
@@ -573,7 +589,7 @@ class _BillingScreenState extends State<BillingScreen> {
     for (final t in monthTx) { for (final i in t.items) monthItems += i.quantity; }
     for (final t in yearTx)  { for (final i in t.items) yearItems  += i.quantity; }
 
-    // ── Profit per period ─────────────────────────────────────────────────────
+    // â”€â”€ Profit per period â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     double calcProfit(List<TransactionRecord> txs) {
       double profit = 0;
       for (final t in txs) {
@@ -589,31 +605,31 @@ class _BillingScreenState extends State<BillingScreen> {
     final profitWeek  = calcProfit(weekTx);
     final profitMonth = calcProfit(monthTx);
 
-    // ── Chart bars ────────────────────────────────────────────────────────────
+    // â”€â”€ Chart bars â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Today: 8 three-hour slots
     final tSlotLabels = ['12a','3a','6a','9a','12p','3p','6p','9p'];
     final tSlotMap = {for (final l in tSlotLabels) l: 0.0};
     for (final t in todayTx) { final l = tSlotLabels[t.createdAt.hour ~/ 3]; tSlotMap[l] = tSlotMap[l]! + t.total; }
     final chartToday = tSlotLabels.map((l) => (l, tSlotMap[l]!)).toList();
 
-    // Week: Mon–Sun
+    // Week: Monâ€“Sun
     const wLabels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
     final wMap = {for (final l in wLabels) l: 0.0};
     for (final t in weekTx) { final l = wLabels[t.createdAt.weekday - 1]; wMap[l] = wMap[l]! + t.total; }
     final chartWeek = wLabels.map((l) => (l, wMap[l]!)).toList();
 
-    // Month: weeks W1–W5
+    // Month: weeks W1â€“W5
     const mLabels = ['W1','W2','W3','W4','W5'];
     final mMap = {for (final l in mLabels) l: 0.0};
     for (final t in monthTx) { final l = 'W${((t.createdAt.day - 1) ~/ 7) + 1}'; mMap[l] = (mMap[l] ?? 0) + t.total; }
     final chartMonth = mLabels.map((l) => (l, mMap[l]!)).toList();
 
-    // Year: Jan–Dec
+    // Year: Janâ€“Dec
     final yMap = {for (int i = 1; i <= 12; i++) _monthName(i): 0.0};
     for (final t in yearTx) { final l = _monthName(t.createdAt.month); yMap[l] = yMap[l]! + t.total; }
     final chartYear = List.generate(12, (i) => (_monthName(i + 1), yMap[_monthName(i + 1)]!));
 
-    // ── Top sold products ─────────────────────────────────────────────────────
+    // â”€â”€ Top sold products â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     List<(String, int, double)> _topOf(List<TransactionRecord> txs) {
       final map = <String, (int, double)>{};
       for (final t in txs) {
@@ -639,7 +655,7 @@ class _BillingScreenState extends State<BillingScreen> {
     final dashCats = sortedCats.take(5).toList().asMap().entries.map((e) =>
       (e.value.key, e.value.value, catColors[e.key % catColors.length])).toList();
 
-    // ── Payment breakdown ─────────────────────────────────────────────────────
+    // â”€â”€ Payment breakdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const payColors = {
       'cash':   Color(0xFF10B981),
       'card':   Color(0xFF3B82F6),
@@ -754,9 +770,9 @@ class _BillingScreenState extends State<BillingScreen> {
                   ],
                 ),
         ),
-            // ── Top toast ──
+            // â”€â”€ Top toast â”€â”€
             _buildToast(),
-            // ── Print loading overlay ──
+            // â”€â”€ Print loading overlay â”€â”€
             if (_isPrinting)
               _buildPrintingOverlay(),
           ],
@@ -811,7 +827,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Top Toast ────────────────────────────────────────────────────────────────
+  // â”€â”€ Top Toast â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildToast() {
     return AnimatedPositioned(
@@ -864,7 +880,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Update Banner ────────────────────────────────────────────────────────────
+  // â”€â”€ Update Banner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildUpdateBanner() {
     if (_updateInfo == null || _updateDismissed) return const SizedBox.shrink();
@@ -890,7 +906,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     isDownloading
                         ? 'Installing BillCat ${info.version}...'
                         : 'BillCat ${info.version} is available'
-                            '${info.releaseNotes.isNotEmpty ? ' — ${info.releaseNotes}' : ''}',
+                            '${info.releaseNotes.isNotEmpty ? ' â€” ${info.releaseNotes}' : ''}',
                     style: GoogleFonts.manrope(
                         color: Colors.white,
                         fontSize: 13,
@@ -962,7 +978,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Top Bar ─────────────────────────────────────────────────────────────────
+  // â”€â”€ Top Bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildTopBar() {
     return Container(
@@ -1006,7 +1022,7 @@ class _BillingScreenState extends State<BillingScreen> {
             GestureDetector(
               onTap: () {
                 _bulkPrintQtys = { for (final p in _products) p.id: p.stock > 0 ? p.stock : 1 };
-                _bulkPrintSelected = {}; // start empty — user adds via search
+                _bulkPrintSelected = {}; // start empty â€” user adds via search
                 _bulkPrinters = ['System Default'];
                 Printing.listPrinters().then((printers) {
                   final list = <String>[
@@ -1146,7 +1162,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Left Panel ───────────────────────────────────────────────────────────────
+  // â”€â”€ Left Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildLeftPanel() {
     return Expanded(
@@ -1183,11 +1199,11 @@ class _BillingScreenState extends State<BillingScreen> {
                       autofocus: true,
                       onChanged: (v) {
                         setState(() => _searchQuery = v);
-                        // Auto-add on exact SKU match (barcode scanner hit)
+                        // Auto-add on exact barcode/SKU match (barcode scanner hit)
                         final query = v.trim();
                         if (query.isNotEmpty) {
                           final match = _products.cast<Product?>().firstWhere(
-                            (p) => p!.sku.toLowerCase() == query.toLowerCase(), orElse: () => null);
+                            (p) => _barcodeMatches(p!.barcodeNo, query) || p.sku.toLowerCase() == query.toLowerCase(), orElse: () => null);
                           if (match != null) {
                             context.read<CartProvider>().addProduct(match);
                             setState(() { _searchQuery = ''; _searchController.clear(); });
@@ -1202,8 +1218,10 @@ class _BillingScreenState extends State<BillingScreen> {
                           _searchFocus.requestFocus();
                           return;
                         }
-                        // Exact SKU match first, then exact name, then partial SKU
+                        // Barcode no match first, then SKU, then name, then partial SKU
                         Product? match = _products.cast<Product?>().firstWhere(
+                          (p) => _barcodeMatches(p!.barcodeNo, query), orElse: () => null);
+                        match ??= _products.cast<Product?>().firstWhere(
                           (p) => p!.sku.toLowerCase() == query.toLowerCase(), orElse: () => null);
                         match ??= _products.cast<Product?>().firstWhere(
                           (p) => p!.name.toLowerCase() == query.toLowerCase(), orElse: () => null);
@@ -1304,7 +1322,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Right Panel ──────────────────────────────────────────────────────────────
+  // â”€â”€ Right Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildResizeDivider() {
     return GestureDetector(
@@ -1436,7 +1454,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   (phone.isNotEmpty && (c.phone ?? '') == phone));
 
                 if (isSaved) {
-                  // saved customer → subtle clear-customer button
+                  // saved customer â†’ subtle clear-customer button
                   return Tooltip(
                     message: 'Clear customer',
                     child: GestureDetector(
@@ -1459,7 +1477,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     ),
                   );
                 } else {
-                  // new customer → dark add-person button that saves directly
+                  // new customer â†’ dark add-person button that saves directly
                   return GestureDetector(
                     onTap: () async {
                       if (name.isEmpty) return;
@@ -1783,7 +1801,7 @@ class _BillingScreenState extends State<BillingScreen> {
         cart.addProduct(Product(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
           name: name, price: price,
-          category: 'Custom', emoji: '📦', sku: 'CUSTOM', stock: 99,
+          category: 'Custom', emoji: 'ðŸ“¦', sku: 'CUSTOM', stock: 99,
         ));
         setState(() => _addingCustomProduct = false);
       }
@@ -1798,7 +1816,7 @@ class _BillingScreenState extends State<BillingScreen> {
         borderRadius: BorderRadius.circular(10),
       ),
       child: Row(children: [
-        const Text('📦', style: TextStyle(fontSize: 18)),
+        const Text('ðŸ“¦', style: TextStyle(fontSize: 18)),
         const SizedBox(width: 10),
         Expanded(
           flex: 5,
@@ -2114,7 +2132,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Bottom Bar ───────────────────────────────────────────────────────────────
+  // â”€â”€ Bottom Bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildBottomBar() {
     return Container(
@@ -2135,7 +2153,7 @@ class _BillingScreenState extends State<BillingScreen> {
           _bottomBarBtn(Icons.receipt_outlined, 'LAST RECEIPT'),
           const Spacer(),
           Text(
-              'POS T-01  •  SESSION: ${TimeOfDay.now().format(context)}  •  ${_sessionUserLabel()}',
+              'POS T-01  â€¢  SESSION: ${TimeOfDay.now().format(context)}  â€¢  ${_sessionUserLabel()}',
               style: GoogleFonts.inter(
                   fontSize: 10,
                   fontWeight: FontWeight.w300,
@@ -2175,7 +2193,7 @@ class _BillingScreenState extends State<BillingScreen> {
     return local.toUpperCase();
   }
 
-  // ── Top bar helper ───────────────────────────────────────────────────────────
+  // â”€â”€ Top bar helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _topBarIconBtn(IconData icon, String tooltip, VoidCallback onTap) {
     return Tooltip(
@@ -2196,7 +2214,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Profile menu ─────────────────────────────────────────────────────────────
+  // â”€â”€ Profile menu â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildProfileMenu() {
     final user = SupabaseService.currentUser;
@@ -2213,7 +2231,7 @@ class _BillingScreenState extends State<BillingScreen> {
         if (value == 'profile') _showProfileDialog(email);
       },
       itemBuilder: (_) => [
-        // Header — non-interactive user info
+        // Header â€” non-interactive user info
         PopupMenuItem<String>(
           enabled: false,
           padding: EdgeInsets.zero,
@@ -2363,7 +2381,7 @@ class _BillingScreenState extends State<BillingScreen> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // ── Header ──
+                // â”€â”€ Header â”€â”€
                 Container(
                   padding: const EdgeInsets.fromLTRB(20, 20, 20, 18),
                   color: AppColors.primary,
@@ -2476,7 +2494,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                 ),
 
-                // ── Scrollable fields ──
+                // â”€â”€ Scrollable fields â”€â”€
                 Flexible(
                   child: SingleChildScrollView(
                     padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
@@ -2520,7 +2538,7 @@ class _BillingScreenState extends State<BillingScreen> {
                         _settingsCard([
                           Builder(builder: (_) {
                             final rawUid = Supabase.instance.client.auth.currentUser?.id ?? '';
-                            final shortId = rawUid.isEmpty ? '—' : rawUid.replaceAll('-', '').substring(0, rawUid.length >= 6 ? 6 : rawUid.length).toUpperCase();
+                            final shortId = rawUid.isEmpty ? 'â€”' : rawUid.replaceAll('-', '').substring(0, rawUid.length >= 6 ? 6 : rawUid.length).toUpperCase();
                             return Container(
                               constraints: const BoxConstraints(minHeight: 46),
                               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -2560,7 +2578,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                 ),
 
-                // ── Footer ──
+                // â”€â”€ Footer â”€â”€
                 Container(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
                   decoration: const BoxDecoration(
@@ -2643,7 +2661,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 fontSize: 18, fontWeight: FontWeight.w800, color: Colors.white)),
       );
 
-  // ── Settings panel (Apple-style) ─────────────────────────────────────────────
+  // â”€â”€ Settings panel (Apple-style) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _openSettings() {
     setState(() {
@@ -2747,7 +2765,7 @@ class _BillingScreenState extends State<BillingScreen> {
       color: const Color(0xFFF2F2F7),
       child: Column(
         children: [
-          // ── header bar ──
+          // â”€â”€ header bar â”€â”€
           Container(
             height: 64,
             decoration: const BoxDecoration(
@@ -2790,7 +2808,7 @@ class _BillingScreenState extends State<BillingScreen> {
               ],
             ),
           ),
-          // ── body: sidebar + content ──
+          // â”€â”€ body: sidebar + content â”€â”€
           Expanded(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2874,7 +2892,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Store ──
+  // â”€â”€ Store â”€â”€
   Widget _buildSettingsStore() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2974,13 +2992,13 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   static const _dialCodes = [
-    ('+91', '🇮🇳', 'India'), ('+1', '🇺🇸', 'United States'), ('+44', '🇬🇧', 'United Kingdom'),
-    ('+971', '🇦🇪', 'UAE'), ('+966', '🇸🇦', 'Saudi Arabia'), ('+65', '🇸🇬', 'Singapore'),
-    ('+60', '🇲🇾', 'Malaysia'), ('+92', '🇵🇰', 'Pakistan'), ('+880', '🇧🇩', 'Bangladesh'),
-    ('+94', '🇱🇰', 'Sri Lanka'), ('+977', '🇳🇵', 'Nepal'), ('+61', '🇦🇺', 'Australia'),
-    ('+49', '🇩🇪', 'Germany'), ('+33', '🇫🇷', 'France'), ('+81', '🇯🇵', 'Japan'),
-    ('+86', '🇨🇳', 'China'), ('+55', '🇧🇷', 'Brazil'), ('+27', '🇿🇦', 'South Africa'),
-    ('+234', '🇳🇬', 'Nigeria'), ('+254', '🇰🇪', 'Kenya'),
+    ('+91', 'ðŸ‡®ðŸ‡³', 'India'), ('+1', 'ðŸ‡ºðŸ‡¸', 'United States'), ('+44', 'ðŸ‡¬ðŸ‡§', 'United Kingdom'),
+    ('+971', 'ðŸ‡¦ðŸ‡ª', 'UAE'), ('+966', 'ðŸ‡¸ðŸ‡¦', 'Saudi Arabia'), ('+65', 'ðŸ‡¸ðŸ‡¬', 'Singapore'),
+    ('+60', 'ðŸ‡²ðŸ‡¾', 'Malaysia'), ('+92', 'ðŸ‡µðŸ‡°', 'Pakistan'), ('+880', 'ðŸ‡§ðŸ‡©', 'Bangladesh'),
+    ('+94', 'ðŸ‡±ðŸ‡°', 'Sri Lanka'), ('+977', 'ðŸ‡³ðŸ‡µ', 'Nepal'), ('+61', 'ðŸ‡¦ðŸ‡º', 'Australia'),
+    ('+49', 'ðŸ‡©ðŸ‡ª', 'Germany'), ('+33', 'ðŸ‡«ðŸ‡·', 'France'), ('+81', 'ðŸ‡¯ðŸ‡µ', 'Japan'),
+    ('+86', 'ðŸ‡¨ðŸ‡³', 'China'), ('+55', 'ðŸ‡§ðŸ‡·', 'Brazil'), ('+27', 'ðŸ‡¿ðŸ‡¦', 'South Africa'),
+    ('+234', 'ðŸ‡³ðŸ‡¬', 'Nigeria'), ('+254', 'ðŸ‡°ðŸ‡ª', 'Kenya'),
   ];
 
   Future<String?> _showDialCodePicker(BuildContext context, String current) async {
@@ -3007,7 +3025,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Tax ──
+  // â”€â”€ Tax â”€â”€
   Widget _buildSettingsTax() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -3026,7 +3044,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Receipt ──
+  // â”€â”€ Receipt â”€â”€
   Widget _buildSettingsReceipt() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -3041,12 +3059,12 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Printer ──
+  // â”€â”€ Printer â”€â”€
   Widget _buildSettingsPrinter() {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // ── Left: settings column ──────────────────────────────────────
+        // â”€â”€ Left: settings column â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         SizedBox(
           width: 420,
           child: SingleChildScrollView(
@@ -3273,7 +3291,7 @@ class _BillingScreenState extends State<BillingScreen> {
         // Vertical divider
         Container(width: 1, color: const Color(0xFFD8D8DC)),
 
-        // ── Right: live preview ────────────────────────────────────────
+        // â”€â”€ Right: live preview â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         Expanded(
           child: Container(
             color: const Color(0xFFE8E8ED),
@@ -3303,7 +3321,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   ]),
                 ),
                 Container(height: 1, color: const Color(0xFFD8D8DC)),
-                // Preview body — renders the actual PDF bytes
+                // Preview body â€” renders the actual PDF bytes
                 Expanded(
                   child: PdfPreview(
                     key: ValueKey(_previewRevision),
@@ -3392,7 +3410,7 @@ class _BillingScreenState extends State<BillingScreen> {
           const SizedBox(width: 3),
           Column(mainAxisSize: MainAxisSize.min, children: [line(18, 1.5), gap, line(18, 1.5), gap, line(18, 1.5), gap, line(12, 3)]),
         ]);
-      // ── Thermal ───────────────────────────────────────────────────────────
+      // â”€â”€ Thermal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case 'Theme 1':
         return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.center, children: [
           line(22, 2.5), gap, line(28, 1), gap, line(28, 1), gap, line(28, 1), gap, line(16, 2.5),
@@ -3919,7 +3937,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     Container(
                       decoration: BoxDecoration(border: Border(bottom: BorderSide(color: cBorder))),
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-                      child: Text('—', style: TextStyle(fontSize: fs - 1, color: c55)),
+                      child: Text('â€”', style: TextStyle(fontSize: fs - 1, color: c55)),
                     ),
                     // Items header
                     Container(color: cGrey,
@@ -3932,7 +3950,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       ])),
                     Container(height: 0.5, color: cBorder),
                     // Sample rows
-                    for (final row in [('1','Sample Product A','—','2','₹250','₹0','₹0','₹500'), ('2','Sample Product B','—','1','₹180','₹0','₹0','₹180')])
+                    for (final row in [('1','Sample Product A','â€”','2','â‚¹250','â‚¹0','â‚¹0','â‚¹500'), ('2','Sample Product B','â€”','1','â‚¹180','â‚¹0','â‚¹0','â‚¹180')])
                       Column(children: [
                         Row(children: [
                           SizedBox(width: 14, child: cell(row.$1, a: TextAlign.center)),
@@ -3954,9 +3972,9 @@ class _BillingScreenState extends State<BillingScreen> {
                         const SizedBox(width: 38),
                         SizedBox(width: 28, child: cell('3', bold: true, a: TextAlign.center)),
                         const SizedBox(width: 38),
-                        SizedBox(width: 36, child: cell('₹0', bold: true, a: TextAlign.right)),
-                        SizedBox(width: 34, child: cell('₹0', bold: true, a: TextAlign.right)),
-                        SizedBox(width: 36, child: cell('₹680', bold: true, a: TextAlign.right)),
+                        SizedBox(width: 36, child: cell('â‚¹0', bold: true, a: TextAlign.right)),
+                        SizedBox(width: 34, child: cell('â‚¹0', bold: true, a: TextAlign.right)),
+                        SizedBox(width: 36, child: cell('â‚¹680', bold: true, a: TextAlign.right)),
                       ])),
                     Container(height: 0.5, color: cBorder),
                     // Tax Summary | Totals
@@ -3994,23 +4012,23 @@ class _BillingScreenState extends State<BillingScreen> {
                           Container(height: 0.5, color: cBorder),
                           // Data row
                           Row(children: [
-                            SizedBox(width: 28, child: cell('—', a: TextAlign.center, size: fs - 2.5)),
+                            SizedBox(width: 28, child: cell('â€”', a: TextAlign.center, size: fs - 2.5)),
                             Container(width: 0.5, color: cBorder),
-                            SizedBox(width: 38, child: cell('₹680', a: TextAlign.right, size: fs - 2.5)),
+                            SizedBox(width: 38, child: cell('â‚¹680', a: TextAlign.right, size: fs - 2.5)),
                             Container(width: 0.5, color: cBorder),
                             Expanded(child: Row(children: [
                               Expanded(child: cell('${_editTaxRate}%', a: TextAlign.right, size: fs - 2.5)),
                               Container(width: 0.5, color: cBorder),
-                              Expanded(child: cell('₹0', a: TextAlign.right, size: fs - 2.5)),
+                              Expanded(child: cell('â‚¹0', a: TextAlign.right, size: fs - 2.5)),
                             ])),
                             Container(width: 0.5, color: cBorder),
                             Expanded(child: Row(children: [
                               Expanded(child: cell('${_editTaxRate}%', a: TextAlign.right, size: fs - 2.5)),
                               Container(width: 0.5, color: cBorder),
-                              Expanded(child: cell('₹0', a: TextAlign.right, size: fs - 2.5)),
+                              Expanded(child: cell('â‚¹0', a: TextAlign.right, size: fs - 2.5)),
                             ])),
                             Container(width: 0.5, color: cBorder),
-                            SizedBox(width: 32, child: cell('₹0', a: TextAlign.right, size: fs - 2.5)),
+                            SizedBox(width: 32, child: cell('â‚¹0', a: TextAlign.right, size: fs - 2.5)),
                           ]),
                           Container(height: 0.5, color: cBorder),
                           // Payment mode
@@ -4025,16 +4043,16 @@ class _BillingScreenState extends State<BillingScreen> {
                         Expanded(flex: 45, child: Padding(
                           padding: const EdgeInsets.all(6),
                           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                            totLine('Sub Total', '₹680.00'),
-                            totLine('Tax ($_editTaxRate%)', '₹0.00'),
+                            totLine('Sub Total', 'â‚¹680.00'),
+                            totLine('Tax ($_editTaxRate%)', 'â‚¹0.00'),
                             Container(height: 0.5, color: cBorder, margin: const EdgeInsets.symmetric(vertical: 3)),
                             totLine('Total', '$_editCurrencySymbol 680.00', bold: true),
                             const SizedBox(height: 4),
                             Text('Invoice Amount In Words:', style: TextStyle(fontSize: fs - 2, color: c55, fontWeight: FontWeight.w700)),
                             Text('Six Hundred Eighty only', style: TextStyle(fontSize: fs - 2.5, color: c88)),
                             const SizedBox(height: 3),
-                            totLine('Received', '₹680.00'),
-                            totLine('Balance', '₹0.00'),
+                            totLine('Received', 'â‚¹680.00'),
+                            totLine('Balance', 'â‚¹0.00'),
                           ]),
                         )),
                       ]),
@@ -4056,9 +4074,9 @@ class _BillingScreenState extends State<BillingScreen> {
                                 child: Center(child: Text('QR', style: TextStyle(fontSize: 7, color: c88)))),
                               const SizedBox(width: 6),
                               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                Text('Bank Name: —', style: TextStyle(fontSize: fs - 2.5, color: c55)),
-                                Text('Account No.: —', style: TextStyle(fontSize: fs - 2.5, color: c55)),
-                                Text('IFSC Code: —', style: TextStyle(fontSize: fs - 2.5, color: c55)),
+                                Text('Bank Name: â€”', style: TextStyle(fontSize: fs - 2.5, color: c55)),
+                                Text('Account No.: â€”', style: TextStyle(fontSize: fs - 2.5, color: c55)),
+                                Text('IFSC Code: â€”', style: TextStyle(fontSize: fs - 2.5, color: c55)),
                               ]),
                             ])),
                         ])),
@@ -4115,7 +4133,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Account ──
+  // â”€â”€ Account â”€â”€
   Widget _buildSettingsAccount() {
     final user = Supabase.instance.client.auth.currentUser;
     final email = user?.email ?? '';
@@ -4283,7 +4301,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 activeColor: AppColors.primary,
                 onChanged: (val) async {
                   if (val) {
-                    // Enabling — require a passcode first
+                    // Enabling â€” require a passcode first
                     if (_ownerPasscode.isEmpty) {
                       _showSetPasscodeDialog(isFirstTime: true, onSet: () async {
                         setState(() { _ownerLockEnabled = true; _isOwnerMode = true; });
@@ -4321,7 +4339,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     const SizedBox(width: 12),
                     Expanded(child: Text(_ownerPasscode.isEmpty ? 'Set Passcode' : 'Change Passcode',
                         style: GoogleFonts.inter(fontSize: 14, fontWeight: FontWeight.w500, color: const Color(0xFF1D1D1F)))),
-                    Text(_ownerPasscode.isEmpty ? 'Not set' : '••••',
+                    Text(_ownerPasscode.isEmpty ? 'Not set' : 'â€¢â€¢â€¢â€¢',
                         style: GoogleFonts.inter(fontSize: 13, color: const Color(0xFF6E6E73))),
                     const SizedBox(width: 6),
                     const Icon(Icons.chevron_right_rounded, size: 18, color: Color(0xFFAAAAAA)),
@@ -4336,7 +4354,7 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
 
-  // ── WhatsApp Settings ──
+  // â”€â”€ WhatsApp Settings â”€â”€
   Widget _buildSettingsWhatsApp() {
     final configured = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
     return Column(
@@ -4390,7 +4408,7 @@ class _BillingScreenState extends State<BillingScreen> {
             const Icon(Icons.info_outline_rounded, size: 16, color: AppColors.primary),
             const SizedBox(width: 10),
             Expanded(child: Text(
-              'Get Phone Number ID and Access Token from Meta for Developers → BillCat app → WhatsApp → API Setup.',
+              'Get Phone Number ID and Access Token from Meta for Developers â†’ BillCat app â†’ WhatsApp â†’ API Setup.',
               style: GoogleFonts.inter(fontSize: 12, color: AppColors.primary),
             )),
           ]),
@@ -4399,7 +4417,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Settings UI helpers ──
+  // â”€â”€ Settings UI helpers â”€â”€
 
   Widget _settingsPageTitle(String title, IconData icon) {
     return Row(
@@ -4504,7 +4522,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
   String _appVersion() => _currentVersion.isNotEmpty ? _currentVersion : '1.0.0';
 
-  // ── Settings dialog (legacy — kept for reference) ─────────────────────────────────────────────
+  // â”€â”€ Settings dialog (legacy â€” kept for reference) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _showSettingsDialog() {
     String storeName = _storeName;
@@ -4738,7 +4756,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Currency picker ──────────────────────────────────────────────────────────
+  // â”€â”€ Currency picker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Future<_Currency?> _showCurrencyPicker(BuildContext ctx, String currentCode) {
     String query = '';
@@ -4782,7 +4800,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       onChanged: (v) => setLocal(() => query = v),
                       style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
                       decoration: InputDecoration(
-                        hintText: 'Search currency or code…',
+                        hintText: 'Search currency or codeâ€¦',
                         hintStyle: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted, fontWeight: FontWeight.w300),
                         prefixIcon: const Icon(Icons.search_rounded, size: 18, color: AppColors.textMuted),
                         filled: true,
@@ -4847,11 +4865,11 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Printer dialog ───────────────────────────────────────────────────────────
+  // â”€â”€ Printer dialog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _showPrinterDialog() async {
     if (!mounted) return;
-    // Open dialog immediately — load printers in the background
+    // Open dialog immediately â€” load printers in the background
     List<Printer> systemPrinters = [];
 
     const paperSizes = ['A4', 'A5', '2 inch', '3 inch', '4 inch', 'Custom'];
@@ -5093,7 +5111,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Dialogs ──────────────────────────────────────────────────────────────────
+  // â”€â”€ Dialogs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _confirmLogout(BuildContext context) {
     showDialog(
@@ -5180,7 +5198,7 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  // ── Print helpers ────────────────────────────────────────────────────────────
+  // â”€â”€ Print helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   TransactionRecord _snapshotCart(CartProvider cart, {String? invoiceNumber}) => TransactionRecord(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -5434,7 +5452,7 @@ class _BillingScreenState extends State<BillingScreen> {
           : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
 
       if (toPrinter) {
-        // Send directly to the selected printer silently — no UI opens
+        // Send directly to the selected printer silently â€” no UI opens
         Printer? target;
         final printers = await Printing.listPrinters();
         if (_selectedPrinter != 'System Default' && _selectedPrinter != 'PDF Export' && _selectedPrinter.isNotEmpty) {
@@ -5679,7 +5697,7 @@ class _BillingScreenState extends State<BillingScreen> {
         'Payment Status: Paid\n\n'
         'For any queries, feel free to contact us.\n'
         'Thank you for your support!\n\n'
-        '— $_storeName\n\n'
+        'â€” $_storeName\n\n'
         '$invoiceLink',
       );
       final url = 'https://web.whatsapp.com/send?phone=$normalized&text=$message';
@@ -5766,7 +5784,7 @@ end tell
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // ── Header ──────────────────────────────────────────────
+              // â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
                 decoration: const BoxDecoration(
@@ -5787,7 +5805,7 @@ end tell
                   ),
                 ]),
               ),
-              // ── Fields ───────────────────────────────────────────────
+              // â”€â”€ Fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Padding(
                 padding: const EdgeInsets.all(24),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -5829,10 +5847,10 @@ end tell
                     textInputAction: TextInputAction.done,
                     onSubmitted: (_) => doSave(ctx),
                     style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-                    decoration: _dlgInputDecor('Street, city…'),
+                    decoration: _dlgInputDecor('Street, cityâ€¦'),
                   ),
                   const SizedBox(height: 24),
-                  // ── Actions ───────────────────────────────────────────
+                  // â”€â”€ Actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                   Row(mainAxisAlignment: MainAxisAlignment.end, children: [
                     TextButton(
                       onPressed: () => Navigator.pop(ctx),
@@ -5920,7 +5938,7 @@ end tell
                   name: name,
                   price: price,
                   category: 'Custom',
-                  emoji: '📦',
+                  emoji: 'ðŸ“¦',
                   sku: 'CUSTOM',
                   stock: 99,
                 ));
@@ -5943,7 +5961,7 @@ end tell
     );
   }
 
-  // ── Bulk Barcode Print View ──────────────────────────────────────────────────
+  // â”€â”€ Bulk Barcode Print View â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _showBulkPrintDialog() {
     final labelWCtrl  = TextEditingController(text: _barcodeLabelW.toStringAsFixed(_barcodeLabelW == _barcodeLabelW.truncateToDouble() ? 0 : 1));
@@ -5979,7 +5997,7 @@ end tell
           child: SizedBox(
             width: 620,
             child: Column(mainAxisSize: MainAxisSize.min, children: [
-              // ── Header ──
+              // â”€â”€ Header â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(22, 20, 18, 16),
                 child: Row(children: [
@@ -5994,7 +6012,7 @@ end tell
                   ),
                 ]),
               ),
-              // ── Settings bar ──
+              // â”€â”€ Settings bar â”€â”€
               Container(
                 margin: const EdgeInsets.fromLTRB(16, 0, 16, 14),
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -6023,7 +6041,7 @@ end tell
                   ))),
                 ]),
               ),
-              // ── Search to add ──
+              // â”€â”€ Search to add â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
                 child: Column(children: [
@@ -6044,7 +6062,7 @@ end tell
                         style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
                         decoration: InputDecoration(
                           isDense: true, border: InputBorder.none,
-                          hintText: 'Search to add products…',
+                          hintText: 'Search to add productsâ€¦',
                           hintStyle: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
                           contentPadding: EdgeInsets.zero,
                         ),
@@ -6086,11 +6104,11 @@ end tell
                             child: Row(children: [
                               Container(width: 44, height: 20,
                                 decoration: BoxDecoration(color: const Color(0xFFF5F5F5), borderRadius: BorderRadius.circular(3)),
-                                child: CustomPaint(painter: _BarcodePainter(p.sku))),
+                                child: CustomPaint(painter: _BarcodePainter(p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku))),
                               const SizedBox(width: 10),
                               Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                                 Text(p.name, style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.textDark), maxLines: 1, overflow: TextOverflow.ellipsis),
-                                Text('${p.sku}  ·  ${p.stock} in stock', style: GoogleFonts.inter(fontSize: 10, color: AppColors.textMuted)),
+                                Text('${p.sku}  Â·  ${p.stock} in stock', style: GoogleFonts.inter(fontSize: 10, color: AppColors.textMuted)),
                               ])),
                               Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -6105,7 +6123,7 @@ end tell
                   ),
                 ]),
               ),
-              // ── Added products grid ──
+              // â”€â”€ Added products grid â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
                 child: ConstrainedBox(
@@ -6158,7 +6176,7 @@ end tell
                                 Container(
                                   width: double.infinity, height: 30,
                                   decoration: BoxDecoration(color: const Color(0xFFF5F5F5), borderRadius: BorderRadius.circular(5)),
-                                  child: CustomPaint(painter: _BarcodePainter(p.sku))),
+                                  child: CustomPaint(painter: _BarcodePainter(p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku))),
                                 const SizedBox(height: 4),
                                 Text(p.sku, style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted)),
                                 const Spacer(),
@@ -6197,7 +6215,7 @@ end tell
                 ),
               ),
               const SizedBox(height: 4),
-              // ── Footer ──
+              // â”€â”€ Footer â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
                 child: Row(children: [
@@ -6285,7 +6303,13 @@ end tell
     final allLabels = <pw.Widget>[];
     for (final p in products) {
       final count = qtys[p.id] ?? 1;
-      final svgStr = bc.Barcode.code128().toSvg(p.sku, width: 200, height: 80, drawText: false);
+      final barcodeVal = p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku;
+      String svgStr;
+      try {
+        svgStr = bc.Barcode.ean13().toSvg(barcodeVal, width: 200, height: 80, drawText: false);
+      } catch (_) {
+        svgStr = bc.Barcode.code128().toSvg(barcodeVal, width: 200, height: 80, drawText: false);
+      }
       final innerPad = 5.0 * PdfPageFormat.mm;
       pw.Widget labelCell() => pw.Container(
         width: cellW, height: cellH,
@@ -6399,7 +6423,10 @@ end tell
                           for (final p in products) {
                             final count = qtys[p.id] ?? 1;
                             for (int i = 0; i < count; i++) {
-                              labels.add(LabelData(sku: p.sku, price: p.price));
+                              labels.add(LabelData(
+                                  sku: p.sku,
+                                  price: p.price,
+                                  barcode: p.barcodeNo));
                             }
                           }
                           ok = LabelPrinter.printBarcodeLabels(
@@ -6421,7 +6448,7 @@ end tell
                               isError: !ok);
                         }
                       } else {
-                        // No printer resolved — fall back to the system dialog
+                        // No printer resolved â€” fall back to the system dialog
                         await Printing.layoutPdf(
                             format: pageFormat,
                             onLayout: (_) async => bytes,
@@ -6447,7 +6474,7 @@ end tell
     );
   }
 
-  // ── Inventory View ───────────────────────────────────────────────────────────
+  // â”€â”€ Inventory View â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildInventoryView() {
     final lowStock   = _products.where((p) => p.stock > 0 && p.stock < 10).length;
@@ -6597,7 +6624,7 @@ end tell
                 final updated = Product(id: p.id, name: p.name, price: p.price,
                     buyingPrice: p.buyingPrice, taxPercent: p.taxPercent,
                     category: '', emoji: p.emoji, sku: p.sku, stock: p.stock,
-                    description: p.description);
+                    description: p.description, barcodeNo: p.barcodeNo);
                 await LocalDbService.updateProduct(updated);
               }
               setState(() {
@@ -6608,7 +6635,7 @@ end tell
                         price: _products[i].price, buyingPrice: _products[i].buyingPrice,
                         taxPercent: _products[i].taxPercent, category: '',
                         emoji: _products[i].emoji, sku: _products[i].sku, stock: _products[i].stock,
-                        description: _products[i].description);
+                        description: _products[i].description, barcodeNo: _products[i].barcodeNo);
                   }
                 }
                 if (_inventoryCategoryFilter == category) _inventoryCategoryFilter = 'All';
@@ -6634,7 +6661,7 @@ end tell
                 final updated = Product(id: p.id, name: p.name, price: p.price,
                     buyingPrice: p.buyingPrice, taxPercent: p.taxPercent,
                     category: newName, emoji: p.emoji, sku: p.sku, stock: p.stock,
-                    description: p.description);
+                    description: p.description, barcodeNo: p.barcodeNo);
                 await LocalDbService.updateProduct(updated);
               }
               setState(() {
@@ -6646,7 +6673,7 @@ end tell
                         price: _products[i].price, buyingPrice: _products[i].buyingPrice,
                         taxPercent: _products[i].taxPercent, category: newName,
                         emoji: _products[i].emoji, sku: _products[i].sku, stock: _products[i].stock,
-                        description: _products[i].description);
+                        description: _products[i].description, barcodeNo: _products[i].barcodeNo);
                   }
                 }
                 if (_inventoryCategoryFilter == category) _inventoryCategoryFilter = newName;
@@ -6733,7 +6760,7 @@ end tell
             ? ('Low Stock', const Color(0xFFF59E0B), const Color(0xFFF59E0B).withValues(alpha: 0.08))
             : ('In Stock', AppColors.success, AppColors.success.withValues(alpha: 0.08));
     final topRank = _topProductsToday.indexWhere((t) => t.$1 == p.name);
-    final topMedal = topRank == 0 ? '🥇' : topRank == 1 ? '🥈' : topRank == 2 ? '🥉' : null;
+    final topMedal = topRank == 0 ? 'ðŸ¥‡' : topRank == 1 ? 'ðŸ¥ˆ' : topRank == 2 ? 'ðŸ¥‰' : null;
 
     return Container(
       decoration: BoxDecoration(
@@ -6858,7 +6885,7 @@ end tell
     );
   }
 
-  // ── Edit / Delete Product ─────────────────────────────────────────────────────
+  // â”€â”€ Edit / Delete Product â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _showPrintBarcodeDialog(Product p) {
     int qty = p.stock > 0 ? p.stock : 1;
@@ -6971,7 +6998,7 @@ end tell
                         Text(p.name, maxLines: 1, overflow: TextOverflow.ellipsis,
                             style: GoogleFonts.inter(fontSize: 9, fontWeight: FontWeight.w600, color: Colors.black87)),
                         const SizedBox(height: 6),
-                        SizedBox(height: 48, width: double.infinity, child: CustomPaint(painter: _BarcodePainter(p.sku))),
+                        SizedBox(height: 48, width: double.infinity, child: CustomPaint(painter: _BarcodePainter(p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku))),
                         const SizedBox(height: 4),
                         Text(p.sku, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: Colors.black, letterSpacing: 1.5, fontFamily: 'Courier')),
                         Text('$_currencySymbol${p.price.toStringAsFixed(2)}',
@@ -7013,7 +7040,7 @@ end tell
                   Expanded(child: _field('Height (mm)', labelHCtrl)),
                 ]),
                 const SizedBox(height: 14),
-                // Printer — styled like a segmented/filled selector
+                // Printer â€” styled like a segmented/filled selector
                 Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Text('Printer', style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w500, color: AppColors.textMuted)),
                   const SizedBox(height: 5),
@@ -7118,7 +7145,13 @@ end tell
   }
 
   Future<void> _printBarcode(Product p, {int quantity = 1, double labelW = 58, double labelH = 30, int labelsPerRow = 1, String? printerName}) async {
-    final svgStr = bc.Barcode.code128().toSvg(p.sku, width: 200, height: 60, drawText: false);
+    final barcodeVal = p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku;
+    String svgStr;
+    try {
+      svgStr = bc.Barcode.ean13().toSvg(barcodeVal, width: 200, height: 60, drawText: false);
+    } catch (_) {
+      svgStr = bc.Barcode.code128().toSvg(barcodeVal, width: 200, height: 60, drawText: false);
+    }
 
     final regularData = await rootBundle.load('assets/fonts/NotoSans-Regular.ttf');
     final boldData    = await rootBundle.load('assets/fonts/NotoSans-Bold.ttf');
@@ -7259,7 +7292,11 @@ end tell
                           ok = LabelPrinter.printBarcodeLabels(
                             printerName: target.name,
                             labels: List.filled(
-                                quantity, LabelData(sku: p.sku, price: p.price)),
+                                quantity,
+                                LabelData(
+                                    sku: p.sku,
+                                    price: p.price,
+                                    barcode: p.barcodeNo)),
                             labelWmm: labelW,
                             labelHmm: labelH,
                             perRow: labelsPerRow,
@@ -7336,7 +7373,13 @@ end tell
 
     final allLabels = <pw.Widget>[];
     for (final p in products) {
-      final svgStr = bc.Barcode.code128().toSvg(p.sku, width: 200, height: 80, drawText: false);
+      final barcodeVal = p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku;
+      String svgStr;
+      try {
+        svgStr = bc.Barcode.ean13().toSvg(barcodeVal, width: 200, height: 80, drawText: false);
+      } catch (_) {
+        svgStr = bc.Barcode.code128().toSvg(barcodeVal, width: 200, height: 80, drawText: false);
+      }
       allLabels.add(pw.Container(
         width: lw, height: lh,
         padding: pw.EdgeInsets.symmetric(horizontal: 5 * PdfPageFormat.mm, vertical: 1.5 * PdfPageFormat.mm),
@@ -7608,7 +7651,7 @@ end tell
                         maxLines: 3,
                         minLines: 2,
                         style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-                        decoration: _dlgInputDecor('Optional product details, notes, specs…'),
+                        decoration: _dlgInputDecor('Optional product details, notes, specsâ€¦'),
                       ),
                     ]),
                   ),
@@ -7635,6 +7678,7 @@ end tell
                           sku: skuCtrl.text.trim().isEmpty ? p.sku : skuCtrl.text.trim(),
                           stock: int.parse(stockCtrl.text),
                           description: descriptionCtrl.text.trim(),
+                          barcodeNo: p.barcodeNo,
                         );
                         await LocalDbService.updateProduct(updated);
                         ConnectivityService.instance.syncNow();
@@ -7663,7 +7707,7 @@ end tell
     );
   }
 
-  // ── Add Product Dialog ────────────────────────────────────────────────────────
+  // â”€â”€ Add Product Dialog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   String _generateUniqueSku(String name, {String? excludeId}) {
     final words = name.trim().split(RegExp(r'\s+'));
@@ -8025,7 +8069,7 @@ end tell
                           maxLines: 3,
                           minLines: 2,
                           style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-                          decoration: _dlgInputDecor('Optional product details, notes, specs…'),
+                          decoration: _dlgInputDecor('Optional product details, notes, specsâ€¦'),
                         ),
                       ],
                     ),
@@ -8108,9 +8152,9 @@ end tell
 
   Future<String?> _pickEmoji(BuildContext ctx, String current) async {
     const emojis = [
-      '📦', '💻', '🖥️', '🖱️', '⌨️', '🎧', '🎮', '📷', '💾', '🧠',
-      '🔌', '🗂️', '⚡', '📱', '🖨️', '📡', '🔋', '💿', '📺', '🎙️',
-      '🕹️', '🔦', '🖊️', '📋', '🗃️', '🧲', '🔧', '🔩', '⚙️', '🛒',
+      'ðŸ“¦', 'ðŸ’»', 'ðŸ–¥ï¸', 'ðŸ–±ï¸', 'âŒ¨ï¸', 'ðŸŽ§', 'ðŸŽ®', 'ðŸ“·', 'ðŸ’¾', 'ðŸ§ ',
+      'ðŸ”Œ', 'ðŸ—‚ï¸', 'âš¡', 'ðŸ“±', 'ðŸ–¨ï¸', 'ðŸ“¡', 'ðŸ”‹', 'ðŸ’¿', 'ðŸ“º', 'ðŸŽ™ï¸',
+      'ðŸ•¹ï¸', 'ðŸ”¦', 'ðŸ–Šï¸', 'ðŸ“‹', 'ðŸ—ƒï¸', 'ðŸ§²', 'ðŸ”§', 'ðŸ”©', 'âš™ï¸', 'ðŸ›’',
     ];
     return showDialog<String>(
       context: ctx,
@@ -8254,7 +8298,7 @@ end tell
   Widget _buildBarChart(List<(String, double)> bars) =>
       _PremiumBarChart(bars: bars, currencySymbol: _currencySymbol);
 
-  // ── Dashboard View ───────────────────────────────────────────────────────────
+  // â”€â”€ Dashboard View â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildDashboardView() {
     // Active period data
@@ -8295,9 +8339,9 @@ end tell
       return '${pct >= 0 ? '+' : ''}$pct% vs last $label';
     }
     final pVsLabel = switch (_dashPeriod) {
-      'This Week'  => 'Mon – today',
-      'This Month' => '1–${DateTime.now().day} ${_monthName(DateTime.now().month)}',
-      'This Year'  => 'Jan–${_monthName(DateTime.now().month)} ${DateTime.now().year}',
+      'This Week'  => 'Mon â€“ today',
+      'This Month' => '1â€“${DateTime.now().day} ${_monthName(DateTime.now().month)}',
+      'This Year'  => 'Janâ€“${_monthName(DateTime.now().month)} ${DateTime.now().year}',
       _ => _dashYestSales > 0
           ? '${_dashSales >= _dashYestSales ? '+' : ''}${((_dashSales - _dashYestSales) / _dashYestSales * 100).round()}% vs yesterday'
           : _pctVs(_dashSales, _dashLastWeekSameDaySales, _dow),
@@ -8319,7 +8363,7 @@ end tell
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // ── Header ──
+          // â”€â”€ Header â”€â”€
           Row(
             children: [
               Column(
@@ -8365,7 +8409,7 @@ end tell
           ),
           const SizedBox(height: 20),
 
-          // ── Metric cards ──
+          // â”€â”€ Metric cards â”€â”€
           Row(children: [
             _metricCard('Total Sales', '$_currencySymbol${pSales.toStringAsFixed(2)}',
                 Icons.attach_money_rounded, AppColors.accent, pVsLabel,
@@ -8383,7 +8427,7 @@ end tell
           ]),
           const SizedBox(height: 16),
 
-          // ── Sales Chart ──
+          // â”€â”€ Sales Chart â”€â”€
           Container(
             padding: const EdgeInsets.fromLTRB(24, 20, 24, 16),
             decoration: BoxDecoration(
@@ -8404,7 +8448,7 @@ end tell
                           fontSize: 12, color: AppColors.textMuted)),
                 ]),
                 const SizedBox(height: 4),
-                Text('$_currencySymbol${pSales.toStringAsFixed(2)} total  •  $pTx transactions',
+                Text('$_currencySymbol${pSales.toStringAsFixed(2)} total  â€¢  $pTx transactions',
                     style: GoogleFonts.inter(
                         fontSize: 12, fontWeight: FontWeight.w300,
                         color: AppColors.textMuted)),
@@ -8417,7 +8461,7 @@ end tell
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // ── Top Sold Products ──
+              // â”€â”€ Top Sold Products â”€â”€
               Expanded(
                 flex: 4,
                 child: Container(
@@ -8545,7 +8589,7 @@ end tell
                         const Spacer(),
                         GestureDetector(
                           onTap: () => setState(() { _selectedTab = 3; _reportView = 'Sales'; }),
-                          child: Text('View all →', style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w500, color: AppColors.accentBlue)),
+                          child: Text('View all â†’', style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w500, color: AppColors.accentBlue)),
                         ),
                       ]),
                       Text('Last ${_dashRecentTx.length} bills closed today',
@@ -8688,7 +8732,7 @@ end tell
       pageFormat: PdfPageFormat.a4,
       margin: const pw.EdgeInsets.all(32),
       build: (ctx) => [
-        pw.Text('Transaction History – $periodLabel',
+        pw.Text('Transaction History â€“ $periodLabel',
             style: pw.TextStyle(font: bold, fontSize: 16)),
         pw.SizedBox(height: 12),
         pw.Table(
@@ -8713,7 +8757,7 @@ end tell
             ...rows.map((t) => pw.TableRow(children: [
               _pdfCell(t.createdAt.toString().substring(0, 16), regular),
               _pdfCell('#${t.invoiceNumber ?? t.id.substring(0, 6).toUpperCase()}', regular),
-              _pdfCell(t.customerName ?? '—', regular),
+              _pdfCell(t.customerName ?? 'â€”', regular),
               _pdfCell(t.paymentMethod, regular),
               _pdfCell('$_currencySymbol${t.total.toStringAsFixed(2)}', bold),
             ])),
@@ -8767,7 +8811,7 @@ end tell
             ...rows.asMap().entries.map((e) => pw.TableRow(children: [
               _pdfCell('${e.key + 1}', regular),
               _pdfCell(e.value.name, regular),
-              _pdfCell(e.value.phone ?? '—', regular),
+              _pdfCell(e.value.phone ?? 'â€”', regular),
               _pdfCell(e.value.createdAt.toString().substring(0, 10), regular),
             ])),
           ],
@@ -8862,7 +8906,7 @@ end tell
     return '${months[d.month - 1]} ${d.day}, ${d.year}';
   }
 
-  // ── Utilities View ────────────────────────────────────────────────────────────
+  // â”€â”€ Utilities View â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildUtilitiesView() {
     return Padding(
@@ -8909,7 +8953,7 @@ end tell
     );
   }
 
-  // ── Reports View ─────────────────────────────────────────────────────────────
+  // â”€â”€ Reports View â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Future<void> _loadReportCustomers() async {
     final customers = await LocalDbService.getCustomers();
@@ -8950,7 +8994,7 @@ end tell
     );
   }
 
-  // ── Sales sub-view ─────────────────────────────────────────────────────────
+  // â”€â”€ Sales sub-view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildSalesReport() {
     final isToday = _reportSalesPeriod == 'Today';
@@ -9080,7 +9124,7 @@ end tell
                     final t = entry.value;
                     final invoiceNo = '#${t.id.substring(0, 6).toUpperCase()}';
                     final itemCount = t.items.fold(0, (s, i) => s + i.quantity);
-                    final customer = (t.customerName?.isNotEmpty == true) ? t.customerName! : '—';
+                    final customer = (t.customerName?.isNotEmpty == true) ? t.customerName! : 'â€”';
                     final payLabel = {'cash': 'Cash', 'card': 'Card', 'upi': 'UPI/QR', 'hybrid': 'Hybrid'}[t.paymentMethod] ?? t.paymentMethod;
                     return Column(children: [
                       InkWell(
@@ -9128,14 +9172,14 @@ end tell
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // ── Header ──────────────────────────────────────────────────
+              // â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
                 child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                     Text(invoiceNo, style: GoogleFonts.manrope(fontSize: 20, fontWeight: FontWeight.w800, color: AppColors.textDark)),
                     const SizedBox(height: 4),
-                    Text('$dateStr · $timeStr', style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+                    Text('$dateStr Â· $timeStr', style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
                   ])),
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -9144,7 +9188,7 @@ end tell
                   ),
                 ]),
               ),
-              // ── Customer row ─────────────────────────────────────────────
+              // â”€â”€ Customer row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               if (t.customerName?.isNotEmpty == true)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
@@ -9161,7 +9205,7 @@ end tell
                 ),
               const SizedBox(height: 20),
               const Divider(height: 1, color: AppColors.border),
-              // ── Items ────────────────────────────────────────────────────
+              // â”€â”€ Items â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Flexible(
                 child: SingleChildScrollView(
                   child: Column(children: [
@@ -9180,7 +9224,7 @@ end tell
                       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                       child: Row(children: [
                         Expanded(flex: 5, child: Text(item.productName, style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w500, color: AppColors.textDark))),
-                        SizedBox(width: 40, child: Text('×${item.quantity}', textAlign: TextAlign.center, style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted))),
+                        SizedBox(width: 40, child: Text('Ã—${item.quantity}', textAlign: TextAlign.center, style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted))),
                         SizedBox(width: 80, child: Text('$_currencySymbol${item.price.toStringAsFixed(2)}', textAlign: TextAlign.right, style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted))),
                         SizedBox(width: 80, child: Text('$_currencySymbol${item.total.toStringAsFixed(2)}', textAlign: TextAlign.right, style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.textDark))),
                       ]),
@@ -9188,7 +9232,7 @@ end tell
                   ]),
                 ),
               ),
-              // ── Totals ───────────────────────────────────────────────────
+              // â”€â”€ Totals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Container(
                 margin: const EdgeInsets.symmetric(horizontal: 24),
                 padding: const EdgeInsets.symmetric(vertical: 14),
@@ -9204,7 +9248,7 @@ end tell
                   ]),
                 ]),
               ),
-              // ── Actions ──────────────────────────────────────────────────
+              // â”€â”€ Actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
                 child: Row(children: [
@@ -9276,7 +9320,7 @@ end tell
     _loadDashboardData();
   }
 
-  // ── Customer detail popup ─────────────────────────────────────────────────
+  // â”€â”€ Customer detail popup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _showCustomerDetail(Customer c) async {
     final txs = await LocalDbService.getTransactionsByCustomer(c.name, c.phone);
@@ -9293,7 +9337,7 @@ end tell
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // ── Header ────────────────────────────────────────────────────
+              // â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(24, 24, 24, 16),
                 child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -9328,7 +9372,7 @@ end tell
                 ]),
               ),
               const Divider(height: 1, color: AppColors.border),
-              // ── Transaction list ──────────────────────────────────────────
+              // â”€â”€ Transaction list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               if (txs.isEmpty)
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 32),
@@ -9355,7 +9399,7 @@ end tell
                               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                               child: Row(children: [
                                 Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                  Text('$dateStr · $timeStr',
+                                  Text('$dateStr Â· $timeStr',
                                       style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
                                   const SizedBox(height: 3),
                                   Text(
@@ -9386,7 +9430,7 @@ end tell
                     ),
                   ),
                 ),
-              // ── Actions ───────────────────────────────────────────────────
+              // â”€â”€ Actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
               Padding(
                 padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
                 child: Row(children: [
@@ -9462,7 +9506,7 @@ end tell
     _loadReportCustomers();
   }
 
-  // ── Owner / Staff access ──────────────────────────────────────────────────
+  // â”€â”€ Owner / Staff access â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   void _lockOwnerMode() {
     setState(() {
@@ -9602,7 +9646,7 @@ end tell
                 ['1','2','3'],
                 ['4','5','6'],
                 ['7','8','9'],
-                ['','0','⌫'],
+                ['','0','âŒ«'],
               ].map((row) => Padding(
                 padding: const EdgeInsets.only(bottom: 12),
                 child: Row(
@@ -9613,7 +9657,7 @@ end tell
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                       child: GestureDetector(
                         onTap: () {
-                          if (key == '⌫') {
+                          if (key == 'âŒ«') {
                             if (digits.value.isNotEmpty) {
                               digits.value = digits.value.substring(0, digits.value.length - 1);
                             }
@@ -9624,11 +9668,11 @@ end tell
                         child: Container(
                           width: 64, height: 56,
                           decoration: BoxDecoration(
-                            color: key == '⌫' ? Colors.transparent : const Color(0xFFF5F5F7),
+                            color: key == 'âŒ«' ? Colors.transparent : const Color(0xFFF5F5F7),
                             borderRadius: BorderRadius.circular(12),
                           ),
                           alignment: Alignment.center,
-                          child: key == '⌫'
+                          child: key == 'âŒ«'
                               ? const Icon(Icons.backspace_outlined, size: 20, color: Color(0xFF6E6E73))
                               : Text(key, style: GoogleFonts.manrope(fontSize: 22, fontWeight: FontWeight.w600, color: AppColors.textDark)),
                         ),
@@ -9657,7 +9701,7 @@ end tell
     ]),
   );
 
-  // ── Customers sub-view ─────────────────────────────────────────────────────
+  // â”€â”€ Customers sub-view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildCustomersReport() {
     final total = _reportCustomers.length;
@@ -9770,7 +9814,7 @@ end tell
                           Expanded(flex: 1, child: Text('${i + 1}', style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted))),
                           Expanded(flex: 4, child: Text(c.name, style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.textDark))),
                           Expanded(flex: 3, child: Text(
-                            c.phone?.isNotEmpty == true ? c.phone! : '—',
+                            c.phone?.isNotEmpty == true ? c.phone! : 'â€”',
                             style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted),
                           )),
                           Expanded(flex: 3, child: Row(mainAxisAlignment: MainAxisAlignment.end, children: [
@@ -9796,7 +9840,7 @@ end tell
     );
   }
 
-  // ── Inventory sub-view ─────────────────────────────────────────────────────
+  // â”€â”€ Inventory sub-view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildInventoryReport() {
     final totalProducts = _products.length;
@@ -9908,7 +9952,7 @@ end tell
     );
   }
 
-  // ── Account sub-view ───────────────────────────────────────────────────────
+  // â”€â”€ Account sub-view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
   Widget _reportPeriodBtn(String label) {
@@ -9954,7 +9998,7 @@ end tell
   }
 }
 
-// ── Product Card ─────────────────────────────────────────────────────────────
+// â”€â”€ Product Card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 String _productInitials(String name) {
   final words = name.trim().split(RegExp(r'\s+'));
@@ -10175,7 +10219,7 @@ class _ProductInitialsBox extends StatelessWidget {
   }
 }
 
-// Small (22×22) initials used in inventory list rows.
+// Small (22Ã—22) initials used in inventory list rows.
 class _SmallInitialsBox extends StatelessWidget {
   final String name;
   const _SmallInitialsBox({required this.name});
@@ -10196,7 +10240,7 @@ class _SmallInitialsBox extends StatelessWidget {
   }
 }
 
-// Medium (44×44) initials used in the product management grid.
+// Medium (44Ã—44) initials used in the product management grid.
 class _MediumInitialsBox extends StatelessWidget {
   final String name;
   final double radius;
@@ -10380,7 +10424,7 @@ class _ProductCardState extends State<_ProductCard> {
   }
 }
 
-// ── Cart Row ─────────────────────────────────────────────────────────────────
+// â”€â”€ Cart Row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class _CartRow extends StatefulWidget {
   final CartItem item;
@@ -10526,7 +10570,7 @@ class _CartRowState extends State<_CartRow> {
   }
 }
 
-// ── Discount Toggle ──────────────────────────────────────────────────────────
+// â”€â”€ Discount Toggle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class _DiscountToggle extends StatefulWidget {
   final CartProvider cart;
@@ -10564,7 +10608,7 @@ class _DiscountToggleState extends State<_DiscountToggle> {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // %/₹ toggle
+        // %/â‚¹ toggle
         Container(
           height: 28,
           padding: const EdgeInsets.all(2),
@@ -10681,7 +10725,7 @@ class _DiscountToggleState extends State<_DiscountToggle> {
   }
 }
 
-// ── Premium Bar Chart ─────────────────────────────────────────────────────────
+// â”€â”€ Premium Bar Chart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class _PremiumBarChart extends StatefulWidget {
   final List<(String, double)> bars;
