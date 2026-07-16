@@ -51,3 +51,28 @@ jobs:
           files: |
             build/windows/x64/runner/Release/billcat.msix
             billcat-windows.zip
+
+      - name: Update Supabase update feed
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}" -replace '^v', ''
+          $tag = "${{ steps.version.outputs.VERSION }}"
+          $downloadUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/billcat-windows.zip"
+          $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/$tag"
+
+          $body = @{
+            version        = $version
+            download_url   = $downloadUrl
+            release_notes  = "See the release notes: $releaseUrl"
+            mandatory      = $false
+          } | ConvertTo-Json -Compress
+
+          $headers = @{
+            "Authorization" = "Bearer $env:SUPABASE_SERVICE_KEY"
+            "Content-Type"  = "application/json"
+            "x-upsert"      = "true"
+          }
+
+          Invoke-WebRequest -Uri "https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/billcat-updates/version-windows.json" `
+            -Method POST -Headers $headers -Body $body -UseBasicParsing
