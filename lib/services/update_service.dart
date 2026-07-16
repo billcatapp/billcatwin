@@ -146,7 +146,11 @@ class UpdateService {
     final ts = DateTime.now().millisecondsSinceEpoch;
     final scriptPath = '${Directory.systemTemp.path}\\billcat_updater_$ts.ps1';
 
-    // PowerShell script: wait for the app process to exit, copy new files, relaunch
+    // PowerShell script: wait for the app process to exit, copy new files, relaunch.
+    // Windows keeps the outgoing exe's image memory-mapped for a short window after
+    // the process disappears from Get-Process, so the first Copy-Item attempt can
+    // fail with "a user-mapped section open" even though the process is gone.
+    // Retry with backoff instead of relaunching whatever happens to be on disk.
     await File(scriptPath).writeAsString(
       r'$log = "$env:TEMP\billcat_update.log"' '\n'
       r'Add-Content $log "[$(Get-Date)] Updater started, waiting for BillCat..."' '\n'
@@ -155,22 +159,44 @@ class UpdateService {
       r'    Start-Sleep -Milliseconds 500; $waited += 0.5' '\n'
       r'}' '\n'
       r'Add-Content $log "[$(Get-Date)] Copying files..."' '\n'
-      'Copy-Item -Path "$extractDir\\*" -Destination "$appDir" -Recurse -Force\n'
-      r'Add-Content $log "[$(Get-Date)] Launching updated app..."' '\n'
+      r'$copyAttempts = 0; $copyOk = $false' '\n'
+      r'while (-not $copyOk -and $copyAttempts -lt 10) {' '\n'
+      '    try {\n'
+      '        Copy-Item -Path "$extractDir\\*" -Destination "$appDir" -Recurse -Force -ErrorAction Stop\n'
+      r'        $copyOk = $true' '\n'
+      '    } catch {\n'
+      r'        $copyAttempts++' '\n'
+      r'        Add-Content $log "[$(Get-Date)] Copy attempt $copyAttempts failed: $($_.Exception.Message)"' '\n'
+      r'        Start-Sleep -Milliseconds 500' '\n'
+      '    }\n'
+      r'}' '\n'
+      r'if ($copyOk) {' '\n'
+      r'    Add-Content $log "[$(Get-Date)] Copy succeeded. Launching updated app..."' '\n'
+      r'} else {' '\n'
+      r'    Add-Content $log "[$(Get-Date)] Copy failed after $copyAttempts attempts. Relaunching existing install..."' '\n'
+      r'}' '\n'
       'Start-Process "$execPath"\n'
-      r'Remove-Item -Path "$env:TEMP\billcat_update.log" -Force -ErrorAction SilentlyContinue' '\n'
+      r'if ($copyOk) {' '\n'
+      r'    Remove-Item -Path "$env:TEMP\billcat_update.log" -Force -ErrorAction SilentlyContinue' '\n'
+      r'}' '\n'
       r'Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue' '\n',
     );
 
     onProgress(1.0);
 
-    // Launch the script in a hidden window, detached from this process
-    await Process.run('powershell', [
-      '-WindowStyle', 'Hidden',
-      '-ExecutionPolicy', 'Bypass',
-      '-File', scriptPath,
-    ]);
-    await Future.delayed(const Duration(milliseconds: 500));
+    // Launch the script via `cmd /c start`, not a direct detached Process.start:
+    // Process.run would block here until the script exits, but the script's
+    // first step waits for *this* process to exit first — a deadlock only
+    // broken by the wait-loop's timeout, by which point this process still
+    // hasn't actually exited. A direct `Process.start(mode: detached)` avoids
+    // that deadlock but on Windows the child can still be torn down along
+    // with this process's tree once exit() runs. `cmd /c start` goes through
+    // ShellExecute, which reliably survives the parent's exit.
+    await Process.start(
+      'cmd',
+      ['/c', 'start', '""', '/min', 'powershell', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      mode: ProcessStartMode.detached,
+    );
     exit(0);
   }
 
