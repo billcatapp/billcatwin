@@ -12,34 +12,44 @@ class LabelPrinter {
   static final DynamicLibrary _winspool = DynamicLibrary.open('winspool.drv');
 
   static final int Function(Pointer<Utf8>, Pointer<IntPtr>, Pointer<Void>)
-      _openPrinter = _winspool.lookupFunction<
-          Int32 Function(Pointer<Utf8>, Pointer<IntPtr>, Pointer<Void>),
-          int Function(
-              Pointer<Utf8>, Pointer<IntPtr>, Pointer<Void>)>('OpenPrinterA');
+  _openPrinter = _winspool
+      .lookupFunction<
+        Int32 Function(Pointer<Utf8>, Pointer<IntPtr>, Pointer<Void>),
+        int Function(Pointer<Utf8>, Pointer<IntPtr>, Pointer<Void>)
+      >('OpenPrinterA');
 
-  static final int Function(int) _closePrinter = _winspool.lookupFunction<
-      Int32 Function(IntPtr), int Function(int)>('ClosePrinter');
+  static final int Function(int) _closePrinter = _winspool
+      .lookupFunction<Int32 Function(IntPtr), int Function(int)>(
+        'ClosePrinter',
+      );
 
   static final int Function(int, int, Pointer<_DocInfo1>) _startDocPrinter =
       _winspool.lookupFunction<
-          Uint32 Function(IntPtr, Uint32, Pointer<_DocInfo1>),
-          int Function(int, int, Pointer<_DocInfo1>)>('StartDocPrinterA');
+        Uint32 Function(IntPtr, Uint32, Pointer<_DocInfo1>),
+        int Function(int, int, Pointer<_DocInfo1>)
+      >('StartDocPrinterA');
 
-  static final int Function(int) _endDocPrinter = _winspool.lookupFunction<
-      Int32 Function(IntPtr), int Function(int)>('EndDocPrinter');
+  static final int Function(int) _endDocPrinter = _winspool
+      .lookupFunction<Int32 Function(IntPtr), int Function(int)>(
+        'EndDocPrinter',
+      );
 
-  static final int Function(int) _startPagePrinter =
-      _winspool.lookupFunction<Int32 Function(IntPtr),
-          int Function(int)>('StartPagePrinter');
+  static final int Function(int) _startPagePrinter = _winspool
+      .lookupFunction<Int32 Function(IntPtr), int Function(int)>(
+        'StartPagePrinter',
+      );
 
-  static final int Function(int) _endPagePrinter = _winspool.lookupFunction<
-      Int32 Function(IntPtr), int Function(int)>('EndPagePrinter');
+  static final int Function(int) _endPagePrinter = _winspool
+      .lookupFunction<Int32 Function(IntPtr), int Function(int)>(
+        'EndPagePrinter',
+      );
 
   static final int Function(int, Pointer<Uint8>, int, Pointer<Uint32>)
-      _writePrinter = _winspool.lookupFunction<
-          Int32 Function(IntPtr, Pointer<Uint8>, Uint32, Pointer<Uint32>),
-          int Function(
-              int, Pointer<Uint8>, int, Pointer<Uint32>)>('WritePrinter');
+  _writePrinter = _winspool
+      .lookupFunction<
+        Int32 Function(IntPtr, Pointer<Uint8>, Uint32, Pointer<Uint32>),
+        int Function(int, Pointer<Uint8>, int, Pointer<Uint32>)
+      >('WritePrinter');
 
   /// Writes [data] to [printerName] as a RAW spool job. Returns true on success.
   static bool sendRaw(String printerName, String data) {
@@ -111,10 +121,14 @@ class LabelPrinter {
 
     for (var start = 0; start < labels.length; start += perRow) {
       final row = labels.sublist(
-          start, (start + perRow).clamp(0, labels.length));
+        start,
+        (start + perRow).clamp(0, labels.length),
+      );
       buf
-        ..write('SIZE ${webWmm.toStringAsFixed(1)} mm,'
-            '${labelHmm.toStringAsFixed(1)} mm\r\n')
+        ..write(
+          'SIZE ${webWmm.toStringAsFixed(1)} mm,'
+          '${labelHmm.toStringAsFixed(1)} mm\r\n',
+        )
         ..write('GAP ${rowGapMm.toStringAsFixed(1)} mm,0\r\n')
         ..write('DIRECTION 1\r\n')
         ..write('CLS\r\n');
@@ -122,34 +136,40 @@ class LabelPrinter {
         final label = row[col];
         final cellX = (col * (labelWmm + _colGapMm) * _dpmm).round();
         final cellW = (labelWmm * _dpmm).round();
-        final sku = _tsplSafe(label.sku);
-        final barcodeVal =
-            _tsplSafe(label.barcode.isNotEmpty ? label.barcode : label.sku);
+        final barcodeVal = _tsplSafe(
+          label.barcode.isNotEmpty ? label.barcode : label.sku,
+        );
 
         // 12-digit numeric → EAN-13 (95 modules incl. check digit the
         // printer appends); anything else → Code 128 set B.
-        final isEan = barcodeVal.length == 12 &&
+        final isEan =
+            barcodeVal.length == 12 &&
             barcodeVal.codeUnits.every((c) => c >= 0x30 && c <= 0x39);
         final symbology = isEan ? 'EAN13' : '128';
-        final barcodeW =
-            isEan ? 95 * 2 : ((barcodeVal.length + 2) * 11 + 13) * 2;
+        final barcodeW = isEan
+            ? 95 * 2
+            : ((barcodeVal.length + 2) * 11 + 13) * 2;
         final barcodeH = (labelHmm * _dpmm * 0.42).round();
         final bx = cellX + ((cellW - barcodeW) / 2).round().clamp(0, cellW);
         buf.write(
-            'BARCODE $bx,${2 * _dpmm},"$symbology",$barcodeH,0,0,2,2,"$barcodeVal"\r\n');
+          'BARCODE $bx,${2 * _dpmm},"$symbology",$barcodeH,0,0,2,2,"$barcodeVal"\r\n',
+        );
 
-        // SKU line, centred (font 2 is 12x20 dots).
-        final skuW = sku.length * 12;
-        final sx = cellX + ((cellW - skuW) / 2).round().clamp(0, cellW);
-        final skuY = 2 * _dpmm + barcodeH + _dpmm;
-        buf.write('TEXT $sx,$skuY,"2",0,1,1,"$sku"\r\n');
+        // Product name line, centred (font 2 is 12x20 dots); truncate so it
+        // never runs past the cell edge since TSPL doesn't wrap text.
+        final maxChars = (cellW / 12).floor().clamp(1, 1000);
+        var name = _tsplSafe(label.name);
+        if (name.length > maxChars) name = name.substring(0, maxChars);
+        final nameW = name.length * 12;
+        final nx = cellX + ((cellW - nameW) / 2).round().clamp(0, cellW);
+        final nameY = 2 * _dpmm + barcodeH + _dpmm;
+        buf.write('TEXT $nx,$nameY,"2",0,1,1,"$name"\r\n');
 
-        // Price line, centred below the SKU.
-        final price = _tsplSafe(
-            '$currency${label.price.toStringAsFixed(2)}');
+        // Price line, centred below the name.
+        final price = _tsplSafe('$currency${label.price.toStringAsFixed(2)}');
         final priceW = price.length * 12;
         final px = cellX + ((cellW - priceW) / 2).round().clamp(0, cellW);
-        final priceY = skuY + 20 + 4;
+        final priceY = nameY + 20 + 4;
         buf.write('TEXT $px,$priceY,"2",0,1,1,"$price"\r\n');
       }
       buf.write('PRINT 1\r\n');
@@ -163,14 +183,40 @@ class LabelPrinter {
   static bool isTsplCompatible(String printerName) {
     final n = printerName.toLowerCase();
     const tsplHints = [
-      'tsc', 'tt0', 'te2', 'ttp', 'tdp', 'ttc',
-      'bar code printer', 'barcode printer',
-      'xprinter', 'idprt', 'hprt', 'gainscha', 'gprinter', 'rongta',
+      'tsc',
+      'tt0',
+      'te2',
+      'ttp',
+      'tdp',
+      'ttc',
+      'bar code printer',
+      'barcode printer',
+      'xprinter',
+      'idprt',
+      'hprt',
+      'gainscha',
+      'gprinter',
+      'rongta',
     ];
     const nonTsplHints = [
-      'zebra', 'zdesigner', 'godex', 'dymo', 'brother', 'citizen',
-      'sato', 'honeywell', 'intermec', 'datamax', 'argox',
-      'hp ', 'canon', 'epson', 'microsoft', 'onenote', 'fax', 'pdf',
+      'zebra',
+      'zdesigner',
+      'godex',
+      'dymo',
+      'brother',
+      'citizen',
+      'sato',
+      'honeywell',
+      'intermec',
+      'datamax',
+      'argox',
+      'hp ',
+      'canon',
+      'epson',
+      'microsoft',
+      'onenote',
+      'fax',
+      'pdf',
     ];
     if (nonTsplHints.any(n.contains)) return false;
     return tsplHints.any(n.contains);
@@ -191,18 +237,26 @@ class LabelPrinter {
   }
 
   /// Strips characters that would break a quoted TSPL parameter.
-  static String _tsplSafe(String s) =>
-      s.replaceAll('"', '').replaceAll('\\', '').replaceAll(RegExp(r'[\r\n]'), ' ');
+  static String _tsplSafe(String s) => s
+      .replaceAll('"', '')
+      .replaceAll('\\', '')
+      .replaceAll(RegExp(r'[\r\n]'), ' ');
 }
 
 class LabelData {
+  final String name;
   final String sku;
   final double price;
 
   /// Value encoded in the barcode; falls back to [sku] when empty.
   final String barcode;
 
-  const LabelData({required this.sku, required this.price, this.barcode = ''});
+  const LabelData({
+    required this.name,
+    required this.sku,
+    required this.price,
+    this.barcode = '',
+  });
 }
 
 final class _DocInfo1 extends Struct {

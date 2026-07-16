@@ -274,7 +274,7 @@ class LocalDbService {
       'name': p.name, 'price': p.price, 'buying_price': p.buyingPrice,
       'tax_percent': p.taxPercent, 'category': p.category,
       'emoji': p.emoji, 'sku': p.sku, 'stock': p.stock,
-      'barcode_no': p.barcodeNo, 'synced': 0,
+      'description': p.description, 'barcode_no': p.barcodeNo, 'synced': 0,
     }, where: 'id = ?', whereArgs: [p.id]);
   }
 
