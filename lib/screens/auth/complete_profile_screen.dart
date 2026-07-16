@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../services/connectivity_service.dart';
+import '../../services/local_db_service.dart';
 import '../billing/billing_screen.dart';
 
 class CompleteProfileScreen extends StatefulWidget {
@@ -123,6 +125,33 @@ class _CompleteProfileScreenState extends State<CompleteProfileScreen> {
         'currency':      _currency,
         if (logoUrl != null) 'logo_url': logoUrl,
       }));
+
+      // Also persist as store settings so the account page, receipts and
+      // invoices show these details immediately (and sync to the cloud).
+      if (userId != null) {
+        await LocalDbService.initForUser(userId);
+        final curr = _currencies.firstWhere((c) => c.code == _currency);
+        final addressParts = [
+          _addrCtrl.text.trim(),
+          _cityCtrl.text.trim(),
+        ].where((s) => s.isNotEmpty).join(', ');
+        final postal = _postalCtrl.text.trim();
+        final fullAddress =
+            postal.isEmpty ? addressParts : '$addressParts - $postal';
+        await LocalDbService.saveSettings({
+          if (_bizCtrl.text.trim().isNotEmpty)
+            'store_name': _bizCtrl.text.trim(),
+          if (fullAddress.isNotEmpty) 'store_address': fullAddress,
+          if (_phoneCtrl.text.trim().isNotEmpty)
+            'store_phone': '$_countryCode ${_phoneCtrl.text.trim()}',
+          if (_emailCtrl.text.trim().isNotEmpty)
+            'store_email': _emailCtrl.text.trim(),
+          'currency_code': curr.code,
+          'currency_symbol': curr.sym,
+          if (logoUrl != null) 'logo_url': logoUrl,
+        });
+        ConnectivityService.instance.syncNow();
+      }
     } catch (_) {}
 
     if (!mounted) return;
