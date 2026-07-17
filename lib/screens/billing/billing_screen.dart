@@ -17562,16 +17562,62 @@ class _ProductCardState extends State<_ProductCard> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      widget.product.name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: GoogleFonts.manrope(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                        color: AppColors.primary,
-                        letterSpacing: 0.1,
-                      ),
+                    Builder(
+                      builder: (_) {
+                        final tags = widget.product.description.isNotEmpty
+                            ? widget.product.description
+                                  .split(RegExp(r'[,\n]'))
+                                  .map((t) => t.trim())
+                                  .where((t) => t.isNotEmpty)
+                                  .toList()
+                            : <String>[];
+                        return Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              child: Text(
+                                widget.product.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GoogleFonts.manrope(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.primary,
+                                  letterSpacing: 0.1,
+                                ),
+                              ),
+                            ),
+                            if (tags.isNotEmpty) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 7,
+                                  vertical: 3,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: const Color(
+                                    0xFF6366F1,
+                                  ).withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(20),
+                                  border: Border.all(
+                                    color: const Color(
+                                      0xFF6366F1,
+                                    ).withValues(alpha: 0.4),
+                                  ),
+                                ),
+                                child: Text(
+                                  tags.first,
+                                  style: GoogleFonts.inter(
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.w600,
+                                    color: const Color(0xFF6366F1),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        );
+                      },
                     ),
                     const SizedBox(height: 2),
                     Text(
