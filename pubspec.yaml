@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.2-beta+1
+version: 1.0.3-beta+1
 
 environment:
   sdk: ^3.11.3
@@ -61,7 +61,7 @@ msix_config:
   display_name: BillCat
   publisher_display_name: BillCat
   identity_name: com.billcat.pos
-  msix_version: 1.0.0.1
+  msix_version: 1.0.3.1
   logo_path: assets/icons/app_icon.png
   start_menu_icon_path: assets/icons/app_icon.png
   tile_icon_path: assets/icons/app_icon.png
