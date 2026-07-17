@@ -94,6 +94,18 @@ class UpdateService {
     String url,
     void Function(double progress) onProgress,
   ) async {
+    // Installs that live under a read-only location (e.g. a leftover MSIX
+    // install under WindowsApps) can never succeed the in-place file copy
+    // below. Derive the GitHub release page so the fallback can send the
+    // user to grab the installer manually instead of failing silently.
+    String releasePageUrl = url;
+    final releaseMatch =
+        RegExp(r'^(https://github\.com/[^/]+/[^/]+)/releases/download/([^/]+)/')
+            .firstMatch(url);
+    if (releaseMatch != null) {
+      releasePageUrl = '${releaseMatch.group(1)}/releases/tag/${releaseMatch.group(2)}';
+    }
+
     final tmpDir = await Directory.systemTemp.createTemp('billcat_update_');
     final zipPath = '${tmpDir.path}\\update.zip';
 
@@ -173,7 +185,8 @@ class UpdateService {
       r'if ($copyOk) {' '\n'
       r'    Add-Content $log "[$(Get-Date)] Copy succeeded. Launching updated app..."' '\n'
       r'} else {' '\n'
-      r'    Add-Content $log "[$(Get-Date)] Copy failed after $copyAttempts attempts. Relaunching existing install..."' '\n'
+      r'    Add-Content $log "[$(Get-Date)] Copy failed after $copyAttempts attempts (install location is likely read-only, e.g. a leftover MSIX install). Opening manual download page..."' '\n'
+      '    Start-Process "$releasePageUrl"\n'
       r'}' '\n'
       'Start-Process "$execPath"\n'
       r'if ($copyOk) {' '\n'
