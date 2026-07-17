@@ -25,27 +25,18 @@ jobs:
       - name: Build Windows release
         run: flutter build windows --release
 
-      - name: Set MSIX package version from tag
-        # msix_version must be 4 numeric parts and strictly greater than the
-        # previously installed package's, or Windows blocks the upgrade.
-        # Deriving it here (tag + always-incrementing run number) means no
-        # one has to remember to bump it by hand in pubspec.yaml.
-        run: |
-          $core = "${{ github.ref_name }}" -replace '^v', '' -replace '-.*$', ''
-          $msixVersion = "$core.${{ github.run_number }}"
-          Write-Output "Computed MSIX version: $msixVersion"
-          (Get-Content pubspec.yaml) -replace 'msix_version:\s*[\d.]+', "msix_version: $msixVersion" |
-            Set-Content pubspec.yaml
-
-      - name: Create MSIX installer
-        run: dart run msix:create
-
       - name: Zip release folder
         run: Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "billcat-windows.zip"
 
       - name: Get version from tag
         id: version
         run: echo "VERSION=$($env:GITHUB_REF -replace 'refs/tags/', '')" >> $env:GITHUB_OUTPUT
+
+      - name: Compile EXE installer
+        # windows-latest ships Inno Setup 6 preinstalled.
+        run: |
+          $ver = "${{ steps.version.outputs.VERSION }}" -replace '^v', ''
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" installer.iss
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -56,12 +47,11 @@ jobs:
             See commit history for changes.
 
             ## Install
-            - **New install**: download `billcat.msix` and double-click
+            - **New install**: download `BillCat-Setup-*.exe` and run it (no admin rights needed)
             - **Existing users**: update banner will appear in the app automatically
 
-            > If Windows blocks the install: Settings → Apps → Advanced app settings → Allow apps from anywhere
           files: |
-            build/windows/x64/runner/Release/billcat.msix
+            installer_output/*.exe
             billcat-windows.zip
 
       - name: Update Supabase update feed
