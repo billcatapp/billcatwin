@@ -2891,6 +2891,36 @@ class _BillingScreenState extends State<BillingScreen> {
     return p.price * (1 + rate / 100);
   }
 
+  // Splits a "Product Name (Variant)" label into a product-name line and, if
+  // present, a separate variant line below it — so the variant never gets
+  // truncated off the edge of a barcode label.
+  List<pw.Widget> _labelNameWidgets(String fullName, pw.Font bold) {
+    String main = fullName;
+    String? variant;
+    final m = RegExp(r'^(.*)\s*\((.+)\)\s*$').firstMatch(fullName);
+    if (m != null) {
+      main = m.group(1)!.trim();
+      variant = m.group(2)!.trim();
+    }
+    return [
+      pw.Text(
+        main,
+        maxLines: 1,
+        overflow: pw.TextOverflow.clip,
+        style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4),
+        textAlign: pw.TextAlign.center,
+      ),
+      if (variant != null && variant.isNotEmpty)
+        pw.Text(
+          variant,
+          maxLines: 1,
+          overflow: pw.TextOverflow.clip,
+          style: pw.TextStyle(font: bold, fontSize: 3.8, letterSpacing: 0.3),
+          textAlign: pw.TextAlign.center,
+        ),
+    ];
+  }
+
   // 5.0 -> "5", 12.5 -> "12.5"
   String _formatRate(double r) =>
       r == r.truncateToDouble() ? r.toStringAsFixed(0) : r.toString();
@@ -10677,19 +10707,9 @@ end tell
             pw.SvgImage(
               svg: svgStr,
               width: (cellW - innerPad * 2),
-              height: (cellH - 2 * PdfPageFormat.mm) * 0.62,
+              height: (cellH - 2 * PdfPageFormat.mm) * 0.58,
             ),
-            pw.Text(
-              p.name,
-              maxLines: 1,
-              overflow: pw.TextOverflow.clip,
-              style: pw.TextStyle(
-                font: bold,
-                fontSize: 4.5,
-                letterSpacing: 0.4,
-              ),
-              textAlign: pw.TextAlign.center,
-            ),
+            ..._labelNameWidgets(p.name, bold),
             pw.Text(
               '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
               style: pw.TextStyle(font: bold, fontSize: 4.5),

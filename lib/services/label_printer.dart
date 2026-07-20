@@ -149,28 +149,48 @@ class LabelPrinter {
         final barcodeW = isEan
             ? 95 * 2
             : ((barcodeVal.length + 2) * 11 + 13) * 2;
-        final barcodeH = (labelHmm * _dpmm * 0.42).round();
+        final barcodeH = (labelHmm * _dpmm * 0.38).round();
         final bx = cellX + ((cellW - barcodeW) / 2).round().clamp(0, cellW);
         buf.write(
           'BARCODE $bx,${2 * _dpmm},"$symbology",$barcodeH,0,0,2,2,"$barcodeVal"\r\n',
         );
 
-        // Product name line, centred (font 2 is 12x20 dots); truncate so it
-        // never runs past the cell edge since TSPL doesn't wrap text.
-        final maxChars = (cellW / 12).floor().clamp(1, 1000);
-        var name = _tsplSafe(label.name);
-        if (name.length > maxChars) name = name.substring(0, maxChars);
-        final nameW = name.length * 12;
-        final nx = cellX + ((cellW - nameW) / 2).round().clamp(0, cellW);
-        final nameY = 2 * _dpmm + barcodeH + _dpmm;
-        buf.write('TEXT $nx,$nameY,"2",0,1,1,"$name"\r\n');
+        // Split "Product Name (Variant)" so the variant prints on its own line
+        // below the product name instead of being truncated off the edge.
+        var mainName = _tsplSafe(label.name);
+        String? variant;
+        final vm = RegExp(r'^(.*)\s*\((.+)\)\s*$').firstMatch(mainName);
+        if (vm != null) {
+          mainName = vm.group(1)!.trim();
+          variant = vm.group(2)!.trim();
+        }
 
-        // Price line, centred below the name.
-        final price = _tsplSafe('$currency${label.price.toStringAsFixed(2)}');
-        final priceW = price.length * 12;
-        final px = cellX + ((cellW - priceW) / 2).round().clamp(0, cellW);
-        final priceY = nameY + 20 + 4;
-        buf.write('TEXT $px,$priceY,"2",0,1,1,"$price"\r\n');
+        // Centred text helpers. Font 2 = 12x20 dots, font 1 = 8x12 dots.
+        // TSPL doesn't wrap, so truncate each line to the cell width.
+        void writeCentred(String text, int y, String font, int charW) {
+          final maxChars = (cellW / charW).floor().clamp(1, 1000);
+          var t = text;
+          if (t.length > maxChars) t = t.substring(0, maxChars);
+          final w = t.length * charW;
+          final x = cellX + ((cellW - w) / 2).round().clamp(0, cellW);
+          buf.write('TEXT $x,$y,"$font",0,1,1,"$t"\r\n');
+        }
+
+        // Font 2 is 20 dots tall, font 1 is 12 dots tall; add generous gaps
+        // between the barcode, name, variant and price so they don't crowd.
+        var y = 2 * _dpmm + barcodeH + 12;
+        writeCentred(mainName, y, '2', 12); // product name
+        y += 20 + 10;
+        if (variant != null && variant.isNotEmpty) {
+          writeCentred(variant, y, '1', 8); // variant, smaller font
+          y += 12 + 10;
+        }
+        writeCentred(
+          _tsplSafe('$currency${label.price.toStringAsFixed(2)}'),
+          y,
+          '2',
+          12,
+        ); // price
       }
       buf.write('PRINT 1\r\n');
     }
