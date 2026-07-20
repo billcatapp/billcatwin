@@ -12851,55 +12851,66 @@ end tell
         border: Border.all(color: AppColors.border),
       ),
       child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          value: selectedId ?? '__base__',
-          isExpanded: true,
-          isDense: true,
-          style: GoogleFonts.inter(
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
-            color: AppColors.textDark,
-          ),
-          items: [
-            const DropdownMenuItem(
-              value: '__base__',
-              child: Text('Base product'),
-            ),
-            ...variants.map(
-              (v) => DropdownMenuItem(
-                value: v.id,
-                child: Text(v.label, overflow: TextOverflow.ellipsis),
+        child: Builder(
+          builder: (context) {
+            // Once a product has variants, the plain "Base product" is no
+            // longer a sellable option — only the variants are shown.
+            final showBase = variants.isEmpty;
+            final effectiveValue = showBase
+                ? (selectedId ?? '__base__')
+                : (selectedId ?? variants.first.id);
+            return DropdownButton<String>(
+              value: effectiveValue,
+              isExpanded: true,
+              isDense: true,
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: AppColors.textDark,
               ),
-            ),
-            DropdownMenuItem(
-              value: '__add__',
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.add_rounded,
-                    size: 14,
-                    color: AppColors.primary,
+              items: [
+                if (showBase)
+                  const DropdownMenuItem(
+                    value: '__base__',
+                    child: Text('Base product'),
                   ),
-                  const SizedBox(width: 4),
-                  Text(
-                    'Add variant',
-                    style: GoogleFonts.inter(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                      color: AppColors.primary,
-                    ),
+                ...variants.map(
+                  (v) => DropdownMenuItem(
+                    value: v.id,
+                    child: Text(v.label, overflow: TextOverflow.ellipsis),
                   ),
-                ],
-              ),
-            ),
-          ],
-          onChanged: (val) {
-            if (val == '__add__') {
-              onAdd();
-              return;
-            }
-            onSelect(val == '__base__' ? null : val);
+                ),
+                DropdownMenuItem(
+                  value: '__add__',
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.add_rounded,
+                        size: 14,
+                        color: AppColors.primary,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Add variant',
+                        style: GoogleFonts.inter(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.primary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+              onChanged: (val) {
+                if (val == '__add__') {
+                  onAdd();
+                  return;
+                }
+                onSelect(val == '__base__' ? null : val);
+              },
+            );
           },
         ),
       ),
@@ -13295,7 +13306,9 @@ end tell
     if (!mounted) return;
 
     // Which variant the price/stock fields currently edit (null = base product).
-    String? selectedVariantId;
+    // If the product already has variants, the base is no longer sellable, so
+    // start editing the first variant rather than the hidden base.
+    String? selectedVariantId = variants.isNotEmpty ? variants.first.id : null;
     // Inline naming state: 'new' while adding, or the id being renamed.
     String? variantNameMode;
     final variantNameCtrl = TextEditingController();
@@ -13334,6 +13347,9 @@ end tell
         stockCtrl.text = '${v.stock}';
       }
     }
+
+    // Sync the price/stock fields to the initially-selected entry.
+    loadFields();
 
     showDialog(
       context: context,
@@ -19719,16 +19735,16 @@ class _ProductCardState extends State<_ProductCard> {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    // Price shown is what the customer pays (tax included).
+                    // Price shown is the actual base price, before tax.
                     Text(
                       () {
-                        final m = 1 + widget.effectiveTaxRate / 100;
                         if (widget.variants.isEmpty) {
-                          return '${widget.currencySymbol}${(widget.product.price * m).toStringAsFixed(2)}';
+                          return '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}';
                         }
-                        final prices =
-                            widget.variants.map((v) => v.price * m).toList()
-                              ..sort();
+                        final prices = widget.variants
+                            .map((v) => v.price)
+                            .toList()
+                          ..sort();
                         return prices.first == prices.last
                             ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
                             : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
@@ -19742,7 +19758,7 @@ class _ProductCardState extends State<_ProductCard> {
                     ),
                     if (widget.effectiveTaxRate > 0)
                       Text(
-                        'incl. ${widget.taxLabel} '
+                        '+ ${widget.taxLabel} '
                         '${widget.effectiveTaxRate == widget.effectiveTaxRate.truncateToDouble() ? widget.effectiveTaxRate.toStringAsFixed(0) : widget.effectiveTaxRate}%',
                         style: GoogleFonts.inter(
                           fontSize: 8.5,
@@ -20022,7 +20038,7 @@ class _VariantCardState extends State<_VariantCard> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        '${widget.currencySymbol}${(widget.variant.price * (1 + widget.effectiveTaxRate / 100)).toStringAsFixed(2)}',
+                        '${widget.currencySymbol}${widget.variant.price.toStringAsFixed(2)}',
                         style: GoogleFonts.manrope(
                           fontSize: 16,
                           fontWeight: FontWeight.w900,
@@ -20032,7 +20048,7 @@ class _VariantCardState extends State<_VariantCard> {
                       ),
                       if (widget.effectiveTaxRate > 0)
                         Text(
-                          'incl. ${widget.taxLabel} '
+                          '+ ${widget.taxLabel} '
                           '${widget.effectiveTaxRate == widget.effectiveTaxRate.truncateToDouble() ? widget.effectiveTaxRate.toStringAsFixed(0) : widget.effectiveTaxRate}%',
                           style: GoogleFonts.inter(
                             fontSize: 8.5,
