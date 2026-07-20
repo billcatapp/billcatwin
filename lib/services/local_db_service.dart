@@ -5,6 +5,7 @@ import 'package:path/path.dart';
 import 'package:uuid/uuid.dart';
 import '../models/customer.dart';
 import '../models/product.dart';
+import '../models/product_variant.dart';
 import '../models/transaction_record.dart';
 
 class LocalDbService {
@@ -39,7 +40,7 @@ class LocalDbService {
     final dbPath = await _appSupportPath();
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 9,
+      version: 10,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try { await db.execute('ALTER TABLE products ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
@@ -76,10 +77,28 @@ class LocalDbService {
         if (oldVersion < 9) {
           try { await db.execute("ALTER TABLE products ADD COLUMN barcode_no TEXT NOT NULL DEFAULT ''"); } catch (_) {}
         }
+        if (oldVersion < 10) {
+          try { await db.execute(_productVariantsTableSql); } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
   }
+
+  static const String _productVariantsTableSql = '''
+    CREATE TABLE IF NOT EXISTS product_variants (
+      id TEXT PRIMARY KEY,
+      product_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      price REAL NOT NULL,
+      buying_price REAL NOT NULL DEFAULT 0,
+      stock INTEGER NOT NULL DEFAULT 0,
+      sku TEXT NOT NULL DEFAULT '',
+      barcode_no TEXT NOT NULL DEFAULT '',
+      synced INTEGER NOT NULL DEFAULT 0,
+      deleted INTEGER NOT NULL DEFAULT 0
+    )
+  ''';
 
   static Future<void> _createTables(Database db) async {
     await db.execute('''
@@ -137,6 +156,7 @@ class LocalDbService {
         value TEXT NOT NULL
       )
     ''');
+    await db.execute(_productVariantsTableSql);
   }
 
   // ── Invoice ID ───────────────────────────────────────────────────────────
@@ -219,6 +239,7 @@ class LocalDbService {
   static Future<void> clearAll() async {
     final database = await db;
     await database.delete('products');
+    await database.delete('product_variants');
     await database.delete('transactions');
     await database.delete('customers');
     await database.delete('categories');
@@ -280,8 +301,11 @@ class LocalDbService {
 
   static Future<String> getNextBarcodeNo() async {
     final database = await db;
+    // Consider both products and variants so numbers never collide
     final rows = await database.rawQuery(
-      "SELECT MAX(CAST(barcode_no AS INTEGER)) as m FROM products WHERE barcode_no != ''");
+      "SELECT MAX(CAST(barcode_no AS INTEGER)) as m FROM ("
+      "SELECT barcode_no FROM products WHERE barcode_no != '' "
+      "UNION ALL SELECT barcode_no FROM product_variants WHERE barcode_no != '')");
     final maxVal = rows.first['m'];
     // EAN-13: 12-digit input (200 prefix + 9-digit sequence), library adds check digit
     final next = (maxVal == null ? 200000000000 : (maxVal as int)) + 1;
@@ -300,11 +324,25 @@ class LocalDbService {
     }
   }
 
+  static Future<void> assignMissingVariantBarcodeNos() async {
+    final database = await db;
+    final rows = await database.query('product_variants',
+      columns: ['id'],
+      where: "(barcode_no = '' OR barcode_no IS NULL) AND deleted = 0");
+    for (final row in rows) {
+      final next = await getNextBarcodeNo();
+      await database.update('product_variants', {'barcode_no': next, 'synced': 0},
+        where: 'id = ?', whereArgs: [row['id']]);
+    }
+  }
+
   static Future<void> deleteProduct(String id) async {
     final database = await db;
     // Soft-delete: mark for cloud removal, hidden from UI immediately
     await database.update('products', {'deleted': 1, 'synced': 0},
         where: 'id = ?', whereArgs: [id]);
+    await database.update('product_variants', {'deleted': 1, 'synced': 0},
+        where: 'product_id = ?', whereArgs: [id]);
   }
 
   static Future<List<Product>> getUnsyncedProducts() async {
@@ -334,14 +372,115 @@ class LocalDbService {
         where: 'id = ?', whereArgs: [id]);
   }
 
+  // ── Product Variants ──────────────────────────────────────────────────────
+
+  static Future<List<ProductVariant>> getVariantsForProduct(String productId) async {
+    final database = await db;
+    final rows = await database.query('product_variants',
+        where: 'product_id = ? AND deleted = 0', whereArgs: [productId],
+        orderBy: 'label ASC');
+    return rows.map(ProductVariant.fromMap).toList();
+  }
+
+  // Bulk load for the product grid — avoids one query per product.
+  static Future<Map<String, List<ProductVariant>>> getVariantsGroupedByProduct() async {
+    final database = await db;
+    final rows = await database.query('product_variants',
+        where: 'deleted = 0', orderBy: 'label ASC');
+    final grouped = <String, List<ProductVariant>>{};
+    for (final row in rows) {
+      final v = ProductVariant.fromMap(row);
+      grouped.putIfAbsent(v.productId, () => []).add(v);
+    }
+    return grouped;
+  }
+
+  static Future<void> insertVariant(ProductVariant variant) async {
+    final database = await db;
+    await database.insert('product_variants', variant.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  static Future<void> insertVariantsSynced(List<ProductVariant> variants) async {
+    final database = await db;
+    final batch = database.batch();
+    for (final v in variants) {
+      final map = v.toMap();
+      map['synced'] = 1;
+      map['deleted'] = 0;
+      batch.insert('product_variants', map, conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  static Future<void> updateVariant(ProductVariant v) async {
+    final database = await db;
+    await database.update('product_variants', {
+      'label': v.label, 'price': v.price, 'buying_price': v.buyingPrice,
+      'stock': v.stock, 'sku': v.sku, 'barcode_no': v.barcodeNo, 'synced': 0,
+    }, where: 'id = ?', whereArgs: [v.id]);
+  }
+
+  static Future<void> updateVariantStock(String id, int newStock) async {
+    final database = await db;
+    await database.update('product_variants', {'stock': newStock, 'synced': 0},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> deleteVariant(String id) async {
+    final database = await db;
+    await database.update('product_variants', {'deleted': 1, 'synced': 0},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<List<ProductVariant>> getUnsyncedVariants() async {
+    final database = await db;
+    final rows = await database.query('product_variants',
+        where: 'synced = 0 AND deleted = 0');
+    return rows.map(ProductVariant.fromMap).toList();
+  }
+
+  static Future<List<String>> getPendingDeleteVariantIds() async {
+    final database = await db;
+    final rows = await database.query('product_variants',
+        columns: ['id'], where: 'deleted = 1 AND synced = 0');
+    return rows.map((r) => r['id'] as String).toList();
+  }
+
+  static Future<void> purgeDeletedVariant(String id) async {
+    final database = await db;
+    await database.delete('product_variants', where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> markVariantSynced(String id) async {
+    final database = await db;
+    await database.update('product_variants', {'synced': 1},
+        where: 'id = ?', whereArgs: [id]);
+  }
+
   // ── Transactions ──────────────────────────────────────────────────────────
 
   static Future<void> insertTransaction(TransactionRecord t) async {
     final database = await db;
     await database.insert('transactions', t.toMap(),
         conflictAlgorithm: ConflictAlgorithm.replace);
-    // Deduct stock for each sold item and mark product unsynced for cloud push
+    // Deduct stock for each sold item and mark product/variant unsynced for cloud push
     for (final item in t.items) {
+      if (item.variantId != null) {
+        final rows = await database.query('product_variants',
+            where: 'id = ?', whereArgs: [item.variantId], limit: 1);
+        if (rows.isNotEmpty) {
+          final current = rows.first['stock'] as int;
+          final updated = (current - item.quantity).clamp(0, current);
+          await database.update(
+            'product_variants',
+            {'stock': updated, 'synced': 0},
+            where: 'id = ?',
+            whereArgs: [item.variantId],
+          );
+        }
+        continue;
+      }
       final rows = await database.query('products',
           where: 'id = ?', whereArgs: [item.productId], limit: 1);
       if (rows.isNotEmpty) {

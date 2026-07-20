@@ -259,7 +259,7 @@ class ReceiptPrinter {
             ...tx.items.map((item) => pw.Padding(
                   padding: pw.EdgeInsets.symmetric(vertical: isCompact ? 1.5 : 2.5),
                   child: pw.Row(children: [
-                    pw.Expanded(flex: 5, child: pw.Text(item.productName,
+                    pw.Expanded(flex: 5, child: pw.Text(item.displayName,
                         style: pw.TextStyle(font: regular, fontSize: fs))),
                     pw.Container(width: 28, child: pw.Text('x${item.quantity}',
                         textAlign: pw.TextAlign.center,
@@ -410,7 +410,7 @@ class ReceiptPrinter {
             // Items
             pw.TableHelper.fromTextArray(
               headers: ['ITEM', 'QTY', 'UNIT PRICE', 'TOTAL'],
-              data: tx.items.map((i) => [i.productName, '${i.quantity}', '$currencySymbol${i.price.toStringAsFixed(2)}', '$currencySymbol${i.total.toStringAsFixed(2)}']).toList(),
+              data: tx.items.map((i) => [i.displayName, '${i.quantity}', '$currencySymbol${i.price.toStringAsFixed(2)}', '$currencySymbol${i.total.toStringAsFixed(2)}']).toList(),
               headerStyle: pw.TextStyle(font: b, fontSize: fs - 1.5, color: PdfColors.white),
               headerDecoration: const pw.BoxDecoration(color: PdfColors.grey800),
               cellStyle: pw.TextStyle(font: r, fontSize: fs - 0.5),
@@ -482,7 +482,7 @@ class ReceiptPrinter {
         pw.SizedBox(height: 12),
         pw.TableHelper.fromTextArray(
           headers: ['#', 'Item Name', 'Qty', 'Unit Price', 'Amount'],
-          data: tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.productName, '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
+          data: tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.displayName, '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
           headerStyle: pw.TextStyle(font: b, fontSize: fs - 1.5, color: PdfColors.white),
           headerDecoration: const pw.BoxDecoration(color: PdfColors.grey700),
           cellStyle: pw.TextStyle(font: r, fontSize: fs - 0.5),
@@ -546,8 +546,8 @@ class ReceiptPrinter {
         pw.TableHelper.fromTextArray(
           headers: isNarrow ? ['Item', 'Qty', 'Rate', 'Tax', 'Amt'] : ['#', 'Item Name', 'HSN/SAC', 'Qty', 'Rate', 'Disc', 'Tax%', 'Amount'],
           data: isNarrow
-              ? tx.items.map((i) => [i.productName, '${i.quantity}', '$currencySymbol${i.price.toStringAsFixed(2)}', '$currencySymbol${(i.price * i.quantity * taxRateVal / 100).toStringAsFixed(2)}', '$currencySymbol${i.total.toStringAsFixed(2)}']).toList()
-              : tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.productName, '—', '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '${currencySymbol}0.00', '$taxRate%', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
+              ? tx.items.map((i) => [i.displayName, '${i.quantity}', '$currencySymbol${i.price.toStringAsFixed(2)}', '$currencySymbol${(i.price * i.quantity * taxRateVal / 100).toStringAsFixed(2)}', '$currencySymbol${i.total.toStringAsFixed(2)}']).toList()
+              : tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.displayName, '—', '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '${currencySymbol}0.00', '$taxRate%', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
           headerStyle: pw.TextStyle(font: b, fontSize: fs - 2, color: PdfColors.white),
           headerDecoration: const pw.BoxDecoration(color: PdfColors.grey700),
           cellStyle: pw.TextStyle(font: r, fontSize: fs - 1.5),
@@ -601,7 +601,7 @@ class ReceiptPrinter {
               pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 3, vertical: 3), child: pw.Text(h, style: pw.TextStyle(font: b, fontSize: fs - 2, color: PdfColors.white))),
           ]),
           ...items.map((i) => pw.TableRow(children: [
-            pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 3, vertical: 3), child: pw.Text(i.productName, style: pw.TextStyle(font: r, fontSize: fs - 1.5))),
+            pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 3, vertical: 3), child: pw.Text(i.displayName, style: pw.TextStyle(font: r, fontSize: fs - 1.5))),
             pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 3, vertical: 3), child: pw.Text('${i.quantity}', textAlign: pw.TextAlign.center, style: pw.TextStyle(font: r, fontSize: fs - 1.5))),
             pw.Padding(padding: const pw.EdgeInsets.symmetric(horizontal: 3, vertical: 3), child: pw.Text('$currencySymbol${i.total.toStringAsFixed(0)}', textAlign: pw.TextAlign.right, style: pw.TextStyle(font: b, fontSize: fs - 1.5))),
           ])),
@@ -687,7 +687,7 @@ class ReceiptPrinter {
         pw.SizedBox(height: 6),
         pw.TableHelper.fromTextArray(
           headers: ['#', 'Item Name', 'Qty', 'Unit Price', 'Amount'],
-          data: tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.productName, '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
+          data: tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.displayName, '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
           headerStyle: pw.TextStyle(font: b, fontSize: fs - 1.5, color: PdfColors.white),
           headerDecoration: const pw.BoxDecoration(color: PdfColors.grey700),
           cellStyle: pw.TextStyle(font: r, fontSize: fs - 0.5),
@@ -766,7 +766,7 @@ class ReceiptPrinter {
             padding: const pw.EdgeInsets.all(0),
             child: pw.TableHelper.fromTextArray(
               headers: ['Sl.', 'Description of Goods', 'HSN/SAC', 'Qty', 'Rate', 'Disc.', 'Amount'],
-              data: tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.productName, '—', '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '—', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
+              data: tx.items.asMap().entries.map((e) => ['${e.key+1}', e.value.displayName, '—', '${e.value.quantity}', '$currencySymbol${e.value.price.toStringAsFixed(2)}', '—', '$currencySymbol${e.value.total.toStringAsFixed(2)}']).toList(),
               headerStyle: pw.TextStyle(font: b, fontSize: fs - 1.5, color: PdfColors.white),
               headerDecoration: const pw.BoxDecoration(color: PdfColors.grey700),
               cellStyle: pw.TextStyle(font: r, fontSize: fs - 0.5),
@@ -907,7 +907,7 @@ class ReceiptPrinter {
       final gstAmt = itemTotal * taxRateVal / (100 + taxRateVal);
       return pw.TableRow(children: [
         pd(tx_('${e.key + 1}', a: pw.TextAlign.center, s: fs - 1)),
-        pd(tx_(e.value.productName, f: b, s: fs - 1)),
+        pd(tx_(e.value.displayName, f: b, s: fs - 1)),
         pd(tx_('—', a: pw.TextAlign.center, s: fs - 1)),
         pd(tx_('${e.value.quantity}', a: pw.TextAlign.center, s: fs - 1)),
         pd(tx_(e.value.price.toStringAsFixed(2), a: pw.TextAlign.right, s: fs - 1)),
@@ -1356,7 +1356,7 @@ class ReceiptPrinter {
           final itemRows = [
             ...tx.items.asMap().entries.map((e) => pw.TableRow(children: [
               pad(t('${e.key + 1}', a: pw.TextAlign.center)),
-              pad(t(e.value.productName, s: fs - 0.5)),
+              pad(t(e.value.displayName, s: fs - 0.5)),
               pad(t('—', a: pw.TextAlign.center)),
               pad(t('${e.value.quantity}', a: pw.TextAlign.center)),
               pad(t('$currencySymbol${e.value.price.toStringAsFixed(2)}', a: pw.TextAlign.right)),
@@ -1814,7 +1814,7 @@ class ReceiptPrinter {
       final item = e.value;
       return pw.TableRow(children: [
         cell(t('${e.key + 1}', a: pw.TextAlign.center, s: fs - 1)),
-        cell(t(item.productName, f: b, s: fs - 1)),
+        cell(t(item.displayName, f: b, s: fs - 1)),
         cell(t('—', a: pw.TextAlign.center, s: fs - 1)),
         cell(t('${item.quantity}', a: pw.TextAlign.center, s: fs - 1)),
         cell(t('—', a: pw.TextAlign.center, s: fs - 1)),
@@ -2423,7 +2423,7 @@ class ReceiptPrinter {
               final item = e.value;
               return pw.TableRow(children: [
                 pad(tx_('${e.key + 1}', a: pw.TextAlign.center, s: fs - 1)),
-                pad(tx_(item.productName, f: b, s: fs - 1)),
+                pad(tx_(item.displayName, f: b, s: fs - 1)),
                 pad(tx_('—', a: pw.TextAlign.center, s: fs - 1, c: PdfColors.grey600)),
                 pad(tx_('${item.quantity}', a: pw.TextAlign.center, s: fs - 1)),
                 pad(tx_('—', a: pw.TextAlign.center, s: fs - 1, c: PdfColors.grey600)),
@@ -2562,7 +2562,7 @@ class ReceiptPrinter {
       final item = e.value;
       return pw.TableRow(children: [
         pad(tx_('${e.key + 1}', a: pw.TextAlign.center, s: fs - 1)),
-        pad(tx_(item.productName, f: b, s: fs - 1)),
+        pad(tx_(item.displayName, f: b, s: fs - 1)),
         pad(tx_('—', a: pw.TextAlign.center, s: fs - 1)),
         pad(tx_('${item.quantity}', a: pw.TextAlign.center, s: fs - 1)),
         pad(tx_('—', a: pw.TextAlign.center, s: fs - 1)),
@@ -2896,7 +2896,7 @@ class ReceiptPrinter {
       final item = e.value;
       return pw.TableRow(children: [
         pad(tx_('${e.key + 1}', a: pw.TextAlign.center, s: fs - 1)),
-        pad(tx_(item.productName, f: b, s: fs - 1)),
+        pad(tx_(item.displayName, f: b, s: fs - 1)),
         pad(tx_('—', a: pw.TextAlign.center, s: fs - 1)),
         pad(tx_('${item.quantity}', a: pw.TextAlign.center, s: fs - 1)),
         pad(tx_('—', a: pw.TextAlign.center, s: fs - 1)),
@@ -3206,7 +3206,7 @@ class ReceiptPrinter {
       final item = e.value;
       return pw.TableRow(children: [
         pad(tx_('${e.key + 1}', a: pw.TextAlign.center, s: fs - 1)),
-        pad(tx_(item.productName, s: fs - 1)),
+        pad(tx_(item.displayName, s: fs - 1)),
         pad(tx_(fmtAmt(item.price), a: pw.TextAlign.right, s: fs - 1)),
         pad(tx_('${item.quantity}', a: pw.TextAlign.center, s: fs - 1)),
         pad(tx_(fmtAmt(item.total), f: b, a: pw.TextAlign.right, s: fs - 1)),

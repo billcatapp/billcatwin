@@ -3,8 +3,8 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../constants/app_colors.dart';
 import '../../services/supabase_service.dart';
-import 'complete_profile_screen.dart';
 import 'login_screen.dart';
+import 'otp_verification_screen.dart';
 
 class SignupScreen extends StatefulWidget {
   const SignupScreen({super.key});
@@ -58,9 +58,14 @@ class _SignupScreenState extends State<SignupScreen> {
         _passwordCtrl.text,
       );
       if (!mounted) return;
+      // Email confirmation is required — verify the emailed OTP first. The
+      // OTP screen continues to CompleteProfileScreen on success.
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => const CompleteProfileScreen()),
+        MaterialPageRoute(
+          builder: (_) =>
+              OtpVerificationScreen(email: _emailCtrl.text.trim()),
+        ),
       );
     } on AuthException catch (e) {
       _showError(e.message.contains('already registered')

@@ -10,8 +10,10 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../constants/app_colors.dart';
+import 'package:uuid/uuid.dart';
 import '../../models/customer.dart';
 import '../../models/product.dart';
+import '../../models/product_variant.dart';
 import '../../models/transaction_record.dart';
 import '../../providers/cart_provider.dart';
 import '../../services/connectivity_service.dart';
@@ -138,6 +140,9 @@ class BillingScreen extends StatefulWidget {
 
 class _BillingScreenState extends State<BillingScreen> {
   List<Product> _products = List.from(_defaultProducts);
+  Map<String, List<ProductVariant>> _variantsByProduct = {};
+  // Product whose variants are currently expanded inline in the billing grid.
+  String? _expandedVariantProductId;
   String _selectedCategory = 'All';
   String _searchQuery = '';
   final _searchController = TextEditingController();
@@ -326,6 +331,24 @@ class _BillingScreenState extends State<BillingScreen> {
     }).toList();
   }
 
+  // Grid entries: normally all products; while a product's variants are
+  // expanded, the grid shows only that product followed by its variant cards.
+  List<Object> get _displayGridItems {
+    final expandedId = _expandedVariantProductId;
+    if (expandedId != null) {
+      final parent = _filteredProducts.cast<Product?>().firstWhere(
+            (p) => p!.id == expandedId,
+            orElse: () => null,
+          );
+      final variants =
+          _variantsByProduct[expandedId] ?? const <ProductVariant>[];
+      if (parent != null && variants.isNotEmpty) {
+        return <Object>[parent, ...variants.map((v) => (parent, v))];
+      }
+    }
+    return List<Object>.from(_filteredProducts);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -467,6 +490,22 @@ class _BillingScreenState extends State<BillingScreen> {
     cart.setTaxRate(double.tryParse(_taxRateDisplay) ?? 0.0);
   }
 
+  // Applies a tax rate entered from the cart summary: updates the running bill
+  // and persists it so the next bill (and the receipt) uses the same rate.
+  void _applyTaxRate(String rate) {
+    final parsed = (double.tryParse(rate) ?? 0.0).clamp(0.0, 100.0);
+    final normalised = parsed == parsed.truncateToDouble()
+        ? parsed.toStringAsFixed(0)
+        : parsed.toString();
+    setState(() {
+      _taxRateDisplay = normalised;
+      _editTaxRate = normalised;
+    });
+    context.read<CartProvider>().setTaxRate(parsed);
+    LocalDbService.saveSettings({'tax_rate': normalised});
+    ConnectivityService.instance.syncNow();
+  }
+
   Future<void> _loadSavedCustomers() async {
     final customers = await LocalDbService.getCustomers();
     if (mounted) setState(() => _savedCustomers = customers);
@@ -559,9 +598,11 @@ class _BillingScreenState extends State<BillingScreen> {
     await LocalDbService.assignMissingBarcodeNos();
     final local = await LocalDbService.getProducts();
     final savedCats = await LocalDbService.getCategories();
+    final variantsByProduct = await LocalDbService.getVariantsGroupedByProduct();
     if (mounted)
       setState(() {
         _products = local;
+        _variantsByProduct = variantsByProduct;
         final seen = <String>{};
         // Merge: categories from DB table + categories from products
         final fromProducts = local
@@ -573,6 +614,127 @@ class _BillingScreenState extends State<BillingScreen> {
           ...fromProducts.where((c) => !savedCats.contains(c)),
         ].where((c) => seen.add(c)).toList();
       });
+  }
+
+  (Product, ProductVariant)? _matchVariantByCode(String query) {
+    for (final entry in _variantsByProduct.entries) {
+      for (final v in entry.value) {
+        final matches = _barcodeMatches(v.barcodeNo, query) ||
+            (v.sku.isNotEmpty && v.sku.toLowerCase() == query.toLowerCase());
+        if (matches) {
+          final product = _products.cast<Product?>().firstWhere(
+                (p) => p!.id == entry.key,
+                orElse: () => null,
+              );
+          if (product != null) return (product, v);
+        }
+      }
+    }
+    return null;
+  }
+
+  void _addToCartOrPickVariant(Product product, CartProvider cart) {
+    final variants = _variantsByProduct[product.id] ?? const <ProductVariant>[];
+    if (variants.isEmpty) {
+      cart.addProduct(product);
+      return;
+    }
+    showDialog(
+      context: context,
+      builder: (dCtx) => Dialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 360),
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  product.name,
+                  style: GoogleFonts.manrope(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.textDark,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'Choose a variant',
+                  style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted),
+                ),
+                const SizedBox(height: 14),
+                ...variants.map((v) {
+                  final inCartQty = cart.quantityInCartForVariant(product.id, v.id);
+                  final remaining = v.stock - inCartQty;
+                  final outOfStock = remaining <= 0;
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: outOfStock
+                          ? null
+                          : () {
+                              cart.addVariant(product, v);
+                              Navigator.pop(dCtx);
+                            },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: outOfStock
+                              ? AppColors.surfaceVariant.withValues(alpha: 0.5)
+                              : AppColors.surfaceVariant,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: AppColors.border),
+                        ),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                v.label,
+                                style: GoogleFonts.inter(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                  color: outOfStock
+                                      ? AppColors.textMuted
+                                      : AppColors.textDark,
+                                ),
+                              ),
+                            ),
+                            Text(
+                              outOfStock
+                                  ? 'Out of stock'
+                                  : '$_currencySymbol${v.price.toStringAsFixed(2)}',
+                              style: GoogleFonts.inter(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: outOfStock ? AppColors.error : AppColors.primary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(dCtx),
+                    child: Text(
+                      'Cancel',
+                      style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _loadDashboardData() async {
@@ -1370,6 +1532,24 @@ class _BillingScreenState extends State<BillingScreen> {
                           // Auto-add on exact barcode/SKU match (barcode scanner hit)
                           final query = v.trim();
                           if (query.isNotEmpty) {
+                            final variantMatch = _matchVariantByCode(query);
+                            if (variantMatch != null) {
+                              context.read<CartProvider>().addVariant(
+                                    variantMatch.$1,
+                                    variantMatch.$2,
+                                  );
+                              setState(() {
+                                _searchQuery = '';
+                                _searchController.clear();
+                              });
+                              _showToast(
+                                '${variantMatch.$1.name} (${variantMatch.$2.label}) added to cart',
+                              );
+                              Future.microtask(
+                                () => _searchFocus.requestFocus(),
+                              );
+                              return;
+                            }
                             final match = _products.cast<Product?>().firstWhere(
                               (p) =>
                                   _barcodeMatches(p!.barcodeNo, query) ||
@@ -1377,12 +1557,22 @@ class _BillingScreenState extends State<BillingScreen> {
                               orElse: () => null,
                             );
                             if (match != null) {
-                              context.read<CartProvider>().addProduct(match);
+                              final hasVariants =
+                                  (_variantsByProduct[match.id] ?? const [])
+                                      .isNotEmpty;
+                              if (hasVariants) {
+                                _addToCartOrPickVariant(
+                                  match,
+                                  context.read<CartProvider>(),
+                                );
+                              } else {
+                                context.read<CartProvider>().addProduct(match);
+                                _showToast('${match.name} added to cart');
+                              }
                               setState(() {
                                 _searchQuery = '';
                                 _searchController.clear();
                               });
-                              _showToast('${match.name} added to cart');
                               Future.microtask(
                                 () => _searchFocus.requestFocus(),
                               );
@@ -1395,7 +1585,23 @@ class _BillingScreenState extends State<BillingScreen> {
                             _searchFocus.requestFocus();
                             return;
                           }
-                          // Barcode no match first, then SKU, then name, then partial SKU
+                          // Variant barcode/SKU first, then product barcode, SKU, name, partial SKU
+                          final variantMatch = _matchVariantByCode(query);
+                          if (variantMatch != null) {
+                            context.read<CartProvider>().addVariant(
+                                  variantMatch.$1,
+                                  variantMatch.$2,
+                                );
+                            setState(() {
+                              _searchQuery = '';
+                              _searchController.clear();
+                            });
+                            _showToast(
+                              '${variantMatch.$1.name} (${variantMatch.$2.label}) added to cart',
+                            );
+                            _searchFocus.requestFocus();
+                            return;
+                          }
                           Product? match = _products
                               .cast<Product?>()
                               .firstWhere(
@@ -1417,12 +1623,18 @@ class _BillingScreenState extends State<BillingScreen> {
                             orElse: () => null,
                           );
                           if (match != null) {
-                            context.read<CartProvider>().addProduct(match);
+                            final hasVariants =
+                                (_variantsByProduct[match.id] ?? const []).isNotEmpty;
+                            if (hasVariants) {
+                              _addToCartOrPickVariant(match, context.read<CartProvider>());
+                            } else {
+                              context.read<CartProvider>().addProduct(match);
+                              _showToast('${match.name} added to cart');
+                            }
                             setState(() {
                               _searchQuery = '';
                               _searchController.clear();
                             });
-                            _showToast('${match.name} added to cart');
                           } else {
                             _showToast(
                               'No product found for "$query"',
@@ -1521,12 +1733,32 @@ class _BillingScreenState extends State<BillingScreen> {
                             crossAxisSpacing: 20,
                             childAspectRatio: 0.72,
                           ),
-                      itemCount: _filteredProducts.length,
-                      itemBuilder: (_, i) => _ProductCard(
-                        product: _filteredProducts[i],
-                        onTap: () => cart.addProduct(_filteredProducts[i]),
-                        currencySymbol: _currencySymbol,
-                      ),
+                      itemCount: _displayGridItems.length,
+                      itemBuilder: (_, i) {
+                        final item = _displayGridItems[i];
+                        if (item is Product) {
+                          return _ProductCard(
+                            product: item,
+                            onTap: () => _addToCartOrPickVariant(item, cart),
+                            currencySymbol: _currencySymbol,
+                            variants: _variantsByProduct[item.id] ?? const [],
+                            variantsExpanded:
+                                _expandedVariantProductId == item.id,
+                            onVariantArrowTap: () => setState(() {
+                              _expandedVariantProductId =
+                                  _expandedVariantProductId == item.id
+                                      ? null
+                                      : item.id;
+                            }),
+                          );
+                        }
+                        final pair = item as (Product, ProductVariant);
+                        return _VariantCard(
+                          product: pair.$1,
+                          variant: pair.$2,
+                          currencySymbol: _currencySymbol,
+                        );
+                      },
                     ),
                   );
                 },
@@ -2303,7 +2535,33 @@ class _BillingScreenState extends State<BillingScreen> {
             ],
           ),
           const SizedBox(height: 10),
-          _summaryRow('TAX ($_taxLabel $_taxRateDisplay%)', cart.taxAmount),
+          // Tax rows — one per distinct rate in the cart. Products carry their
+          // own rate; the store-wide rate covers products that don't set one.
+          ...() {
+            final breakdown = cart.taxBreakdown;
+            if (breakdown.isEmpty) {
+              // Nothing taxable yet — keep the store rate visible and editable.
+              return [
+                _TaxSummaryRow(
+                  label: 'TAX ($_taxLabel $_taxRateDisplay%)',
+                  amount: 0,
+                  currencySymbol: _currencySymbol,
+                  rate: _taxRateDisplay,
+                  onRateChanged: _applyTaxRate,
+                ),
+              ];
+            }
+            final rates = breakdown.keys.toList()..sort();
+            return [
+              for (int i = 0; i < rates.length; i++) ...[
+                if (i > 0) const SizedBox(height: 6),
+                _summaryRow(
+                  'TAX ($_taxLabel ${_formatRate(rates[i])}%)',
+                  breakdown[rates[i]]!,
+                ),
+              ],
+            ];
+          }(),
           const SizedBox(height: 12),
           const Divider(height: 1, color: AppColors.border),
           const SizedBox(height: 14),
@@ -2360,6 +2618,147 @@ class _BillingScreenState extends State<BillingScreen> {
       ),
     );
   }
+
+  /// Live price breakdown shown in the product dialogs: base price, the tax it
+  /// attracts, and the final customer-facing price. An empty tax field falls
+  /// back to the store-wide rate, matching how the cart charges it.
+  Widget _finalPriceCard(String priceText, String taxText) {
+    final base = double.tryParse(priceText) ?? 0;
+    final typedRate = double.tryParse(taxText);
+    final rate = (typedRate != null && typedRate > 0)
+        ? typedRate
+        : (double.tryParse(_taxRateDisplay) ?? 0);
+    final taxAmount = base * rate / 100;
+    final finalPrice = base + taxAmount;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            AppColors.primary.withValues(alpha: 0.055),
+            AppColors.accentBlue.withValues(alpha: 0.045),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.primary.withValues(alpha: 0.15)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                'Base price',
+                style: GoogleFonts.inter(
+                  fontSize: 12,
+                  color: AppColors.textMuted,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '$_currencySymbol${base.toStringAsFixed(2)}',
+                style: GoogleFonts.inter(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.textDark,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 7),
+          Row(
+            children: [
+              Text(
+                '$_taxLabel ${_formatRate(rate)}%',
+                style: GoogleFonts.inter(
+                  fontSize: 12,
+                  color: AppColors.textMuted,
+                ),
+              ),
+              if (typedRate == null || typedRate <= 0) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: AppColors.textMuted.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    'store default',
+                    style: GoogleFonts.inter(
+                      fontSize: 9,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                ),
+              ],
+              const Spacer(),
+              Text(
+                '+ $_currencySymbol${taxAmount.toStringAsFixed(2)}',
+                style: GoogleFonts.inter(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.textDark,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Container(height: 1, color: AppColors.primary.withValues(alpha: 0.12)),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'FINAL PRICE',
+                    style: GoogleFonts.inter(
+                      fontSize: 9.5,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textMuted,
+                      letterSpacing: 1.4,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'What the customer pays',
+                    style: GoogleFonts.inter(
+                      fontSize: 10.5,
+                      color: AppColors.textMuted.withValues(alpha: 0.75),
+                    ),
+                  ),
+                ],
+              ),
+              const Spacer(),
+              Text(
+                '$_currencySymbol${finalPrice.toStringAsFixed(2)}',
+                style: GoogleFonts.manrope(
+                  fontSize: 24,
+                  fontWeight: FontWeight.w800,
+                  color: AppColors.primary,
+                  letterSpacing: -0.8,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 5.0 -> "5", 12.5 -> "12.5"
+  String _formatRate(double r) =>
+      r == r.truncateToDouble() ? r.toStringAsFixed(0) : r.toString();
 
   Widget _summaryRow(String label, double amount) {
     return Row(
@@ -7255,29 +7654,16 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
           ),
           Expanded(
-            child: TextFormField(
-              initialValue: value,
+            // Keyed so Flutter doesn't recycle one settings page's field state
+            // onto another page's field.
+            child: _SettingsInput(
+              key: ValueKey('settings-field-$label'),
+              value: value,
               onChanged: onChanged,
               keyboardType: keyboardType,
-              maxLines: obscureText ? 1 : maxLines,
+              maxLines: maxLines,
               obscureText: obscureText,
-              style: GoogleFonts.inter(
-                fontSize: 13.5,
-                color: const Color(0xFF1D1D1F),
-              ),
-              decoration: InputDecoration(
-                border: InputBorder.none,
-                hintText: hint ?? label,
-                hintStyle: GoogleFonts.inter(
-                  fontSize: 13.5,
-                  color: const Color(0xFFC7C7CC),
-                ),
-                isDense: true,
-                contentPadding: maxLines > 1
-                    ? const EdgeInsets.symmetric(vertical: 4)
-                    : EdgeInsets.zero,
-              ),
-              textAlign: TextAlign.right,
+              hintText: hint ?? label,
             ),
           ),
         ],
@@ -9333,7 +9719,7 @@ end tell
 
   // ── Bulk Barcode Print View ──────────────────────────────────────────────────
 
-  void _showBulkPrintDialog() {
+  Future<void> _showBulkPrintDialog() async {
     final labelWCtrl = TextEditingController(
       text: _barcodeLabelW.toStringAsFixed(
         _barcodeLabelW == _barcodeLabelW.truncateToDouble() ? 0 : 1,
@@ -9348,684 +9734,311 @@ end tell
     final searchCtrl = TextEditingController();
     final qtys = Map<String, int>.from(_bulkPrintQtys);
     final selected = Map<String, bool>.from(_bulkPrintSelected);
-    final printers = List<String>.from(_bulkPrinters);
+    List<String> printers = List<String>.from(_bulkPrinters);
     String printer = _barcodePrinter;
     String searchQ = '';
 
-    // Per-product qty TextEditingControllers
+    // Every variant gets its own barcode number and its own label entry.
+    await LocalDbService.assignMissingVariantBarcodeNos();
+    final variantsByProduct = await LocalDbService.getVariantsGroupedByProduct();
+    if (mounted) setState(() => _variantsByProduct = variantsByProduct);
+    final printItems = <Product>[];
+    for (final p in _products) {
+      final pVariants = variantsByProduct[p.id] ?? const <ProductVariant>[];
+      if (pVariants.isEmpty) {
+        printItems.add(p);
+      } else {
+        for (final v in pVariants) {
+          printItems.add(Product(
+            id: v.id,
+            name: '${p.name} — ${v.label}',
+            price: v.price,
+            category: p.category,
+            emoji: p.emoji,
+            sku: v.sku.isNotEmpty ? v.sku : p.sku,
+            stock: v.stock,
+            barcodeNo: v.barcodeNo,
+          ));
+        }
+      }
+    }
+    if (!mounted) return;
+
+    // Per-item qty TextEditingControllers
     final qtyCtrlMap = <String, TextEditingController>{
-      for (final p in _products)
+      for (final p in printItems)
         p.id: TextEditingController(text: '${qtys[p.id] ?? 1}'),
     };
 
     showDialog(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setLocal) {
-          final addedProducts = _products
-              .where((p) => selected[p.id] == true)
-              .toList();
-          final searchResults = searchQ.isEmpty
-              ? <Product>[]
-              : _products.where((p) {
-                  if (selected[p.id] == true) return false; // already added
-                  final q = searchQ.toLowerCase();
-                  return p.name.toLowerCase().contains(q) ||
-                      p.sku.toLowerCase().contains(q);
-                }).toList();
-          final total = addedProducts.fold<int>(
-            0,
-            (s, p) => s + (qtys[p.id] ?? 0),
-          );
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) {
+        if (printers.length <= 1) {
+          Printing.listPrinters().then((list) {
+            final names = <String>['System Default', ...list.map((p) => p.name)];
+            if (ctx.mounted) setLocal(() {
+              printers = names;
+              if (names.contains(_barcodePrinter)) printer = _barcodePrinter;
+            });
+          });
+        }
+        final filteredProducts = searchQ.isEmpty
+          ? printItems
+          : printItems.where((p) {
+              final q = searchQ.toLowerCase();
+              return p.name.toLowerCase().contains(q) || p.sku.toLowerCase().contains(q);
+            }).toList();
+        final total = printItems.where((p) => selected[p.id] == true).fold<int>(0, (s, p) => s + (qtys[p.id] ?? 0));
 
-          return Dialog(
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(20),
-            ),
-            elevation: 0,
-            insetPadding: const EdgeInsets.symmetric(
-              horizontal: 60,
-              vertical: 40,
-            ),
-            child: SizedBox(
-              width: 620,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // ── Header ──
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(22, 20, 18, 16),
-                    child: Row(
-                      children: [
-                        Text(
-                          'Print Barcodes',
-                          style: GoogleFonts.manrope(
-                            fontSize: 17,
-                            fontWeight: FontWeight.w800,
-                            color: AppColors.textDark,
-                          ),
-                        ),
-                        const Spacer(),
-                        InkWell(
-                          onTap: () => Navigator.pop(ctx),
-                          borderRadius: BorderRadius.circular(7),
-                          child: Container(
-                            width: 28,
-                            height: 28,
-                            decoration: BoxDecoration(
-                              color: AppColors.surfaceVariant,
-                              borderRadius: BorderRadius.circular(7),
-                            ),
-                            child: const Icon(
-                              Icons.close_rounded,
-                              size: 15,
-                              color: AppColors.textMuted,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
+        return Dialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          elevation: 0,
+          insetPadding: const EdgeInsets.symmetric(horizontal: 60, vertical: 40),
+          child: SizedBox(
+            width: 620,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              // ── Header ──
+              Padding(
+                padding: const EdgeInsets.fromLTRB(22, 20, 18, 16),
+                child: Row(children: [
+                  Text('Print Barcodes', style: GoogleFonts.manrope(fontSize: 17, fontWeight: FontWeight.w800, color: AppColors.textDark)),
+                  const Spacer(),
+                  InkWell(
+                    onTap: () => Navigator.pop(ctx),
+                    borderRadius: BorderRadius.circular(7),
+                    child: Container(width: 28, height: 28,
+                      decoration: BoxDecoration(color: AppColors.surfaceVariant, borderRadius: BorderRadius.circular(7)),
+                      child: const Icon(Icons.close_rounded, size: 15, color: AppColors.textMuted)),
                   ),
-                  // ── Settings bar ──
-                  Container(
-                    margin: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 10,
-                    ),
-                    decoration: BoxDecoration(
-                      color: AppColors.surfaceVariant,
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Row(
-                      children: [
-                        Text(
-                          'Size',
-                          style: GoogleFonts.inter(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                            color: AppColors.textMuted,
-                          ),
-                        ),
-                        const SizedBox(width: 7),
-                        _miniNumField(labelWCtrl, 'W', 60),
-                        const SizedBox(width: 5),
-                        _miniNumField(labelHCtrl, 'H', 60),
-                        const SizedBox(width: 16),
-                        Text(
-                          'Per Row',
-                          style: GoogleFonts.inter(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                            color: AppColors.textMuted,
-                          ),
-                        ),
-                        const SizedBox(width: 7),
-                        _miniNumField(perRowCtrl, '', 44),
-                        const SizedBox(width: 16),
-                        const Icon(
-                          Icons.print_outlined,
-                          size: 14,
-                          color: AppColors.textMuted,
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<String>(
-                              value: printers.contains(printer)
-                                  ? printer
-                                  : 'System Default',
-                              isDense: true,
-                              isExpanded: true,
-                              icon: const Icon(
-                                Icons.keyboard_arrow_down_rounded,
-                                size: 14,
-                                color: AppColors.textMuted,
-                              ),
-                              items: printers
-                                  .map(
-                                    (n) => DropdownMenuItem(
-                                      value: n,
-                                      child: Text(
-                                        n,
-                                        style: GoogleFonts.inter(
-                                          fontSize: 12,
-                                          color: AppColors.textDark,
-                                        ),
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  )
-                                  .toList(),
-                              onChanged: (v) => setLocal(
-                                () => printer = v ?? 'System Default',
-                              ),
-                              style: GoogleFonts.inter(
-                                fontSize: 12,
-                                color: AppColors.textDark,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  // ── Search to add ──
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-                    child: Column(
-                      children: [
-                        Container(
-                          height: 38,
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(color: AppColors.border),
-                          ),
-                          child: Row(
-                            children: [
-                              const SizedBox(width: 10),
-                              const Icon(
-                                Icons.add_circle_outline_rounded,
-                                size: 16,
-                                color: AppColors.textMuted,
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: TextField(
-                                  controller: searchCtrl,
-                                  onChanged: (v) => setLocal(() => searchQ = v),
-                                  style: GoogleFonts.inter(
-                                    fontSize: 13,
-                                    color: AppColors.textDark,
-                                  ),
-                                  decoration: InputDecoration(
-                                    isDense: true,
-                                    border: InputBorder.none,
-                                    hintText: 'Search to add products…',
-                                    hintStyle: GoogleFonts.inter(
-                                      fontSize: 13,
-                                      color: AppColors.textMuted,
-                                    ),
-                                    contentPadding: EdgeInsets.zero,
-                                  ),
-                                ),
-                              ),
-                              if (searchQ.isNotEmpty)
-                                InkWell(
-                                  onTap: () {
-                                    searchCtrl.clear();
-                                    setLocal(() => searchQ = '');
-                                  },
-                                  borderRadius: BorderRadius.circular(12),
-                                  child: const Padding(
-                                    padding: EdgeInsets.all(6),
-                                    child: Icon(
-                                      Icons.close_rounded,
-                                      size: 14,
-                                      color: AppColors.textMuted,
-                                    ),
-                                  ),
-                                ),
-                              const SizedBox(width: 6),
-                            ],
-                          ),
-                        ),
-                        // Search results dropdown
-                        if (searchResults.isNotEmpty)
-                          Container(
-                            constraints: const BoxConstraints(maxHeight: 180),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(color: AppColors.border),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: Colors.black.withValues(alpha: 0.06),
-                                  blurRadius: 8,
-                                  offset: const Offset(0, 3),
-                                ),
-                              ],
-                            ),
-                            child: ListView.separated(
-                              shrinkWrap: true,
-                              itemCount: searchResults.length,
-                              separatorBuilder: (_, __) =>
-                                  Divider(height: 1, color: AppColors.border),
-                              itemBuilder: (_, i) {
-                                final p = searchResults[i];
-                                return InkWell(
-                                  onTap: () {
-                                    setLocal(() {
-                                      selected[p.id] = true;
-                                      if (!qtys.containsKey(p.id)) {
-                                        qtys[p.id] = p.stock > 0 ? p.stock : 1;
-                                        qtyCtrlMap[p.id]?.text =
-                                            '${qtys[p.id]}';
-                                      }
-                                      searchCtrl.clear();
-                                      searchQ = '';
-                                    });
-                                  },
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 14,
-                                      vertical: 9,
-                                    ),
-                                    child: Row(
-                                      children: [
-                                        Container(
-                                          width: 44,
-                                          height: 20,
-                                          decoration: BoxDecoration(
-                                            color: const Color(0xFFF5F5F5),
-                                            borderRadius: BorderRadius.circular(
-                                              3,
-                                            ),
-                                          ),
-                                          child: CustomPaint(
-                                            painter: _BarcodePainter(
-                                              p.barcodeNo.isNotEmpty
-                                                  ? p.barcodeNo
-                                                  : p.sku,
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 10),
-                                        Expanded(
-                                          child: Column(
-                                            crossAxisAlignment:
-                                                CrossAxisAlignment.start,
-                                            children: [
-                                              Text(
-                                                p.name,
-                                                style: GoogleFonts.inter(
-                                                  fontSize: 12,
-                                                  fontWeight: FontWeight.w600,
-                                                  color: AppColors.textDark,
-                                                ),
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                              Text(
-                                                '${p.sku}  ·  ${p.stock} in stock',
-                                                style: GoogleFonts.inter(
-                                                  fontSize: 10,
-                                                  color: AppColors.textMuted,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 8,
-                                            vertical: 4,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: AppColors.primary.withValues(
-                                              alpha: 0.1,
-                                            ),
-                                            borderRadius: BorderRadius.circular(
-                                              6,
-                                            ),
-                                          ),
-                                          child: Text(
-                                            'Add',
-                                            style: GoogleFonts.inter(
-                                              fontSize: 11,
-                                              fontWeight: FontWeight.w600,
-                                              color: AppColors.primary,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                );
-                              },
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                  // ── Added products grid ──
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 340),
-                      child: addedProducts.isEmpty
-                          ? Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 32),
-                              child: Center(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      Icons.inbox_outlined,
-                                      size: 32,
-                                      color: AppColors.textMuted.withValues(
-                                        alpha: 0.4,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Text(
-                                      'Search above to add products',
-                                      style: GoogleFonts.inter(
-                                        fontSize: 13,
-                                        color: AppColors.textMuted,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            )
-                          : GridView.builder(
-                              shrinkWrap: true,
-                              gridDelegate:
-                                  const SliverGridDelegateWithFixedCrossAxisCount(
-                                    crossAxisCount: 3,
-                                    crossAxisSpacing: 10,
-                                    mainAxisSpacing: 10,
-                                    childAspectRatio: 1.3,
-                                  ),
-                              itemCount: addedProducts.length,
-                              itemBuilder: (_, i) {
-                                final p = addedProducts[i];
-                                final qty = qtys[p.id] ?? 1;
-                                final qtyCtrl = qtyCtrlMap[p.id] ??=
-                                    TextEditingController(text: '$qty');
-                                return Container(
-                                  decoration: BoxDecoration(
-                                    color: Colors.white,
-                                    borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(color: AppColors.border),
-                                  ),
-                                  child: Padding(
-                                    padding: const EdgeInsets.fromLTRB(
-                                      10,
-                                      8,
-                                      8,
-                                      8,
-                                    ),
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        // Name + remove
-                                        Row(
-                                          children: [
-                                            Expanded(
-                                              child: Text(
-                                                p.name,
-                                                style: GoogleFonts.inter(
-                                                  fontSize: 11,
-                                                  fontWeight: FontWeight.w600,
-                                                  color: AppColors.textDark,
-                                                ),
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                            ),
-                                            InkWell(
-                                              onTap: () => setLocal(
-                                                () => selected[p.id] = false,
-                                              ),
-                                              borderRadius:
-                                                  BorderRadius.circular(10),
-                                              child: const Padding(
-                                                padding: EdgeInsets.all(2),
-                                                child: Icon(
-                                                  Icons.close_rounded,
-                                                  size: 13,
-                                                  color: AppColors.textMuted,
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                        const SizedBox(height: 5),
-                                        // Barcode
-                                        Container(
-                                          width: double.infinity,
-                                          height: 30,
-                                          decoration: BoxDecoration(
-                                            color: const Color(0xFFF5F5F5),
-                                            borderRadius: BorderRadius.circular(
-                                              5,
-                                            ),
-                                          ),
-                                          child: CustomPaint(
-                                            painter: _BarcodePainter(
-                                              p.barcodeNo.isNotEmpty
-                                                  ? p.barcodeNo
-                                                  : p.sku,
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(height: 4),
-                                        Text(
-                                          p.sku,
-                                          style: GoogleFonts.inter(
-                                            fontSize: 9,
-                                            color: AppColors.textMuted,
-                                          ),
-                                        ),
-                                        const Spacer(),
-                                        // Editable qty stepper
-                                        Container(
-                                          height: 28,
-                                          decoration: BoxDecoration(
-                                            color: AppColors.surfaceVariant,
-                                            borderRadius: BorderRadius.circular(
-                                              7,
-                                            ),
-                                          ),
-                                          child: Row(
-                                            children: [
-                                              InkWell(
-                                                onTap: qty > 1
-                                                    ? () {
-                                                        setLocal(
-                                                          () => qtys[p.id] =
-                                                              qty - 1,
-                                                        );
-                                                        qtyCtrl.text =
-                                                            '${qty - 1}';
-                                                      }
-                                                    : null,
-                                                borderRadius:
-                                                    const BorderRadius.horizontal(
-                                                      left: Radius.circular(6),
-                                                    ),
-                                                child: Container(
-                                                  width: 26,
-                                                  height: 28,
-                                                  alignment: Alignment.center,
-                                                  child: Icon(
-                                                    Icons.remove_rounded,
-                                                    size: 11,
-                                                    color: qty > 1
-                                                        ? AppColors.textDark
-                                                        : AppColors.textMuted,
-                                                  ),
-                                                ),
-                                              ),
-                                              Container(
-                                                width: 1,
-                                                height: 16,
-                                                color: AppColors.border,
-                                              ),
-                                              Expanded(
-                                                child: TextFormField(
-                                                  controller: qtyCtrl,
-                                                  keyboardType:
-                                                      TextInputType.number,
-                                                  textAlign: TextAlign.center,
-                                                  style: GoogleFonts.inter(
-                                                    fontSize: 12,
-                                                    fontWeight: FontWeight.w700,
-                                                    color: AppColors.textDark,
-                                                  ),
-                                                  decoration:
-                                                      const InputDecoration(
-                                                        isDense: true,
-                                                        border:
-                                                            InputBorder.none,
-                                                        contentPadding:
-                                                            EdgeInsets.zero,
-                                                      ),
-                                                  onChanged: (v) {
-                                                    final n = int.tryParse(v);
-                                                    if (n != null && n > 0)
-                                                      setLocal(
-                                                        () => qtys[p.id] = n,
-                                                      );
-                                                  },
-                                                ),
-                                              ),
-                                              Container(
-                                                width: 1,
-                                                height: 16,
-                                                color: AppColors.border,
-                                              ),
-                                              InkWell(
-                                                onTap: () {
-                                                  setLocal(
-                                                    () => qtys[p.id] = qty + 1,
-                                                  );
-                                                  qtyCtrl.text = '${qty + 1}';
-                                                },
-                                                borderRadius:
-                                                    const BorderRadius.horizontal(
-                                                      right: Radius.circular(6),
-                                                    ),
-                                                child: Container(
-                                                  width: 26,
-                                                  height: 28,
-                                                  alignment: Alignment.center,
-                                                  child: const Icon(
-                                                    Icons.add_rounded,
-                                                    size: 11,
-                                                    color: AppColors.textDark,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                );
-                              },
-                            ),
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  // ── Footer ──
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
-                    child: Row(
-                      children: [
-                        Text(
-                          '$total label${total != 1 ? 's' : ''} to print',
-                          style: GoogleFonts.inter(
-                            fontSize: 12,
-                            color: AppColors.textMuted,
-                          ),
-                        ),
-                        const Spacer(),
-                        OutlinedButton(
-                          onPressed: () => Navigator.pop(ctx),
-                          style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 18,
-                              vertical: 11,
-                            ),
-                            side: const BorderSide(color: AppColors.border),
-                            foregroundColor: AppColors.textMuted,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                          ),
-                          child: Text(
-                            'Cancel',
-                            style: GoogleFonts.inter(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        ElevatedButton.icon(
-                          onPressed: total == 0
-                              ? null
-                              : () async {
-                                  final w =
-                                      double.tryParse(labelWCtrl.text) ??
-                                      _barcodeLabelW;
-                                  final h =
-                                      double.tryParse(labelHCtrl.text) ??
-                                      _barcodeLabelH;
-                                  final perRow =
-                                      int.tryParse(perRowCtrl.text) ??
-                                      _barcodePerRow;
-                                  Navigator.pop(ctx);
-                                  setState(() {
-                                    _barcodeLabelW = w;
-                                    _barcodeLabelH = h;
-                                    _barcodePerRow = perRow;
-                                    _barcodePrinter = printer;
-                                  });
-                                  LocalDbService.saveSettings({
-                                    'barcode_label_w': w.toString(),
-                                    'barcode_label_h': h.toString(),
-                                    'barcode_per_row': perRow.toString(),
-                                    'barcode_printer': printer,
-                                  });
-                                  final selProducts = _products
-                                      .where((p) => selected[p.id] == true)
-                                      .toList();
-                                  await _printAllBarcodesWithQty(
-                                    selProducts,
-                                    qtys,
-                                    labelW: w,
-                                    labelH: h,
-                                    labelsPerRow: perRow,
-                                    printerName: printer,
-                                  );
-                                },
-                          icon: const Icon(Icons.print_rounded, size: 15),
-                          label: Text(
-                            'Print $total Label${total != 1 ? 's' : ''}',
-                            style: GoogleFonts.inter(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: AppColors.primary,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 20,
-                              vertical: 11,
-                            ),
-                            elevation: 0,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+                ]),
               ),
-            ),
-          );
-        },
-      ),
+              // ── Settings bar ──
+              Container(
+                margin: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(color: AppColors.surfaceVariant, borderRadius: BorderRadius.circular(10)),
+                child: Row(children: [
+                  Text('Size', style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w500, color: AppColors.textMuted)),
+                  const SizedBox(width: 7),
+                  _miniNumField(labelWCtrl, 'W', 60),
+                  const SizedBox(width: 5),
+                  _miniNumField(labelHCtrl, 'H', 60),
+                  const SizedBox(width: 16),
+                  Text('Per Row', style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w500, color: AppColors.textMuted)),
+                  const SizedBox(width: 7),
+                  _miniNumField(perRowCtrl, '', 44),
+                  const SizedBox(width: 16),
+                  const Icon(Icons.print_outlined, size: 14, color: AppColors.textMuted),
+                  const SizedBox(width: 6),
+                  Expanded(child: DropdownButtonHideUnderline(child: DropdownButton<String>(
+                    value: printers.contains(printer) ? printer : 'System Default',
+                    isDense: true, isExpanded: true,
+                    icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 14, color: AppColors.textMuted),
+                    items: printers.map((n) => DropdownMenuItem(value: n,
+                      child: Text(n, style: GoogleFonts.inter(fontSize: 12, color: AppColors.textDark), overflow: TextOverflow.ellipsis))).toList(),
+                    onChanged: (v) => setLocal(() => printer = v ?? 'System Default'),
+                    style: GoogleFonts.inter(fontSize: 12, color: AppColors.textDark),
+                  ))),
+                ]),
+              ),
+              // ── Search bar ──
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                child: Container(
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: AppColors.border),
+                  ),
+                  child: Row(children: [
+                    const SizedBox(width: 10),
+                    const Icon(Icons.search_rounded, size: 16, color: AppColors.textMuted),
+                    const SizedBox(width: 8),
+                    Expanded(child: TextField(
+                      controller: searchCtrl,
+                      onChanged: (v) => setLocal(() => searchQ = v),
+                      style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+                      decoration: InputDecoration(
+                        isDense: true, border: InputBorder.none,
+                        hintText: 'Search products…',
+                        hintStyle: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    )),
+                    if (searchQ.isNotEmpty) InkWell(
+                      onTap: () { searchCtrl.clear(); setLocal(() => searchQ = ''); },
+                      borderRadius: BorderRadius.circular(12),
+                      child: const Padding(padding: EdgeInsets.all(6),
+                        child: Icon(Icons.close_rounded, size: 14, color: AppColors.textMuted)),
+                    ),
+                    const SizedBox(width: 6),
+                  ]),
+                ),
+              ),
+              // ── Products grid ──
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 340),
+                  child: filteredProducts.isEmpty
+                    ? Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 32),
+                        child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.search_off_rounded, size: 32, color: AppColors.textMuted.withValues(alpha: 0.4)),
+                          const SizedBox(height: 8),
+                          Text('No products found', style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted)),
+                        ])),
+                      )
+                    : GridView.builder(
+                        shrinkWrap: true,
+                        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 3,
+                          crossAxisSpacing: 10,
+                          mainAxisSpacing: 10,
+                          childAspectRatio: 1.3,
+                        ),
+                        itemCount: filteredProducts.length,
+                        itemBuilder: (_, i) {
+                          final p = filteredProducts[i];
+                          final isSelected = selected[p.id] == true;
+                          final qty = qtys[p.id] ?? 1;
+                          final qtyCtrl = qtyCtrlMap[p.id] ??= TextEditingController(text: '$qty');
+                          return GestureDetector(
+                            onTap: () {
+                              setLocal(() {
+                                if (isSelected) {
+                                  selected[p.id] = false;
+                                } else {
+                                  selected[p.id] = true;
+                                  if (!qtys.containsKey(p.id)) {
+                                    qtys[p.id] = p.stock > 0 ? p.stock : 1;
+                                    qtyCtrlMap[p.id]?.text = '${qtys[p.id]}';
+                                  }
+                                }
+                              });
+                            },
+                            child: Stack(children: [
+                              Container(
+                                decoration: BoxDecoration(
+                                  color: isSelected ? AppColors.primary.withValues(alpha: 0.04) : Colors.white,
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: isSelected ? AppColors.primary : AppColors.border,
+                                    width: isSelected ? 2 : 1,
+                                  ),
+                                ),
+                                child: Padding(
+                                  padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+                                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                    Padding(
+                                      padding: const EdgeInsets.only(right: 14),
+                                      child: Text(p.name,
+                                        style: GoogleFonts.inter(fontSize: 11, fontWeight: FontWeight.w600,
+                                          color: isSelected ? AppColors.primary : AppColors.textDark),
+                                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                                    ),
+                                    const SizedBox(height: 5),
+                                    Container(
+                                      width: double.infinity, height: 30,
+                                      decoration: BoxDecoration(color: const Color(0xFFF5F5F5), borderRadius: BorderRadius.circular(5)),
+                                      child: CustomPaint(painter: _BarcodePainter(p.sku))),
+                                    const SizedBox(height: 4),
+                                    Text(p.sku, style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted)),
+                                    const Spacer(),
+                                    if (isSelected) Container(
+                                      height: 28,
+                                      decoration: BoxDecoration(color: AppColors.surfaceVariant, borderRadius: BorderRadius.circular(7)),
+                                      child: Row(children: [
+                                        InkWell(
+                                          onTap: qty > 1 ? () { setLocal(() => qtys[p.id] = qty - 1); qtyCtrl.text = '${qty - 1}'; } : null,
+                                          borderRadius: const BorderRadius.horizontal(left: Radius.circular(6)),
+                                          child: Container(width: 26, height: 28, alignment: Alignment.center,
+                                            child: Icon(Icons.remove_rounded, size: 11, color: qty > 1 ? AppColors.textDark : AppColors.textMuted))),
+                                        Container(width: 1, height: 16, color: AppColors.border),
+                                        Expanded(child: TextFormField(
+                                          controller: qtyCtrl,
+                                          keyboardType: TextInputType.number,
+                                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                                          textAlign: TextAlign.center,
+                                          style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w700, color: AppColors.textDark),
+                                          decoration: const InputDecoration(isDense: true, border: InputBorder.none, contentPadding: EdgeInsets.zero),
+                                          onChanged: (v) { final n = int.tryParse(v); if (n != null && n > 0) setLocal(() => qtys[p.id] = n); },
+                                        )),
+                                        Container(width: 1, height: 16, color: AppColors.border),
+                                        InkWell(
+                                          onTap: () { setLocal(() => qtys[p.id] = qty + 1); qtyCtrl.text = '${qty + 1}'; },
+                                          borderRadius: const BorderRadius.horizontal(right: Radius.circular(6)),
+                                          child: Container(width: 26, height: 28, alignment: Alignment.center,
+                                            child: const Icon(Icons.add_rounded, size: 11, color: AppColors.textDark))),
+                                      ]),
+                                    ) else Padding(
+                                      padding: const EdgeInsets.only(top: 2),
+                                      child: Text('${p.stock} in stock',
+                                        style: GoogleFonts.inter(fontSize: 9, color: AppColors.textMuted)),
+                                    ),
+                                  ]),
+                                ),
+                              ),
+                              if (isSelected) Positioned(
+                                top: 6, right: 6,
+                                child: Container(
+                                  width: 18, height: 18,
+                                  decoration: const BoxDecoration(color: AppColors.primary, shape: BoxShape.circle),
+                                  child: const Icon(Icons.check_rounded, size: 12, color: Colors.white),
+                                ),
+                              ),
+                            ]),
+                          );
+                        },
+                      ),
+                ),
+              ),
+              const SizedBox(height: 4),
+              // ── Footer ──
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+                child: Row(children: [
+                  Text('$total label${total != 1 ? 's' : ''} to print',
+                      style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted)),
+                  const Spacer(),
+                  OutlinedButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
+                      side: const BorderSide(color: AppColors.border),
+                      foregroundColor: AppColors.textMuted,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    child: Text('Cancel', style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w500)),
+                  ),
+                  const SizedBox(width: 10),
+                  ElevatedButton.icon(
+                    onPressed: total == 0 ? null : () async {
+                      final w = double.tryParse(labelWCtrl.text) ?? _barcodeLabelW;
+                      final h = double.tryParse(labelHCtrl.text) ?? _barcodeLabelH;
+                      final perRow = int.tryParse(perRowCtrl.text) ?? _barcodePerRow;
+                      Navigator.pop(ctx);
+                      setState(() { _barcodeLabelW = w; _barcodeLabelH = h; _barcodePerRow = perRow; _barcodePrinter = printer; });
+                      LocalDbService.saveSettings({'barcode_label_w': w.toString(), 'barcode_label_h': h.toString(), 'barcode_per_row': perRow.toString(), 'barcode_printer': printer});
+                      final selProducts = printItems.where((p) => selected[p.id] == true).toList();
+                      await _printAllBarcodesWithQty(selProducts, qtys, labelW: w, labelH: h, labelsPerRow: perRow, printerName: printer);
+                    },
+                    icon: const Icon(Icons.print_rounded, size: 15),
+                    label: Text('Print $total Label${total != 1 ? 's' : ''}',
+                        style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.primary, foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 11),
+                      elevation: 0, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                  ),
+                ]),
+              ),
+            ]),
+          ),
+        );
+      }),
     );
   }
 
@@ -10823,7 +10836,20 @@ end tell
     );
   }
 
+  String _variantPriceRangeLabel(List<ProductVariant> variants) {
+    final prices = variants.map((v) => v.price).toList()..sort();
+    if (prices.first == prices.last) {
+      return '$_currencySymbol${prices.first.toStringAsFixed(2)}';
+    }
+    return '$_currencySymbol${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
+  }
+
   Widget _inventoryCard(Product p) {
+    final variants = _variantsByProduct[p.id] ?? const <ProductVariant>[];
+    final hasVariants = variants.isNotEmpty;
+    final displayStock = hasVariants
+        ? variants.fold<int>(0, (s, v) => s + v.stock)
+        : p.stock;
     final tags = p.description.isNotEmpty
         ? p.description
               .split(RegExp(r'[,\n]'))
@@ -10831,13 +10857,13 @@ end tell
               .where((t) => t.isNotEmpty)
               .toList()
         : <String>[];
-    final (statusLabel, statusColor, statusBg) = p.stock == 0
+    final (statusLabel, statusColor, statusBg) = displayStock == 0
         ? (
             'Out of Stock',
             AppColors.error,
             AppColors.error.withValues(alpha: 0.08),
           )
-        : p.stock < 10
+        : displayStock < 10
         ? (
             'Low Stock',
             const Color(0xFFF59E0B),
@@ -11098,7 +11124,9 @@ end tell
           Row(
             children: [
               Text(
-                '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                hasVariants
+                    ? _variantPriceRangeLabel(variants)
+                    : '$_currencySymbol${p.price.toStringAsFixed(2)}',
                 style: GoogleFonts.manrope(
                   fontSize: 14,
                   fontWeight: FontWeight.w800,
@@ -11107,15 +11135,22 @@ end tell
               ),
               const Spacer(),
               Text(
-                '${p.stock} pcs',
+                '$displayStock pcs',
                 style: GoogleFonts.inter(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
-                  color: p.stock < 10 ? AppColors.error : AppColors.textMuted,
+                  color: displayStock < 10 ? AppColors.error : AppColors.textMuted,
                 ),
               ),
             ],
           ),
+          if (hasVariants) ...[
+            const SizedBox(height: 4),
+            Text(
+              '${variants.length} variant${variants.length == 1 ? '' : 's'}',
+              style: GoogleFonts.inter(fontSize: 10, color: AppColors.textMuted),
+            ),
+          ],
         ],
       ),
     );
@@ -12166,7 +12201,153 @@ end tell
     );
   }
 
-  void _showEditProductDialog(Product p) {
+  Future<String?> _promptVariantName(BuildContext parentCtx, {String? initial}) {
+    final ctrl = TextEditingController(text: initial ?? '');
+    return showDialog<String>(
+      context: parentCtx,
+      builder: (dCtx) => Dialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        child: Padding(
+          padding: const EdgeInsets.all(22),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                initial == null ? 'Add Variant' : 'Rename Variant',
+                style: GoogleFonts.manrope(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: AppColors.textDark,
+                ),
+              ),
+              const SizedBox(height: 14),
+              _dlgLabel('VARIANT NAME'),
+              const SizedBox(height: 6),
+              SizedBox(
+                width: 300,
+                child: TextField(
+                  controller: ctrl,
+                  autofocus: true,
+                  style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+                  decoration: _dlgInputDecor('e.g. 128GB / Blue'),
+                  onSubmitted: (v) {
+                    final t = v.trim();
+                    if (t.isNotEmpty) Navigator.pop(dCtx, t);
+                  },
+                ),
+              ),
+              const SizedBox(height: 18),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dCtx),
+                    child: Text(
+                      'Cancel',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        color: AppColors.textMuted,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton(
+                    onPressed: () {
+                      final t = ctrl.text.trim();
+                      if (t.isNotEmpty) Navigator.pop(dCtx, t);
+                    },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.primary,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      elevation: 0,
+                    ),
+                    child: Text(
+                      initial == null ? 'Add' : 'Save',
+                      style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _variantDropdown({
+    required List<ProductVariant> variants,
+    required String? selectedId,
+    required ValueChanged<String?> onSelect,
+    required VoidCallback onAdd,
+  }) {
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      alignment: Alignment.centerLeft,
+      decoration: BoxDecoration(
+        color: AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: selectedId ?? '__base__',
+          isExpanded: true,
+          isDense: true,
+          style: GoogleFonts.inter(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: AppColors.textDark,
+          ),
+          items: [
+            const DropdownMenuItem(
+              value: '__base__',
+              child: Text('Base product'),
+            ),
+            ...variants.map(
+              (v) => DropdownMenuItem(
+                value: v.id,
+                child: Text(v.label, overflow: TextOverflow.ellipsis),
+              ),
+            ),
+            DropdownMenuItem(
+              value: '__add__',
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.add_rounded, size: 14, color: AppColors.primary),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Add variant',
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.primary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          onChanged: (val) {
+            if (val == '__add__') {
+              onAdd();
+              return;
+            }
+            onSelect(val == '__base__' ? null : val);
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showEditProductDialog(Product p) async {
     final formKey = GlobalKey<FormState>();
     final nameCtrl = TextEditingController(text: p.name);
     final skuCtrl = TextEditingController(text: p.sku);
@@ -12192,6 +12373,47 @@ end tell
     String category = _userCategories.contains(p.category)
         ? p.category
         : (_userCategories..add(p.category)).last;
+    final originalVariants = await LocalDbService.getVariantsForProduct(p.id);
+    final originalVariantIds = originalVariants.map((v) => v.id).toSet();
+    List<ProductVariant> variants = List.of(originalVariants);
+    if (!mounted) return;
+
+    // Which variant the price/stock fields currently edit (null = base product).
+    String? selectedVariantId;
+    String basePriceText = priceCtrl.text;
+    String baseBuyingText = buyingPriceCtrl.text;
+    String baseStockText = stockCtrl.text;
+
+    void commitFields() {
+      if (selectedVariantId == null) {
+        basePriceText = priceCtrl.text;
+        baseBuyingText = buyingPriceCtrl.text;
+        baseStockText = stockCtrl.text;
+      } else {
+        final idx = variants.indexWhere((v) => v.id == selectedVariantId);
+        if (idx != -1) {
+          variants[idx] = variants[idx].copyWith(
+            price: double.tryParse(priceCtrl.text) ?? variants[idx].price,
+            buyingPrice: double.tryParse(buyingPriceCtrl.text) ?? 0.0,
+            stock: int.tryParse(stockCtrl.text) ?? variants[idx].stock,
+          );
+        }
+      }
+    }
+
+    void loadFields() {
+      if (selectedVariantId == null) {
+        priceCtrl.text = basePriceText;
+        buyingPriceCtrl.text = baseBuyingText;
+        stockCtrl.text = baseStockText;
+      } else {
+        final v = variants.firstWhere((x) => x.id == selectedVariantId);
+        priceCtrl.text = v.price.toStringAsFixed(2);
+        buyingPriceCtrl.text =
+            v.buyingPrice > 0 ? v.buyingPrice.toStringAsFixed(2) : '';
+        stockCtrl.text = '${v.stock}';
+      }
+    }
 
     showDialog(
       context: context,
@@ -12350,22 +12572,139 @@ end tell
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    _dlgLabel('PRODUCT NAME'),
-                                    const SizedBox(height: 6),
-                                    TextFormField(
-                                      controller: nameCtrl,
-                                      validator: (v) =>
-                                          v != null && v.trim().isNotEmpty
-                                          ? null
-                                          : 'Required',
-                                      style: GoogleFonts.inter(
-                                        fontSize: 13,
-                                        color: AppColors.textDark,
-                                      ),
-                                      decoration: _dlgInputDecor(
-                                        'e.g. Wireless Keyboard',
-                                      ),
+                                    Row(
+                                      children: [
+                                        Expanded(child: _dlgLabel('PRODUCT NAME')),
+                                        SizedBox(
+                                          width: 158,
+                                          child: _dlgLabel('VARIANT'),
+                                        ),
+                                      ],
                                     ),
+                                    const SizedBox(height: 6),
+                                    Row(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Expanded(
+                                          child: TextFormField(
+                                            controller: nameCtrl,
+                                            validator: (v) =>
+                                                v != null && v.trim().isNotEmpty
+                                                ? null
+                                                : 'Required',
+                                            style: GoogleFonts.inter(
+                                              fontSize: 13,
+                                              color: AppColors.textDark,
+                                            ),
+                                            decoration: _dlgInputDecor(
+                                              'e.g. Wireless Keyboard',
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        SizedBox(
+                                          width: 148,
+                                          child: _variantDropdown(
+                                            variants: variants,
+                                            selectedId: selectedVariantId,
+                                            onSelect: (id) => setLocal(() {
+                                              commitFields();
+                                              selectedVariantId = id;
+                                              loadFields();
+                                            }),
+                                            onAdd: () async {
+                                              final name =
+                                                  await _promptVariantName(ctx);
+                                              if (name == null || name.isEmpty) {
+                                                return;
+                                              }
+                                              setLocal(() {
+                                                commitFields();
+                                                final v = ProductVariant(
+                                                  id: const Uuid().v4(),
+                                                  productId: p.id,
+                                                  label: name,
+                                                  price: double.tryParse(
+                                                          priceCtrl.text) ??
+                                                      p.price,
+                                                  stock: 0,
+                                                );
+                                                variants.add(v);
+                                                selectedVariantId = v.id;
+                                                loadFields();
+                                              });
+                                            },
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    if (selectedVariantId != null) ...[
+                                      const SizedBox(height: 6),
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: Text(
+                                              'Price & stock below apply to this variant',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                color: AppColors.textMuted,
+                                              ),
+                                            ),
+                                          ),
+                                          GestureDetector(
+                                            onTap: () async {
+                                              final v = variants.firstWhere(
+                                                (x) => x.id == selectedVariantId,
+                                              );
+                                              final name =
+                                                  await _promptVariantName(
+                                                ctx,
+                                                initial: v.label,
+                                              );
+                                              if (name == null || name.isEmpty) {
+                                                return;
+                                              }
+                                              setLocal(() {
+                                                final idx = variants.indexWhere(
+                                                  (x) =>
+                                                      x.id == selectedVariantId,
+                                                );
+                                                if (idx != -1) {
+                                                  variants[idx] = variants[idx]
+                                                      .copyWith(label: name);
+                                                }
+                                              });
+                                            },
+                                            child: Text(
+                                              'Rename',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w600,
+                                                color: AppColors.primary,
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 10),
+                                          GestureDetector(
+                                            onTap: () => setLocal(() {
+                                              variants.removeWhere(
+                                                (x) => x.id == selectedVariantId,
+                                              );
+                                              selectedVariantId = null;
+                                              loadFields();
+                                            }),
+                                            child: Text(
+                                              'Remove',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w600,
+                                                color: AppColors.error,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
                                   ],
                                 ),
                               ),
@@ -12501,6 +12840,7 @@ end tell
                                               double.tryParse(v) != null
                                           ? null
                                           : 'Required',
+                                      onChanged: (_) => setLocal(() {}),
                                       style: GoogleFonts.inter(
                                         fontSize: 13,
                                         color: AppColors.textDark,
@@ -12587,18 +12927,24 @@ end tell
                                           RegExp(r'^\d*\.?\d{0,2}'),
                                         ),
                                       ],
+                                      onChanged: (_) => setLocal(() {}),
                                       style: GoogleFonts.inter(
                                         fontSize: 13,
                                         color: AppColors.textDark,
                                       ),
-                                      decoration: _dlgInputDecor('0.00'),
+                                      // Empty = fall back to the store-wide rate
+                                      decoration: _dlgInputDecor(
+                                        '$_taxRateDisplay (default)',
+                                      ),
                                     ),
                                   ],
                                 ),
                               ),
                             ],
                           ),
-                          const SizedBox(height: 16),
+                          const SizedBox(height: 18),
+                          _finalPriceCard(priceCtrl.text, taxPercentCtrl.text),
+                          const SizedBox(height: 18),
                           _dlgLabel('TAGS'),
                           const SizedBox(height: 6),
                           Container(
@@ -12787,6 +13133,7 @@ end tell
                         ElevatedButton(
                           onPressed: () async {
                             if (!formKey.currentState!.validate()) return;
+                            commitFields();
                             final pendingTag = tagInputCtrl.text.trim();
                             if (pendingTag.isNotEmpty &&
                                 !tags.contains(pendingTag)) {
@@ -12795,9 +13142,9 @@ end tell
                             final updated = Product(
                               id: p.id,
                               name: nameCtrl.text.trim(),
-                              price: double.parse(priceCtrl.text),
+                              price: double.tryParse(basePriceText) ?? p.price,
                               buyingPrice:
-                                  double.tryParse(buyingPriceCtrl.text) ?? 0.0,
+                                  double.tryParse(baseBuyingText) ?? 0.0,
                               taxPercent:
                                   double.tryParse(taxPercentCtrl.text) ?? 0.0,
                               category: category,
@@ -12805,11 +13152,22 @@ end tell
                               sku: skuCtrl.text.trim().isEmpty
                                   ? p.sku
                                   : skuCtrl.text.trim(),
-                              stock: int.parse(stockCtrl.text),
+                              stock: int.tryParse(baseStockText) ?? p.stock,
                               description: tags.join(', '),
                               barcodeNo: p.barcodeNo,
                             );
                             await LocalDbService.updateProduct(updated);
+                            final currentIds = variants.map((v) => v.id).toSet();
+                            for (final removedId in originalVariantIds.difference(currentIds)) {
+                              await LocalDbService.deleteVariant(removedId);
+                            }
+                            for (final v in variants) {
+                              if (originalVariantIds.contains(v.id)) {
+                                await LocalDbService.updateVariant(v);
+                              } else {
+                                await LocalDbService.insertVariant(v);
+                              }
+                            }
                             ConnectivityService.instance.syncNow();
                             if (!ctx.mounted) return;
                             setState(() {
@@ -12817,6 +13175,7 @@ end tell
                                 (x) => x.id == p.id,
                               );
                               if (idx != -1) _products[idx] = updated;
+                              _variantsByProduct[p.id] = variants;
                             });
                             Navigator.pop(ctx);
                           },
@@ -12883,7 +13242,10 @@ end tell
     final skuCtrl = TextEditingController();
     final priceCtrl = TextEditingController();
     final buyingPriceCtrl = TextEditingController();
-    final taxPercentCtrl = TextEditingController();
+    // New products inherit the store-wide tax rate from Settings by default.
+    final taxPercentCtrl = TextEditingController(
+      text: (double.tryParse(_taxRateDisplay) ?? 0) > 0 ? _taxRateDisplay : '',
+    );
     final stockCtrl = TextEditingController();
     List<String> tags = [];
     final tagInputCtrl = TextEditingController();
@@ -12892,6 +13254,45 @@ end tell
     String emoji = '';
     String category = _userCategories.isNotEmpty ? _userCategories.first : '';
     bool skuAutoMode = true;
+    final pendingProductId = const Uuid().v4();
+    List<ProductVariant> variants = [];
+
+    // Which variant the price/stock fields currently edit (null = base product).
+    String? selectedVariantId;
+    String basePriceText = '';
+    String baseBuyingText = '';
+    String baseStockText = '';
+
+    void commitFields() {
+      if (selectedVariantId == null) {
+        basePriceText = priceCtrl.text;
+        baseBuyingText = buyingPriceCtrl.text;
+        baseStockText = stockCtrl.text;
+      } else {
+        final idx = variants.indexWhere((v) => v.id == selectedVariantId);
+        if (idx != -1) {
+          variants[idx] = variants[idx].copyWith(
+            price: double.tryParse(priceCtrl.text) ?? variants[idx].price,
+            buyingPrice: double.tryParse(buyingPriceCtrl.text) ?? 0.0,
+            stock: int.tryParse(stockCtrl.text) ?? variants[idx].stock,
+          );
+        }
+      }
+    }
+
+    void loadFields() {
+      if (selectedVariantId == null) {
+        priceCtrl.text = basePriceText;
+        buyingPriceCtrl.text = baseBuyingText;
+        stockCtrl.text = baseStockText;
+      } else {
+        final v = variants.firstWhere((x) => x.id == selectedVariantId);
+        priceCtrl.text = v.price > 0 ? v.price.toStringAsFixed(2) : '';
+        buyingPriceCtrl.text =
+            v.buyingPrice > 0 ? v.buyingPrice.toStringAsFixed(2) : '';
+        stockCtrl.text = '${v.stock}';
+      }
+    }
 
     nameCtrl.addListener(() {
       if (skuAutoMode && nameCtrl.text.isNotEmpty) {
@@ -13057,22 +13458,139 @@ end tell
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    _dlgLabel('PRODUCT NAME'),
-                                    const SizedBox(height: 6),
-                                    TextFormField(
-                                      controller: nameCtrl,
-                                      validator: (v) =>
-                                          v != null && v.trim().isNotEmpty
-                                          ? null
-                                          : 'Required',
-                                      style: GoogleFonts.inter(
-                                        fontSize: 13,
-                                        color: AppColors.textDark,
-                                      ),
-                                      decoration: _dlgInputDecor(
-                                        'e.g. Wireless Keyboard',
-                                      ),
+                                    Row(
+                                      children: [
+                                        Expanded(child: _dlgLabel('PRODUCT NAME')),
+                                        SizedBox(
+                                          width: 158,
+                                          child: _dlgLabel('VARIANT'),
+                                        ),
+                                      ],
                                     ),
+                                    const SizedBox(height: 6),
+                                    Row(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Expanded(
+                                          child: TextFormField(
+                                            controller: nameCtrl,
+                                            validator: (v) =>
+                                                v != null && v.trim().isNotEmpty
+                                                ? null
+                                                : 'Required',
+                                            style: GoogleFonts.inter(
+                                              fontSize: 13,
+                                              color: AppColors.textDark,
+                                            ),
+                                            decoration: _dlgInputDecor(
+                                              'e.g. Wireless Keyboard',
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        SizedBox(
+                                          width: 148,
+                                          child: _variantDropdown(
+                                            variants: variants,
+                                            selectedId: selectedVariantId,
+                                            onSelect: (id) => setLocal(() {
+                                              commitFields();
+                                              selectedVariantId = id;
+                                              loadFields();
+                                            }),
+                                            onAdd: () async {
+                                              final name =
+                                                  await _promptVariantName(ctx);
+                                              if (name == null || name.isEmpty) {
+                                                return;
+                                              }
+                                              setLocal(() {
+                                                commitFields();
+                                                final v = ProductVariant(
+                                                  id: const Uuid().v4(),
+                                                  productId: pendingProductId,
+                                                  label: name,
+                                                  price: double.tryParse(
+                                                          priceCtrl.text) ??
+                                                      0.0,
+                                                  stock: 0,
+                                                );
+                                                variants.add(v);
+                                                selectedVariantId = v.id;
+                                                loadFields();
+                                              });
+                                            },
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    if (selectedVariantId != null) ...[
+                                      const SizedBox(height: 6),
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: Text(
+                                              'Price & stock below apply to this variant',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                color: AppColors.textMuted,
+                                              ),
+                                            ),
+                                          ),
+                                          GestureDetector(
+                                            onTap: () async {
+                                              final v = variants.firstWhere(
+                                                (x) => x.id == selectedVariantId,
+                                              );
+                                              final name =
+                                                  await _promptVariantName(
+                                                ctx,
+                                                initial: v.label,
+                                              );
+                                              if (name == null || name.isEmpty) {
+                                                return;
+                                              }
+                                              setLocal(() {
+                                                final idx = variants.indexWhere(
+                                                  (x) =>
+                                                      x.id == selectedVariantId,
+                                                );
+                                                if (idx != -1) {
+                                                  variants[idx] = variants[idx]
+                                                      .copyWith(label: name);
+                                                }
+                                              });
+                                            },
+                                            child: Text(
+                                              'Rename',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w600,
+                                                color: AppColors.primary,
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 10),
+                                          GestureDetector(
+                                            onTap: () => setLocal(() {
+                                              variants.removeWhere(
+                                                (x) => x.id == selectedVariantId,
+                                              );
+                                              selectedVariantId = null;
+                                              loadFields();
+                                            }),
+                                            child: Text(
+                                              'Remove',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w600,
+                                                color: AppColors.error,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
                                   ],
                                 ),
                               ),
@@ -13301,18 +13819,24 @@ end tell
                                           RegExp(r'^\d*\.?\d{0,2}'),
                                         ),
                                       ],
+                                      onChanged: (_) => setLocal(() {}),
                                       style: GoogleFonts.inter(
                                         fontSize: 13,
                                         color: AppColors.textDark,
                                       ),
-                                      decoration: _dlgInputDecor('0.00'),
+                                      // Empty = fall back to the store-wide rate
+                                      decoration: _dlgInputDecor(
+                                        '$_taxRateDisplay (default)',
+                                      ),
                                     ),
                                   ],
                                 ),
                               ),
                             ],
                           ),
-                          const SizedBox(height: 16),
+                          const SizedBox(height: 18),
+                          _finalPriceCard(priceCtrl.text, taxPercentCtrl.text),
+                          const SizedBox(height: 18),
                           _dlgLabel('TAGS'),
                           const SizedBox(height: 6),
                           Container(
@@ -13512,30 +14036,51 @@ end tell
                               );
                               return;
                             }
+                            commitFields();
+                            final basePrice = double.tryParse(basePriceText);
+                            final baseStock = int.tryParse(baseStockText);
+                            if (basePrice == null || baseStock == null) {
+                              _showToast(
+                                'Enter a price and stock for the base product',
+                                isError: true,
+                              );
+                              setLocal(() {
+                                selectedVariantId = null;
+                                loadFields();
+                              });
+                              return;
+                            }
                             final pendingTag = tagInputCtrl.text.trim();
                             if (pendingTag.isNotEmpty &&
                                 !tags.contains(pendingTag)) {
                               tags.add(pendingTag);
                             }
                             final newProduct = Product(
-                              id: DateTime.now().millisecondsSinceEpoch
-                                  .toString(),
+                              id: pendingProductId,
                               name: nameCtrl.text.trim(),
-                              price: double.parse(priceCtrl.text),
+                              price: basePrice,
                               buyingPrice:
-                                  double.tryParse(buyingPriceCtrl.text) ?? 0.0,
+                                  double.tryParse(baseBuyingText) ?? 0.0,
                               taxPercent:
                                   double.tryParse(taxPercentCtrl.text) ?? 0.0,
                               category: category,
                               emoji: emoji,
                               sku: sku,
-                              stock: int.parse(stockCtrl.text),
+                              stock: baseStock,
                               description: tags.join(', '),
                             );
                             await LocalDbService.insertProduct(newProduct);
+                            for (final v in variants) {
+                              await LocalDbService.insertVariant(v);
+                            }
                             ConnectivityService.instance.syncNow();
                             if (!ctx.mounted) return;
-                            setState(() => _products.add(newProduct));
+                            setState(() {
+                              _products.add(newProduct);
+                              if (variants.isNotEmpty) {
+                                _variantsByProduct[pendingProductId] = variants;
+                              }
+                            });
                             Navigator.pop(ctx);
                             _showToast('${newProduct.name} added to inventory');
                           },
@@ -15538,7 +16083,7 @@ end tell
                               Expanded(
                                 flex: 5,
                                 child: Text(
-                                  item.productName,
+                                  item.displayName,
                                   style: GoogleFonts.inter(
                                     fontSize: 13,
                                     fontWeight: FontWeight.w500,
@@ -15955,7 +16500,7 @@ end tell
                                           const SizedBox(height: 3),
                                           Text(
                                             t.items
-                                                .map((i) => i.productName)
+                                                .map((i) => i.displayName)
                                                 .join(', '),
                                             style: GoogleFonts.inter(
                                               fontSize: 12,
@@ -17402,10 +17947,16 @@ class _ProductCard extends StatefulWidget {
   final Product product;
   final VoidCallback onTap;
   final String currencySymbol;
+  final List<ProductVariant> variants;
+  final bool variantsExpanded;
+  final VoidCallback? onVariantArrowTap;
   const _ProductCard({
     required this.product,
     required this.onTap,
     required this.currencySymbol,
+    this.variants = const [],
+    this.variantsExpanded = false,
+    this.onVariantArrowTap,
   });
   @override
   State<_ProductCard> createState() => _ProductCardState();
@@ -17480,11 +18031,14 @@ class _ProductCardState extends State<_ProductCard> {
                     ),
                     Consumer<CartProvider>(
                       builder: (_, cart, __) {
-                        final inCart = cart.quantityInCart(widget.product.id);
-                        final remaining = (widget.product.stock - inCart).clamp(
-                          0,
-                          widget.product.stock,
-                        );
+                        final hasVariants = widget.variants.isNotEmpty;
+                        final totalStock = hasVariants
+                            ? widget.variants.fold<int>(0, (s, v) => s + v.stock)
+                            : widget.product.stock;
+                        final inCart = hasVariants
+                            ? cart.totalQuantityInCartForProduct(widget.product.id)
+                            : cart.quantityInCart(widget.product.id);
+                        final remaining = (totalStock - inCart).clamp(0, totalStock);
                         final outOfStock = remaining == 0;
                         return Stack(
                           children: [
@@ -17549,6 +18103,111 @@ class _ProductCardState extends State<_ProductCard> {
                                 ),
                               ),
                             ),
+                            if (widget.variants.isNotEmpty)
+                              Positioned(
+                                left: 8,
+                                bottom: 8,
+                                right: 52,
+                                child: Wrap(
+                                  spacing: 3,
+                                  runSpacing: 3,
+                                  children: [
+                                    ...widget.variants.take(3).map((v) {
+                                      final vInCart =
+                                          cart.quantityInCartForVariant(
+                                        widget.product.id,
+                                        v.id,
+                                      );
+                                      final vOut = (v.stock - vInCart) <= 0;
+                                      return Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 5,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: vOut
+                                              ? AppColors.error
+                                              : AppColors.success,
+                                          borderRadius:
+                                              BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          v.label,
+                                          style: GoogleFonts.inter(
+                                            fontSize: 8,
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      );
+                                    }),
+                                    if (widget.variants.length > 3)
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 5,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: AppColors.textMuted,
+                                          borderRadius:
+                                              BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          '+${widget.variants.length - 3}',
+                                          style: GoogleFonts.inter(
+                                            fontSize: 8,
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            if (widget.variants.isNotEmpty)
+                              Positioned(
+                                right: 6,
+                                top: 0,
+                                bottom: 0,
+                                child: Center(
+                                  child: GestureDetector(
+                                    onTap: widget.onVariantArrowTap,
+                                    child: Container(
+                                      width: 24,
+                                      height: 24,
+                                      decoration: BoxDecoration(
+                                        color: widget.variantsExpanded
+                                            ? AppColors.primary
+                                            : Colors.white,
+                                        shape: BoxShape.circle,
+                                        border:
+                                            Border.all(color: AppColors.border),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black
+                                                .withValues(alpha: 0.12),
+                                            blurRadius: 4,
+                                            offset: const Offset(0, 1),
+                                          ),
+                                        ],
+                                      ),
+                                      child: AnimatedRotation(
+                                        turns:
+                                            widget.variantsExpanded ? 0.5 : 0,
+                                        duration:
+                                            const Duration(milliseconds: 200),
+                                        child: Icon(
+                                          Icons.chevron_right_rounded,
+                                          size: 18,
+                                          color: widget.variantsExpanded
+                                              ? Colors.white
+                                              : AppColors.primary,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                           ],
                         );
                       },
@@ -17631,7 +18290,15 @@ class _ProductCardState extends State<_ProductCard> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}',
+                      widget.variants.isEmpty
+                          ? '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}'
+                          : (() {
+                              final prices = widget.variants.map((v) => v.price).toList()
+                                ..sort();
+                              return prices.first == prices.last
+                                  ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
+                                  : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
+                            })(),
                       style: GoogleFonts.manrope(
                         fontSize: 16,
                         fontWeight: FontWeight.w900,
@@ -17643,6 +18310,276 @@ class _ProductCardState extends State<_ProductCard> {
                 ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Variant Card (slides out beside its product in the grid) ────────────────
+
+class _VariantCard extends StatefulWidget {
+  final Product product;
+  final ProductVariant variant;
+  final String currencySymbol;
+  final VoidCallback? onCollapse;
+  const _VariantCard({
+    required this.product,
+    required this.variant,
+    required this.currencySymbol,
+    this.onCollapse,
+  });
+  @override
+  State<_VariantCard> createState() => _VariantCardState();
+}
+
+class _VariantCardState extends State<_VariantCard> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final cart = context.watch<CartProvider>();
+    final inCart =
+        cart.quantityInCartForVariant(widget.product.id, widget.variant.id);
+    final remaining =
+        (widget.variant.stock - inCart).clamp(0, widget.variant.stock);
+    final outOfStock = remaining == 0;
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.0, end: 1.0),
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeOutCubic,
+      builder: (context, t, child) => Opacity(
+        opacity: t,
+        child: Transform.translate(
+          offset: Offset(28 * (1 - t), 0),
+          child: child,
+        ),
+      ),
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          onTap: outOfStock
+              ? null
+              : () => context
+                  .read<CartProvider>()
+                  .addVariant(widget.product, widget.variant),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: _hovered ? AppColors.accentBlue : AppColors.border,
+              ),
+              boxShadow: _hovered
+                  ? [
+                      BoxShadow(
+                        color: AppColors.primary.withValues(alpha: 0.12),
+                        blurRadius: 12,
+                        offset: const Offset(0, 4),
+                      ),
+                    ]
+                  : [
+                      BoxShadow(
+                        color: AppColors.cardShadow,
+                        blurRadius: 4,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: widget.product.emoji.startsWith('/')
+                            ? ClipRRect(
+                                borderRadius: const BorderRadius.vertical(
+                                  top: Radius.circular(15),
+                                ),
+                                child: Image.file(
+                                  File(widget.product.emoji),
+                                  width: double.infinity,
+                                  height: double.infinity,
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (_, __, ___) =>
+                                      _ProductInitialsBox(
+                                        name: widget.variant.label,
+                                        radius: 15,
+                                      ),
+                                ),
+                              )
+                            : _ProductInitialsBox(
+                                name: widget.variant.label,
+                                radius: 15,
+                              ),
+                      ),
+                      Positioned(
+                        top: 10,
+                        right: 10,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: outOfStock
+                                ? AppColors.error
+                                : AppColors.primary,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            outOfStock
+                                ? 'OUT OF STOCK'
+                                : 'STOCK: ${remaining.toString().padLeft(2, '0')}',
+                            style: GoogleFonts.inter(
+                              fontSize: 9,
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        top: 10,
+                        left: 10,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF6366F1),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            'VARIANT',
+                            style: GoogleFonts.inter(
+                              fontSize: 8,
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        bottom: 10,
+                        right: 10,
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 200),
+                          opacity: _hovered ? 1.0 : 0.0,
+                          child: Container(
+                            width: 36,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              color: outOfStock
+                                  ? AppColors.textMuted
+                                  : AppColors.accentBlue,
+                              shape: BoxShape.circle,
+                              boxShadow: outOfStock
+                                  ? []
+                                  : [
+                                      BoxShadow(
+                                        color: AppColors.accentBlue
+                                            .withValues(alpha: 0.35),
+                                        blurRadius: 8,
+                                        offset: const Offset(0, 2),
+                                      ),
+                                    ],
+                            ),
+                            child: const Icon(
+                              Icons.add,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (widget.onCollapse != null)
+                        Positioned(
+                          left: 6,
+                          top: 0,
+                          bottom: 0,
+                          child: Center(
+                            child: GestureDetector(
+                              onTap: widget.onCollapse,
+                              child: Container(
+                                width: 24,
+                                height: 24,
+                                decoration: BoxDecoration(
+                                  color: AppColors.primary,
+                                  shape: BoxShape.circle,
+                                  border: Border.all(color: AppColors.border),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color:
+                                          Colors.black.withValues(alpha: 0.12),
+                                      blurRadius: 4,
+                                      offset: const Offset(0, 1),
+                                    ),
+                                  ],
+                                ),
+                                child: const Icon(
+                                  Icons.chevron_left_rounded,
+                                  size: 18,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        widget.variant.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.manrope(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.primary,
+                          letterSpacing: 0.1,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        widget.product.name.toUpperCase(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.inter(
+                          fontSize: 9,
+                          fontWeight: FontWeight.w300,
+                          color: AppColors.textMuted.withValues(alpha: 0.7),
+                          letterSpacing: 0.8,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        '${widget.currencySymbol}${widget.variant.price.toStringAsFixed(2)}',
+                        style: GoogleFonts.manrope(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w900,
+                          color: AppColors.primary,
+                          letterSpacing: -0.5,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -17690,12 +18627,12 @@ class _CartRowState extends State<_CartRow> {
     final v = int.tryParse(_qtyCtrl.text.trim()) ?? 0;
     if (v > 0) {
       widget.cart.setQuantity(
-        widget.item.product.id,
+        widget.item.lineKey,
         v,
-        stock: widget.item.product.stock,
+        stock: widget.item.stock,
       );
     } else {
-      widget.cart.removeItem(widget.item.product.id);
+      widget.cart.removeItem(widget.item.lineKey);
     }
     if (mounted) setState(() => _editing = false);
   }
@@ -17712,7 +18649,7 @@ class _CartRowState extends State<_CartRow> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  widget.item.product.name,
+                  widget.item.displayName,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: GoogleFonts.inter(
@@ -17750,7 +18687,7 @@ class _CartRowState extends State<_CartRow> {
               children: [
                 _qtyBtn(
                   Icons.remove,
-                  () => widget.cart.decrement(widget.item.product.id),
+                  () => widget.cart.decrement(widget.item.lineKey),
                 ),
                 GestureDetector(
                   onTap: () {
@@ -17800,8 +18737,8 @@ class _CartRowState extends State<_CartRow> {
                 _qtyBtn(
                   Icons.add,
                   () => widget.cart.increment(
-                    widget.item.product.id,
-                    stock: widget.item.product.stock,
+                    widget.item.lineKey,
+                    stock: widget.item.stock,
                   ),
                 ),
               ],
@@ -17821,7 +18758,7 @@ class _CartRowState extends State<_CartRow> {
                   ),
                 ),
                 Text(
-                  '${widget.currencySymbol}${widget.item.product.price.toStringAsFixed(2)}/unit',
+                  '${widget.currencySymbol}${widget.item.unitPrice.toStringAsFixed(2)}/unit',
                   style: GoogleFonts.inter(
                     fontSize: 9,
                     color: AppColors.textMuted.withValues(alpha: 0.6),
@@ -17835,7 +18772,7 @@ class _CartRowState extends State<_CartRow> {
             width: 28,
             child: Center(
               child: GestureDetector(
-                onTap: () => widget.cart.removeItem(widget.item.product.id),
+                onTap: () => widget.cart.removeItem(widget.item.lineKey),
                 child: Icon(
                   Icons.close_rounded,
                   size: 18,
@@ -17866,6 +18803,235 @@ class _CartRowState extends State<_CartRow> {
 }
 
 // ── Discount Toggle ──────────────────────────────────────────────────────────
+
+// Settings row input. Uses a real controller (not `initialValue`) so the caret
+// isn't stuck at offset 0 — with right-aligned text that made typing insert
+// before the existing value instead of replacing it. Focusing selects all.
+class _SettingsInput extends StatefulWidget {
+  final String value;
+  final ValueChanged<String> onChanged;
+  final TextInputType? keyboardType;
+  final int maxLines;
+  final bool obscureText;
+  final String hintText;
+  const _SettingsInput({
+    super.key,
+    required this.value,
+    required this.onChanged,
+    required this.hintText,
+    this.keyboardType,
+    this.maxLines = 1,
+    this.obscureText = false,
+  });
+  @override
+  State<_SettingsInput> createState() => _SettingsInputState();
+}
+
+class _SettingsInputState extends State<_SettingsInput> {
+  late final TextEditingController _ctrl =
+      TextEditingController(text: widget.value);
+  final FocusNode _focus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _focus.addListener(() {
+      if (_focus.hasFocus && _ctrl.text.isNotEmpty) {
+        _ctrl.selection =
+            TextSelection(baseOffset: 0, extentOffset: _ctrl.text.length);
+      }
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _SettingsInput old) {
+    super.didUpdateWidget(old);
+    // Adopt external changes only while the user isn't typing in this field.
+    if (widget.value != old.value &&
+        !_focus.hasFocus &&
+        widget.value != _ctrl.text) {
+      _ctrl.text = widget.value;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: _ctrl,
+      focusNode: _focus,
+      onChanged: widget.onChanged,
+      keyboardType: widget.keyboardType,
+      maxLines: widget.obscureText ? 1 : widget.maxLines,
+      obscureText: widget.obscureText,
+      style: GoogleFonts.inter(
+        fontSize: 13.5,
+        color: const Color(0xFF1D1D1F),
+      ),
+      decoration: InputDecoration(
+        border: InputBorder.none,
+        hintText: widget.hintText,
+        hintStyle: GoogleFonts.inter(
+          fontSize: 13.5,
+          color: const Color(0xFFC7C7CC),
+        ),
+        isDense: true,
+        contentPadding: widget.maxLines > 1
+            ? const EdgeInsets.symmetric(vertical: 4)
+            : EdgeInsets.zero,
+      ),
+      textAlign: TextAlign.right,
+    );
+  }
+}
+
+// Tax row in the cart summary. Renders exactly like the other summary rows;
+// tapping it reveals a small field to change the rate for this bill onwards.
+class _TaxSummaryRow extends StatefulWidget {
+  final String label;
+  final double amount;
+  final String currencySymbol;
+  final String rate;
+  final ValueChanged<String> onRateChanged;
+  const _TaxSummaryRow({
+    required this.label,
+    required this.amount,
+    required this.currencySymbol,
+    required this.rate,
+    required this.onRateChanged,
+  });
+  @override
+  State<_TaxSummaryRow> createState() => _TaxSummaryRowState();
+}
+
+class _TaxSummaryRowState extends State<_TaxSummaryRow> {
+  late final TextEditingController _ctrl =
+      TextEditingController(text: widget.rate);
+  bool _editing = false;
+
+  @override
+  void didUpdateWidget(_TaxSummaryRow old) {
+    super.didUpdateWidget(old);
+    if (!_editing && widget.rate != old.rate) _ctrl.text = widget.rate;
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _apply() {
+    widget.onRateChanged(_ctrl.text.trim().isEmpty ? '0' : _ctrl.text.trim());
+    setState(() => _editing = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _editing
+                ? null
+                : () {
+                    _ctrl.text = widget.rate;
+                    setState(() => _editing = true);
+                  },
+            child: Row(
+              children: [
+                Text(
+                  widget.label,
+                  style: GoogleFonts.inter(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w500,
+                    color: AppColors.textMuted,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+                if (_editing) ...[
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 52,
+                    height: 26,
+                    child: TextField(
+                      controller: _ctrl,
+                      autofocus: true,
+                      keyboardType:
+                          const TextInputType.numberWithOptions(decimal: true),
+                      inputFormatters: [
+                        FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                      ],
+                      style: GoogleFonts.inter(fontSize: 12),
+                      textAlign: TextAlign.center,
+                      onSubmitted: (_) => _apply(),
+                      decoration: InputDecoration(
+                        contentPadding: EdgeInsets.zero,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(6),
+                          borderSide: const BorderSide(color: AppColors.border),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(6),
+                          borderSide: const BorderSide(color: AppColors.border),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(6),
+                          borderSide: const BorderSide(
+                            color: AppColors.accentBlue,
+                            width: 1.5,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: _apply,
+                    child: Container(
+                      height: 26,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      decoration: BoxDecoration(
+                        color: AppColors.accentBlue,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Center(
+                        child: Text(
+                          'APPLY',
+                          style: GoogleFonts.inter(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        Text(
+          '${widget.currencySymbol}${widget.amount.toStringAsFixed(2)}',
+          style: GoogleFonts.inter(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: AppColors.textDark,
+          ),
+        ),
+      ],
+    );
+  }
+}
 
 class _DiscountToggle extends StatefulWidget {
   final CartProvider cart;

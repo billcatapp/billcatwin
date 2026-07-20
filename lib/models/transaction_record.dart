@@ -6,6 +6,8 @@ class TransactionItem {
   final String description;
   final double price;
   final int quantity;
+  final String? variantId;
+  final String? variantLabel;
 
   const TransactionItem({
     required this.productId,
@@ -13,9 +15,16 @@ class TransactionItem {
     this.description = '',
     required this.price,
     required this.quantity,
+    this.variantId,
+    this.variantLabel,
   });
 
   double get total => price * quantity;
+
+  String get displayName =>
+      variantLabel != null && variantLabel!.isNotEmpty
+          ? '$productName ($variantLabel)'
+          : productName;
 
   Map<String, dynamic> toMap() => {
     'productId': productId,
@@ -23,6 +32,8 @@ class TransactionItem {
     'description': description,
     'price': price,
     'quantity': quantity,
+    'variantId': variantId,
+    'variantLabel': variantLabel,
   };
 
   factory TransactionItem.fromMap(Map<String, dynamic> m) => TransactionItem(
@@ -31,6 +42,8 @@ class TransactionItem {
     description: (m['description'] as String?) ?? '',
     price: (m['price'] as num).toDouble(),
     quantity: m['quantity'] as int,
+    variantId: m['variantId'] as String?,
+    variantLabel: m['variantLabel'] as String?,
   );
 }
 

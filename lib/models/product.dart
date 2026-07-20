@@ -1,3 +1,5 @@
+import 'product_variant.dart';
+
 class Product {
   final String id;
   final String name;
@@ -65,9 +67,18 @@ class Product {
 
 class CartItem {
   final Product product;
+  final ProductVariant? variant;
   int quantity;
 
-  CartItem({required this.product, this.quantity = 1});
+  CartItem({required this.product, this.variant, this.quantity = 1});
 
-  double get total => product.price * quantity;
+  double get unitPrice => variant?.price ?? product.price;
+  double get total => unitPrice * quantity;
+  String get sku => variant?.sku.isNotEmpty == true ? variant!.sku : product.sku;
+  int get stock => variant?.stock ?? product.stock;
+  String get displayName =>
+      variant != null ? '${product.name} (${variant!.label})' : product.name;
+
+  // Cart line identity: same product with different variants are distinct lines.
+  String get lineKey => variant != null ? '${product.id}::${variant!.id}' : product.id;
 }

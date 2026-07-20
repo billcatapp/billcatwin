@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/customer.dart';
 import '../models/product.dart';
+import '../models/product_variant.dart';
 import '../models/transaction_record.dart';
 import 'local_db_service.dart';
 
@@ -90,6 +91,48 @@ class ConnectivityService extends ChangeNotifier {
         }
       }
 
+      // ── Sync product variant deletions ───────────────────────────────────
+      final pendingVariantDeletes = await LocalDbService.getPendingDeleteVariantIds();
+      if (pendingVariantDeletes.isNotEmpty) {
+        try {
+          await client.from('product_variants')
+              .delete()
+              .inFilter('id', pendingVariantDeletes)
+              .eq('user_id', userId);
+          for (final id in pendingVariantDeletes) {
+            await LocalDbService.purgeDeletedVariant(id);
+          }
+        } catch (e) {
+          debugPrint('Variant delete sync error: $e');
+        }
+      }
+
+      // ── Sync product variants (batch) ────────────────────────────────────
+      final unsyncedVariants = await LocalDbService.getUnsyncedVariants();
+      if (unsyncedVariants.isNotEmpty) {
+        try {
+          await client.from('product_variants').upsert(
+            unsyncedVariants.map((v) => {
+              'id': v.id,
+              'user_id': userId,
+              'product_id': v.productId,
+              'label': v.label,
+              'price': v.price,
+              'buying_price': v.buyingPrice,
+              'stock': v.stock,
+              'sku': v.sku,
+              'barcode_no': v.barcodeNo,
+            }).toList(),
+          );
+          for (final v in unsyncedVariants) {
+            await LocalDbService.markVariantSynced(v.id);
+          }
+          debugPrint('PUSH: product_variants ok (${unsyncedVariants.length} rows)');
+        } catch (e) {
+          debugPrint('Variant sync error: $e');
+        }
+      }
+
       // ── Sync transactions (batch) ────────────────────────────────────────
       final unsyncedTx = await LocalDbService.getUnsynced();
       if (unsyncedTx.isNotEmpty) {
@@ -156,16 +199,21 @@ class ConnectivityService extends ChangeNotifier {
       }
 
       // ── Sync settings ────────────────────────────────────────────────────
-      const _knownSettingsCols = {
+      // Business-level settings that should follow the account across devices.
+      // Device-specific ones (printer, paper size, orientation, logo_path) are
+      // deliberately excluded so one machine can't override another's setup.
+      // Requires database/add_settings_columns.sql for the last three.
+      const knownSettingsCols = {
         'store_name', 'store_address', 'store_phone', 'store_email', 'store_gstin',
         'receipt_footer', 'tax_label', 'tax_rate', 'currency_code', 'currency_symbol',
         'invoice_layout', 'store_terms', 'store_upi_id', 'branch_number', 'logo_url',
+        'wa_access_token', 'wa_phone_number_id', 'auto_print',
       };
       final settings = await LocalDbService.getSettings();
       if (settings.isNotEmpty) {
         try {
           final filtered = Map.fromEntries(
-            settings.entries.where((e) => _knownSettingsCols.contains(e.key)),
+            settings.entries.where((e) => knownSettingsCols.contains(e.key)),
           );
           if (filtered.isNotEmpty) {
             await client.from('user_settings').upsert({
@@ -218,6 +266,29 @@ class ConnectivityService extends ChangeNotifier {
       debugPrint('PULL: products ok (${products.length} rows)');
     } catch (e) {
       debugPrint('PULL: products FAILED: $e');
+    }
+
+    try {
+      final variantRows = await client
+          .from('product_variants')
+          .select()
+          .eq('user_id', userId);
+      final variants = (variantRows as List)
+          .map((r) => ProductVariant.fromMap({
+                'id': r['id'],
+                'product_id': r['product_id'],
+                'label': r['label'],
+                'price': (r['price'] as num).toDouble(),
+                'buying_price': (r['buying_price'] as num?)?.toDouble() ?? 0.0,
+                'stock': r['stock'],
+                'sku': (r['sku'] as String?) ?? '',
+                'barcode_no': (r['barcode_no'] as String?) ?? '',
+              }))
+          .toList();
+      await LocalDbService.insertVariantsSynced(variants);
+      debugPrint('PULL: product_variants ok (${variants.length} rows)');
+    } catch (e) {
+      debugPrint('PULL: product_variants FAILED: $e');
     }
 
     try {
