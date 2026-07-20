@@ -8,6 +8,10 @@ class TransactionItem {
   final int quantity;
   final String? variantId;
   final String? variantLabel;
+  /// Rate charged on this line at the time of sale. 0 means "not recorded"
+  /// (sales made before per-item rates existed) — callers fall back to the
+  /// store-wide rate for those.
+  final double taxPercent;
 
   const TransactionItem({
     required this.productId,
@@ -17,6 +21,7 @@ class TransactionItem {
     required this.quantity,
     this.variantId,
     this.variantLabel,
+    this.taxPercent = 0,
   });
 
   double get total => price * quantity;
@@ -34,6 +39,7 @@ class TransactionItem {
     'quantity': quantity,
     'variantId': variantId,
     'variantLabel': variantLabel,
+    'taxPercent': taxPercent,
   };
 
   factory TransactionItem.fromMap(Map<String, dynamic> m) => TransactionItem(
@@ -44,6 +50,7 @@ class TransactionItem {
     quantity: m['quantity'] as int,
     variantId: m['variantId'] as String?,
     variantLabel: m['variantLabel'] as String?,
+    taxPercent: (m['taxPercent'] as num?)?.toDouble() ?? 0,
   );
 }
 

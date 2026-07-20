@@ -40,7 +40,7 @@ class LocalDbService {
     final dbPath = await _appSupportPath();
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 10,
+      version: 11,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try { await db.execute('ALTER TABLE products ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
@@ -80,6 +80,9 @@ class LocalDbService {
         if (oldVersion < 10) {
           try { await db.execute(_productVariantsTableSql); } catch (_) {}
         }
+        if (oldVersion < 11) {
+          try { await db.execute("ALTER TABLE products ADD COLUMN dealer_name TEXT NOT NULL DEFAULT ''"); } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -114,6 +117,7 @@ class LocalDbService {
         sku TEXT NOT NULL,
         stock INTEGER NOT NULL,
         barcode_no TEXT NOT NULL DEFAULT '',
+        dealer_name TEXT NOT NULL DEFAULT '',
         synced INTEGER NOT NULL DEFAULT 0,
         deleted INTEGER NOT NULL DEFAULT 0
       )
@@ -260,15 +264,34 @@ class LocalDbService {
         conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
+  /// Merges cloud products into the local table.
+  ///
+  /// New products are inserted. Existing ones are refreshed from the cloud
+  /// *only* when the local copy has nothing pending — a row with synced = 0 or
+  /// deleted = 1 is waiting to be pushed, so overwriting it would silently
+  /// throw away the user's unsent edit.
   static Future<void> insertProductsSynced(List<Product> products) async {
     final database = await db;
+    final existing = {
+      for (final r in await database.query('products',
+          columns: ['id', 'synced', 'deleted']))
+        r['id'] as String: (
+          synced: (r['synced'] as int?) ?? 1,
+          deleted: (r['deleted'] as int?) ?? 0,
+        ),
+    };
     final batch = database.batch();
     for (final p in products) {
       final map = p.toMap();
       map['synced'] = 1;
       map['deleted'] = 0;
-      // ignore = don't overwrite locally-deleted products
-      batch.insert('products', map, conflictAlgorithm: ConflictAlgorithm.ignore);
+      final local = existing[p.id];
+      if (local == null) {
+        batch.insert('products', map,
+            conflictAlgorithm: ConflictAlgorithm.ignore);
+      } else if (local.synced == 1 && local.deleted == 0) {
+        batch.update('products', map, where: 'id = ?', whereArgs: [p.id]);
+      }
     }
     await batch.commit(noResult: true);
   }
@@ -295,7 +318,8 @@ class LocalDbService {
       'name': p.name, 'price': p.price, 'buying_price': p.buyingPrice,
       'tax_percent': p.taxPercent, 'category': p.category,
       'emoji': p.emoji, 'sku': p.sku, 'stock': p.stock,
-      'description': p.description, 'barcode_no': p.barcodeNo, 'synced': 0,
+      'description': p.description, 'barcode_no': p.barcodeNo,
+      'dealer_name': p.dealerName, 'synced': 0,
     }, where: 'id = ?', whereArgs: [p.id]);
   }
 
@@ -401,14 +425,31 @@ class LocalDbService {
         conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
+  /// Same merge rule as [insertProductsSynced]: refresh from the cloud unless
+  /// the local row still has unsent changes.
   static Future<void> insertVariantsSynced(List<ProductVariant> variants) async {
     final database = await db;
+    final existing = {
+      for (final r in await database.query('product_variants',
+          columns: ['id', 'synced', 'deleted']))
+        r['id'] as String: (
+          synced: (r['synced'] as int?) ?? 1,
+          deleted: (r['deleted'] as int?) ?? 0,
+        ),
+    };
     final batch = database.batch();
     for (final v in variants) {
       final map = v.toMap();
       map['synced'] = 1;
       map['deleted'] = 0;
-      batch.insert('product_variants', map, conflictAlgorithm: ConflictAlgorithm.ignore);
+      final local = existing[v.id];
+      if (local == null) {
+        batch.insert('product_variants', map,
+            conflictAlgorithm: ConflictAlgorithm.ignore);
+      } else if (local.synced == 1 && local.deleted == 0) {
+        batch.update('product_variants', map,
+            where: 'id = ?', whereArgs: [v.id]);
+      }
     }
     await batch.commit(noResult: true);
   }

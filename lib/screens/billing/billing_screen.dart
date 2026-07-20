@@ -1742,6 +1742,10 @@ class _BillingScreenState extends State<BillingScreen> {
                             onTap: () => _addToCartOrPickVariant(item, cart),
                             currencySymbol: _currencySymbol,
                             variants: _variantsByProduct[item.id] ?? const [],
+                            effectiveTaxRate: item.taxPercent > 0
+                                ? item.taxPercent
+                                : (double.tryParse(_taxRateDisplay) ?? 0),
+                            taxLabel: _taxLabel,
                             variantsExpanded:
                                 _expandedVariantProductId == item.id,
                             onVariantArrowTap: () => setState(() {
@@ -1757,6 +1761,10 @@ class _BillingScreenState extends State<BillingScreen> {
                           product: pair.$1,
                           variant: pair.$2,
                           currencySymbol: _currencySymbol,
+                          effectiveTaxRate: pair.$1.taxPercent > 0
+                              ? pair.$1.taxPercent
+                              : (double.tryParse(_taxRateDisplay) ?? 0),
+                          taxLabel: _taxLabel,
                         );
                       },
                     ),
@@ -2335,6 +2343,7 @@ class _BillingScreenState extends State<BillingScreen> {
                           item: cart.items[i],
                           cart: cart,
                           currencySymbol: _currencySymbol,
+                          taxLabel: _taxLabel,
                         );
                       },
                     ),
@@ -2754,6 +2763,15 @@ class _BillingScreenState extends State<BillingScreen> {
         ],
       ),
     );
+  }
+
+  /// Shelf price for a product: its price plus the tax it attracts (its own
+  /// rate, or the store default). This is what goes on barcode labels so the
+  /// sticker matches what the customer is charged at the till.
+  double _finalPriceOf(Product p) {
+    final rate =
+        p.taxPercent > 0 ? p.taxPercent : (double.tryParse(_taxRateDisplay) ?? 0);
+    return p.price * (1 + rate / 100);
   }
 
   // 5.0 -> "5", 12.5 -> "12.5"
@@ -8623,9 +8641,16 @@ class _BillingScreenState extends State<BillingScreen> {
               (i) => TransactionItem(
                 productId: i.product.id,
                 productName: i.product.name,
-                price: i.product.price,
+                // Variant lines must price and label off the variant, not the
+                // base product, or the preview won't match the real bill.
+                price: i.unitPrice,
                 quantity: i.quantity,
                 description: i.product.description,
+                variantId: i.variant?.id,
+                variantLabel: i.variant?.label,
+                taxPercent: i.product.taxPercent > 0
+                    ? i.product.taxPercent
+                    : cart.taxRate,
               ),
             )
             .toList(),
@@ -9751,13 +9776,18 @@ end tell
         for (final v in pVariants) {
           printItems.add(Product(
             id: v.id,
-            name: '${p.name} — ${v.label}',
+            // Matches TransactionItem.displayName so labels, receipts and
+            // history all read the same way.
+            name: '${p.name} (${v.label})',
             price: v.price,
             category: p.category,
             emoji: p.emoji,
             sku: v.sku.isNotEmpty ? v.sku : p.sku,
             stock: v.stock,
             barcodeNo: v.barcodeNo,
+            // Variants are taxed at the parent product's rate — without this
+            // the label would price them at 0% tax.
+            taxPercent: p.taxPercent,
           ));
         }
       }
@@ -10167,7 +10197,7 @@ end tell
               textAlign: pw.TextAlign.center,
             ),
             pw.Text(
-              '$_currencySymbol${p.price.toStringAsFixed(2)}',
+              '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
               style: pw.TextStyle(font: bold, fontSize: 4.5),
               textAlign: pw.TextAlign.center,
             ),
@@ -10952,6 +10982,27 @@ end tell
                     ),
                   ),
                   PopupMenuItem(
+                    value: 'stock',
+                    height: 38,
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.inventory_2_outlined,
+                          size: 14,
+                          color: AppColors.primary,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Update Stock',
+                          style: GoogleFonts.inter(
+                            fontSize: 13,
+                            color: AppColors.textDark,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
                     value: 'barcode',
                     height: 38,
                     child: Row(
@@ -10997,6 +11048,8 @@ end tell
                 onSelected: (v) async {
                   if (v == 'edit') {
                     _showEditProductDialog(p);
+                  } else if (v == 'stock') {
+                    _showUpdateStockDialog(p);
                   } else if (v == 'barcode') {
                     _showPrintBarcodeDialog(p);
                   } else if (v == 'delete') {
@@ -11424,7 +11477,7 @@ end tell
                               ),
                             ),
                             Text(
-                              '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                              '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
                               style: GoogleFonts.inter(
                                 fontSize: 10,
                                 fontWeight: FontWeight.w700,
@@ -11786,7 +11839,7 @@ end tell
             textAlign: pw.TextAlign.center,
           ),
           pw.Text(
-            '$_currencySymbol${p.price.toStringAsFixed(2)}',
+            '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
             style: pw.TextStyle(font: bold, fontSize: 4.5),
             textAlign: pw.TextAlign.center,
           ),
@@ -12110,7 +12163,7 @@ end tell
                 textAlign: pw.TextAlign.center,
               ),
               pw.Text(
-                '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
                 style: pw.TextStyle(font: bold, fontSize: 7),
                 textAlign: pw.TextAlign.center,
               ),
@@ -12201,81 +12254,78 @@ end tell
     );
   }
 
-  Future<String?> _promptVariantName(BuildContext parentCtx, {String? initial}) {
-    final ctrl = TextEditingController(text: initial ?? '');
-    return showDialog<String>(
-      context: parentCtx,
-      builder: (dCtx) => Dialog(
-        backgroundColor: Colors.white,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        child: Padding(
-          padding: const EdgeInsets.all(22),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                initial == null ? 'Add Variant' : 'Rename Variant',
-                style: GoogleFonts.manrope(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.textDark,
+  /// Inline replacement for the variant dropdown while naming a new (or
+  /// renaming an existing) variant — keeps the interaction in the same slot
+  /// instead of throwing a modal over the form.
+  Widget _inlineVariantField({
+    required TextEditingController ctrl,
+    required String hint,
+    required VoidCallback onCancel,
+    required ValueChanged<String> onSubmit,
+  }) {
+    void commit() {
+      final t = ctrl.text.trim();
+      if (t.isEmpty) {
+        onCancel();
+      } else {
+        onSubmit(t);
+      }
+    }
+
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppColors.accentBlue, width: 1.4),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: ctrl,
+              autofocus: true,
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: AppColors.textDark,
+              ),
+              decoration: InputDecoration(
+                isDense: true,
+                border: InputBorder.none,
+                hintText: hint,
+                hintStyle: GoogleFonts.inter(
+                  fontSize: 11.5,
+                  color: AppColors.textMuted,
                 ),
+                contentPadding: EdgeInsets.zero,
               ),
-              const SizedBox(height: 14),
-              _dlgLabel('VARIANT NAME'),
-              const SizedBox(height: 6),
-              SizedBox(
-                width: 300,
-                child: TextField(
-                  controller: ctrl,
-                  autofocus: true,
-                  style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
-                  decoration: _dlgInputDecor('e.g. 128GB / Blue'),
-                  onSubmitted: (v) {
-                    final t = v.trim();
-                    if (t.isNotEmpty) Navigator.pop(dCtx, t);
-                  },
-                ),
-              ),
-              const SizedBox(height: 18),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(dCtx),
-                    child: Text(
-                      'Cancel',
-                      style: GoogleFonts.inter(
-                        fontSize: 13,
-                        color: AppColors.textMuted,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton(
-                    onPressed: () {
-                      final t = ctrl.text.trim();
-                      if (t.isNotEmpty) Navigator.pop(dCtx, t);
-                    },
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.primary,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                      elevation: 0,
-                    ),
-                    child: Text(
-                      initial == null ? 'Add' : 'Save',
-                      style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                ],
-              ),
-            ],
+              onSubmitted: (_) => commit(),
+            ),
           ),
-        ),
+          GestureDetector(
+            onTap: onCancel,
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 3),
+              child: Icon(Icons.close_rounded,
+                  size: 15, color: AppColors.textMuted),
+            ),
+          ),
+          GestureDetector(
+            onTap: commit,
+            child: Container(
+              width: 24,
+              height: 24,
+              decoration: BoxDecoration(
+                color: AppColors.primary,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: const Icon(Icons.check_rounded,
+                  size: 14, color: Colors.white),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -12347,6 +12397,345 @@ end tell
     );
   }
 
+  /// Quick restock: add to (or set) stock without opening the full edit form.
+  /// Products with variants get a row per variant, since that's where the
+  /// stock actually lives.
+  Future<void> _showUpdateStockDialog(Product p) async {
+    final variants = await LocalDbService.getVariantsForProduct(p.id);
+    if (!mounted) return;
+    bool addMode = true; // true = add to stock, false = set exact
+    final dealerCtrl = TextEditingController(text: p.dealerName);
+    final ctrls = <String, TextEditingController>{
+      if (variants.isEmpty) p.id: TextEditingController(),
+      for (final v in variants) v.id: TextEditingController(),
+    };
+
+    int resultFor(int current, String raw) {
+      final n = int.tryParse(raw.trim());
+      if (n == null) return current;
+      return addMode ? (current + n).clamp(0, 1 << 30) : n.clamp(0, 1 << 30);
+    }
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => Dialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.fromLTRB(24, 18, 16, 16),
+                  decoration: const BoxDecoration(
+                    color: AppColors.surfaceVariant,
+                    borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+                    border: Border(bottom: BorderSide(color: AppColors.border)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.inventory_2_outlined,
+                          size: 18, color: AppColors.primary),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Update Stock',
+                              style: GoogleFonts.manrope(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textDark,
+                              ),
+                            ),
+                            Text(
+                              p.name,
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.inter(
+                                fontSize: 11.5,
+                                color: AppColors.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        icon: const Icon(Icons.close_rounded,
+                            size: 18, color: AppColors.textMuted),
+                        style: IconButton.styleFrom(
+                          minimumSize: const Size(32, 32),
+                          padding: EdgeInsets.zero,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 18, 24, 4),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _dlgLabel('DEALER / SUPPLIER'),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: dealerCtrl,
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          color: AppColors.textDark,
+                        ),
+                        decoration: _dlgInputDecor('e.g. Metro Wholesale'),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 10, 24, 8),
+                  child: Row(
+                    children: [
+                      for (final mode in [true, false])
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: GestureDetector(
+                            onTap: () => setLocal(() => addMode = mode),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 7),
+                              decoration: BoxDecoration(
+                                color: addMode == mode
+                                    ? AppColors.primary
+                                    : AppColors.surfaceVariant,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: AppColors.border),
+                              ),
+                              child: Text(
+                                mode ? 'Add to stock' : 'Set exact',
+                                style: GoogleFonts.inter(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: addMode == mode
+                                      ? Colors.white
+                                      : AppColors.textMuted,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                Flexible(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
+                    child: Column(
+                      children: [
+                        if (variants.isEmpty)
+                          _stockRow(
+                            label: p.name,
+                            current: p.stock,
+                            ctrl: ctrls[p.id]!,
+                            addMode: addMode,
+                            onChanged: () => setLocal(() {}),
+                            resultFor: resultFor,
+                          )
+                        else
+                          ...variants.map(
+                            (v) => Padding(
+                              padding: const EdgeInsets.only(bottom: 10),
+                              child: _stockRow(
+                                label: v.label,
+                                current: v.stock,
+                                ctrl: ctrls[v.id]!,
+                                addMode: addMode,
+                                onChanged: () => setLocal(() {}),
+                                resultFor: resultFor,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(24, 14, 24, 16),
+                  decoration: const BoxDecoration(
+                    border: Border(top: BorderSide(color: AppColors.border)),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        child: Text(
+                          'Cancel',
+                          style: GoogleFonts.inter(
+                            fontSize: 13,
+                            color: AppColors.textMuted,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      ElevatedButton(
+                        onPressed: () async {
+                          final dealer = dealerCtrl.text.trim();
+                          if (variants.isEmpty) {
+                            final next =
+                                resultFor(p.stock, ctrls[p.id]!.text);
+                            if (next != p.stock || dealer != p.dealerName) {
+                              await LocalDbService.updateProduct(
+                                p.copyWith(stock: next, dealerName: dealer),
+                              );
+                            }
+                          } else {
+                            for (final v in variants) {
+                              final next =
+                                  resultFor(v.stock, ctrls[v.id]!.text);
+                              if (next != v.stock) {
+                                await LocalDbService.updateVariant(
+                                  v.copyWith(stock: next),
+                                );
+                              }
+                            }
+                            // Dealer is recorded on the parent product.
+                            if (dealer != p.dealerName) {
+                              await LocalDbService.updateProduct(
+                                p.copyWith(dealerName: dealer),
+                              );
+                            }
+                          }
+                          ConnectivityService.instance.syncNow();
+                          if (!ctx.mounted) return;
+                          Navigator.pop(ctx);
+                          await _loadProducts();
+                          _showToast('Stock updated for ${p.name}');
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primary,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 22, vertical: 12),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          elevation: 0,
+                        ),
+                        child: Text(
+                          'Update',
+                          style: GoogleFonts.inter(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    dealerCtrl.dispose();
+    for (final c in ctrls.values) {
+      c.dispose();
+    }
+  }
+
+  Widget _stockRow({
+    required String label,
+    required int current,
+    required TextEditingController ctrl,
+    required bool addMode,
+    required VoidCallback onChanged,
+    required int Function(int, String) resultFor,
+  }) {
+    final next = resultFor(current, ctrl.text);
+    final changed = ctrl.text.trim().isNotEmpty && next != current;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textDark,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  changed ? 'now $current  →  $next' : 'in stock: $current',
+                  style: GoogleFonts.inter(
+                    fontSize: 10.5,
+                    fontWeight: changed ? FontWeight.w600 : FontWeight.w400,
+                    color: changed ? AppColors.success : AppColors.textMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          SizedBox(
+            width: 92,
+            height: 36,
+            child: TextField(
+              controller: ctrl,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              textAlign: TextAlign.center,
+              onChanged: (_) => onChanged(),
+              style: GoogleFonts.inter(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: AppColors.textDark,
+              ),
+              decoration: InputDecoration(
+                hintText: addMode ? '+ qty' : '$current',
+                hintStyle: GoogleFonts.inter(
+                  fontSize: 12,
+                  color: AppColors.textMuted,
+                ),
+                filled: true,
+                fillColor: Colors.white,
+                contentPadding: EdgeInsets.zero,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: AppColors.border),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: AppColors.border),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(
+                      color: AppColors.accentBlue, width: 1.5),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _showEditProductDialog(Product p) async {
     final formKey = GlobalKey<FormState>();
     final nameCtrl = TextEditingController(text: p.name);
@@ -12380,6 +12769,9 @@ end tell
 
     // Which variant the price/stock fields currently edit (null = base product).
     String? selectedVariantId;
+    // Inline naming state: 'new' while adding, or the id being renamed.
+    String? variantNameMode;
+    final variantNameCtrl = TextEditingController();
     String basePriceText = priceCtrl.text;
     String baseBuyingText = buyingPriceCtrl.text;
     String baseStockText = stockCtrl.text;
@@ -12604,37 +12996,61 @@ end tell
                                         const SizedBox(width: 10),
                                         SizedBox(
                                           width: 148,
-                                          child: _variantDropdown(
-                                            variants: variants,
-                                            selectedId: selectedVariantId,
-                                            onSelect: (id) => setLocal(() {
-                                              commitFields();
-                                              selectedVariantId = id;
-                                              loadFields();
-                                            }),
-                                            onAdd: () async {
-                                              final name =
-                                                  await _promptVariantName(ctx);
-                                              if (name == null || name.isEmpty) {
-                                                return;
-                                              }
-                                              setLocal(() {
-                                                commitFields();
-                                                final v = ProductVariant(
-                                                  id: const Uuid().v4(),
-                                                  productId: p.id,
-                                                  label: name,
-                                                  price: double.tryParse(
-                                                          priceCtrl.text) ??
-                                                      p.price,
-                                                  stock: 0,
-                                                );
-                                                variants.add(v);
-                                                selectedVariantId = v.id;
-                                                loadFields();
-                                              });
-                                            },
-                                          ),
+                                          child: variantNameMode != null
+                                              ? _inlineVariantField(
+                                                  ctrl: variantNameCtrl,
+                                                  hint: 'e.g. 128GB / Blue',
+                                                  onCancel: () => setLocal(() {
+                                                    variantNameMode = null;
+                                                    variantNameCtrl.clear();
+                                                  }),
+                                                  onSubmit: (name) =>
+                                                      setLocal(() {
+                                                    if (variantNameMode ==
+                                                        'new') {
+                                                      commitFields();
+                                                      final v = ProductVariant(
+                                                        id: const Uuid().v4(),
+                                                        productId: p.id,
+                                                        label: name,
+                                                        price: double.tryParse(
+                                                                priceCtrl
+                                                                    .text) ??
+                                                            p.price,
+                                                        stock: 0,
+                                                      );
+                                                      variants.add(v);
+                                                      selectedVariantId = v.id;
+                                                      loadFields();
+                                                    } else {
+                                                      final idx = variants
+                                                          .indexWhere((x) =>
+                                                              x.id ==
+                                                              variantNameMode);
+                                                      if (idx != -1) {
+                                                        variants[idx] =
+                                                            variants[idx]
+                                                                .copyWith(
+                                                                    label: name);
+                                                      }
+                                                    }
+                                                    variantNameMode = null;
+                                                    variantNameCtrl.clear();
+                                                  }),
+                                                )
+                                              : _variantDropdown(
+                                                  variants: variants,
+                                                  selectedId: selectedVariantId,
+                                                  onSelect: (id) => setLocal(() {
+                                                    commitFields();
+                                                    selectedVariantId = id;
+                                                    loadFields();
+                                                  }),
+                                                  onAdd: () => setLocal(() {
+                                                    variantNameCtrl.clear();
+                                                    variantNameMode = 'new';
+                                                  }),
+                                                ),
                                         ),
                                       ],
                                     ),
@@ -12652,29 +13068,14 @@ end tell
                                             ),
                                           ),
                                           GestureDetector(
-                                            onTap: () async {
+                                            onTap: () => setLocal(() {
                                               final v = variants.firstWhere(
-                                                (x) => x.id == selectedVariantId,
+                                                (x) =>
+                                                    x.id == selectedVariantId,
                                               );
-                                              final name =
-                                                  await _promptVariantName(
-                                                ctx,
-                                                initial: v.label,
-                                              );
-                                              if (name == null || name.isEmpty) {
-                                                return;
-                                              }
-                                              setLocal(() {
-                                                final idx = variants.indexWhere(
-                                                  (x) =>
-                                                      x.id == selectedVariantId,
-                                                );
-                                                if (idx != -1) {
-                                                  variants[idx] = variants[idx]
-                                                      .copyWith(label: name);
-                                                }
-                                              });
-                                            },
+                                              variantNameCtrl.text = v.label;
+                                              variantNameMode = v.id;
+                                            }),
                                             child: Text(
                                               'Rename',
                                               style: GoogleFonts.inter(
@@ -13259,6 +13660,9 @@ end tell
 
     // Which variant the price/stock fields currently edit (null = base product).
     String? selectedVariantId;
+    // Inline naming state: 'new' while adding, or the id being renamed.
+    String? variantNameMode;
+    final variantNameCtrl = TextEditingController();
     String basePriceText = '';
     String baseBuyingText = '';
     String baseStockText = '';
@@ -13490,37 +13894,62 @@ end tell
                                         const SizedBox(width: 10),
                                         SizedBox(
                                           width: 148,
-                                          child: _variantDropdown(
-                                            variants: variants,
-                                            selectedId: selectedVariantId,
-                                            onSelect: (id) => setLocal(() {
-                                              commitFields();
-                                              selectedVariantId = id;
-                                              loadFields();
-                                            }),
-                                            onAdd: () async {
-                                              final name =
-                                                  await _promptVariantName(ctx);
-                                              if (name == null || name.isEmpty) {
-                                                return;
-                                              }
-                                              setLocal(() {
-                                                commitFields();
-                                                final v = ProductVariant(
-                                                  id: const Uuid().v4(),
-                                                  productId: pendingProductId,
-                                                  label: name,
-                                                  price: double.tryParse(
-                                                          priceCtrl.text) ??
-                                                      0.0,
-                                                  stock: 0,
-                                                );
-                                                variants.add(v);
-                                                selectedVariantId = v.id;
-                                                loadFields();
-                                              });
-                                            },
-                                          ),
+                                          child: variantNameMode != null
+                                              ? _inlineVariantField(
+                                                  ctrl: variantNameCtrl,
+                                                  hint: 'e.g. 128GB / Blue',
+                                                  onCancel: () => setLocal(() {
+                                                    variantNameMode = null;
+                                                    variantNameCtrl.clear();
+                                                  }),
+                                                  onSubmit: (name) =>
+                                                      setLocal(() {
+                                                    if (variantNameMode ==
+                                                        'new') {
+                                                      commitFields();
+                                                      final v = ProductVariant(
+                                                        id: const Uuid().v4(),
+                                                        productId:
+                                                            pendingProductId,
+                                                        label: name,
+                                                        price: double.tryParse(
+                                                                priceCtrl
+                                                                    .text) ??
+                                                            0.0,
+                                                        stock: 0,
+                                                      );
+                                                      variants.add(v);
+                                                      selectedVariantId = v.id;
+                                                      loadFields();
+                                                    } else {
+                                                      final idx = variants
+                                                          .indexWhere((x) =>
+                                                              x.id ==
+                                                              variantNameMode);
+                                                      if (idx != -1) {
+                                                        variants[idx] =
+                                                            variants[idx]
+                                                                .copyWith(
+                                                                    label: name);
+                                                      }
+                                                    }
+                                                    variantNameMode = null;
+                                                    variantNameCtrl.clear();
+                                                  }),
+                                                )
+                                              : _variantDropdown(
+                                                  variants: variants,
+                                                  selectedId: selectedVariantId,
+                                                  onSelect: (id) => setLocal(() {
+                                                    commitFields();
+                                                    selectedVariantId = id;
+                                                    loadFields();
+                                                  }),
+                                                  onAdd: () => setLocal(() {
+                                                    variantNameCtrl.clear();
+                                                    variantNameMode = 'new';
+                                                  }),
+                                                ),
                                         ),
                                       ],
                                     ),
@@ -13538,29 +13967,14 @@ end tell
                                             ),
                                           ),
                                           GestureDetector(
-                                            onTap: () async {
+                                            onTap: () => setLocal(() {
                                               final v = variants.firstWhere(
-                                                (x) => x.id == selectedVariantId,
+                                                (x) =>
+                                                    x.id == selectedVariantId,
                                               );
-                                              final name =
-                                                  await _promptVariantName(
-                                                ctx,
-                                                initial: v.label,
-                                              );
-                                              if (name == null || name.isEmpty) {
-                                                return;
-                                              }
-                                              setLocal(() {
-                                                final idx = variants.indexWhere(
-                                                  (x) =>
-                                                      x.id == selectedVariantId,
-                                                );
-                                                if (idx != -1) {
-                                                  variants[idx] = variants[idx]
-                                                      .copyWith(label: name);
-                                                }
-                                              });
-                                            },
+                                              variantNameCtrl.text = v.label;
+                                              variantNameMode = v.id;
+                                            }),
                                             child: Text(
                                               'Rename',
                                               style: GoogleFonts.inter(
@@ -17950,6 +18364,9 @@ class _ProductCard extends StatefulWidget {
   final List<ProductVariant> variants;
   final bool variantsExpanded;
   final VoidCallback? onVariantArrowTap;
+  /// Rate actually charged for this product — its own, or the store default.
+  final double effectiveTaxRate;
+  final String taxLabel;
   const _ProductCard({
     required this.product,
     required this.onTap,
@@ -17957,6 +18374,8 @@ class _ProductCard extends StatefulWidget {
     this.variants = const [],
     this.variantsExpanded = false,
     this.onVariantArrowTap,
+    this.effectiveTaxRate = 0,
+    this.taxLabel = 'GST',
   });
   @override
   State<_ProductCard> createState() => _ProductCardState();
@@ -18289,16 +18708,20 @@ class _ProductCardState extends State<_ProductCard> {
                       ),
                     ),
                     const SizedBox(height: 8),
+                    // Price shown is what the customer pays (tax included).
                     Text(
-                      widget.variants.isEmpty
-                          ? '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}'
-                          : (() {
-                              final prices = widget.variants.map((v) => v.price).toList()
-                                ..sort();
-                              return prices.first == prices.last
-                                  ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
-                                  : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
-                            })(),
+                      () {
+                        final m = 1 + widget.effectiveTaxRate / 100;
+                        if (widget.variants.isEmpty) {
+                          return '${widget.currencySymbol}${(widget.product.price * m).toStringAsFixed(2)}';
+                        }
+                        final prices =
+                            widget.variants.map((v) => v.price * m).toList()
+                              ..sort();
+                        return prices.first == prices.last
+                            ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
+                            : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
+                      }(),
                       style: GoogleFonts.manrope(
                         fontSize: 16,
                         fontWeight: FontWeight.w900,
@@ -18306,6 +18729,16 @@ class _ProductCardState extends State<_ProductCard> {
                         letterSpacing: -0.5,
                       ),
                     ),
+                    if (widget.effectiveTaxRate > 0)
+                      Text(
+                        'incl. ${widget.taxLabel} '
+                        '${widget.effectiveTaxRate == widget.effectiveTaxRate.truncateToDouble() ? widget.effectiveTaxRate.toStringAsFixed(0) : widget.effectiveTaxRate}%',
+                        style: GoogleFonts.inter(
+                          fontSize: 8.5,
+                          fontWeight: FontWeight.w300,
+                          color: AppColors.textMuted.withValues(alpha: 0.7),
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -18324,11 +18757,15 @@ class _VariantCard extends StatefulWidget {
   final ProductVariant variant;
   final String currencySymbol;
   final VoidCallback? onCollapse;
+  final double effectiveTaxRate;
+  final String taxLabel;
   const _VariantCard({
     required this.product,
     required this.variant,
     required this.currencySymbol,
     this.onCollapse,
+    this.effectiveTaxRate = 0,
+    this.taxLabel = 'GST',
   });
   @override
   State<_VariantCard> createState() => _VariantCardState();
@@ -18567,7 +19004,7 @@ class _VariantCardState extends State<_VariantCard> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        '${widget.currencySymbol}${widget.variant.price.toStringAsFixed(2)}',
+                        '${widget.currencySymbol}${(widget.variant.price * (1 + widget.effectiveTaxRate / 100)).toStringAsFixed(2)}',
                         style: GoogleFonts.manrope(
                           fontSize: 16,
                           fontWeight: FontWeight.w900,
@@ -18575,6 +19012,16 @@ class _VariantCardState extends State<_VariantCard> {
                           letterSpacing: -0.5,
                         ),
                       ),
+                      if (widget.effectiveTaxRate > 0)
+                        Text(
+                          'incl. ${widget.taxLabel} '
+                          '${widget.effectiveTaxRate == widget.effectiveTaxRate.truncateToDouble() ? widget.effectiveTaxRate.toStringAsFixed(0) : widget.effectiveTaxRate}%',
+                          style: GoogleFonts.inter(
+                            fontSize: 8.5,
+                            fontWeight: FontWeight.w300,
+                            color: AppColors.textMuted.withValues(alpha: 0.7),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -18593,10 +19040,12 @@ class _CartRow extends StatefulWidget {
   final CartItem item;
   final CartProvider cart;
   final String currencySymbol;
+  final String taxLabel;
   const _CartRow({
     required this.item,
     required this.cart,
     required this.currencySymbol,
+    this.taxLabel = 'GST',
   });
   @override
   State<_CartRow> createState() => _CartRowState();
@@ -18745,27 +19194,47 @@ class _CartRowState extends State<_CartRow> {
             ),
           ),
           SizedBox(
-            width: 90,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Text(
-                  '${widget.currencySymbol}${widget.item.total.toStringAsFixed(2)}',
-                  style: GoogleFonts.inter(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.primary,
-                  ),
-                ),
-                Text(
-                  '${widget.currencySymbol}${widget.item.unitPrice.toStringAsFixed(2)}/unit',
-                  style: GoogleFonts.inter(
-                    fontSize: 9,
-                    color: AppColors.textMuted.withValues(alpha: 0.6),
-                    fontWeight: FontWeight.w300,
-                  ),
-                ),
-              ],
+            width: 96,
+            child: Builder(
+              builder: (_) {
+                final rate = widget.item.product.taxPercent > 0
+                    ? widget.item.product.taxPercent
+                    : widget.cart.taxRate;
+                final lineTax = widget.item.total * rate / 100;
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    // Line total incl. tax — what this line adds to the bill.
+                    Text(
+                      '${widget.currencySymbol}${(widget.item.total + lineTax).toStringAsFixed(2)}',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.primary,
+                      ),
+                    ),
+                    const SizedBox(height: 1),
+                    Text(
+                      '${widget.currencySymbol}${widget.item.total.toStringAsFixed(2)}'
+                      '${rate > 0 ? ' + ${widget.currencySymbol}${lineTax.toStringAsFixed(2)}' : ''}',
+                      style: GoogleFonts.inter(
+                        fontSize: 9,
+                        color: AppColors.textMuted,
+                        fontWeight: FontWeight.w400,
+                      ),
+                    ),
+                    if (rate > 0)
+                      Text(
+                        '${widget.taxLabel} ${rate == rate.truncateToDouble() ? rate.toStringAsFixed(0) : rate}%',
+                        style: GoogleFonts.inter(
+                          fontSize: 8.5,
+                          color: AppColors.textMuted.withValues(alpha: 0.65),
+                          fontWeight: FontWeight.w300,
+                        ),
+                      ),
+                  ],
+                );
+              },
             ),
           ),
           SizedBox(

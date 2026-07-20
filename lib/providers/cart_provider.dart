@@ -150,6 +150,10 @@ class CartProvider extends ChangeNotifier {
         quantity: i.quantity,
         variantId: i.variant?.id,
         variantLabel: i.variant?.label,
+        // Freeze the rate actually charged, so reprinted receipts stay
+        // accurate even if the product's or store's rate changes later.
+        taxPercent:
+            i.product.taxPercent > 0 ? i.product.taxPercent : taxRate,
       )).toList(),
       subtotal: subtotal,
       discountAmount: discountAmount,

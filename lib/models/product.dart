@@ -12,6 +12,8 @@ class Product {
   final String sku;
   final int stock;
   final String barcodeNo;
+  /// Supplier this stock was last purchased from.
+  final String dealerName;
 
   const Product({
     required this.id,
@@ -25,6 +27,7 @@ class Product {
     required this.sku,
     required this.stock,
     this.barcodeNo = '',
+    this.dealerName = '',
   });
 
   Map<String, dynamic> toMap() => {
@@ -39,6 +42,7 @@ class Product {
     'sku': sku,
     'stock': stock,
     'barcode_no': barcodeNo,
+    'dealer_name': dealerName,
     'synced': 0,
   };
 
@@ -54,14 +58,21 @@ class Product {
     sku: m['sku'] as String,
     stock: m['stock'] as int,
     barcodeNo: (m['barcode_no'] as String?) ?? '',
+    dealerName: (m['dealer_name'] as String?) ?? '',
   );
 
-  Product copyWith({int? stock, String? description, String? barcodeNo}) => Product(
+  Product copyWith({
+    int? stock,
+    String? description,
+    String? barcodeNo,
+    String? dealerName,
+  }) => Product(
     id: id, name: name, description: description ?? this.description,
     price: price, buyingPrice: buyingPrice,
     taxPercent: taxPercent, category: category,
     emoji: emoji, sku: sku, stock: stock ?? this.stock,
     barcodeNo: barcodeNo ?? this.barcodeNo,
+    dealerName: dealerName ?? this.dealerName,
   );
 }
 

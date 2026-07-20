@@ -284,7 +284,7 @@ class ReceiptPrinter {
             if (tx.discountAmount > 0)
               _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', regular, fs,
                   valueColor: PdfColors.green800),
-            _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', regular, fs),
+            ..._taxRows(tx, taxLabel, taxRate, currencySymbol, regular, fs),
             pw.SizedBox(height: 4),
             pw.Divider(thickness: 1, color: PdfColors.black),
             pw.SizedBox(height: 4),
@@ -423,7 +423,7 @@ class ReceiptPrinter {
               pw.SizedBox(width: 200, child: pw.Column(children: [
                 _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
                 if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-                _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+                ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
                 pw.Divider(thickness: 1.5, color: const PdfColor.fromInt(0xFF2D2D2D)),
                 pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
                   pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 4, color: const PdfColor.fromInt(0xFF2D2D2D))),
@@ -499,7 +499,7 @@ class ReceiptPrinter {
             child: pw.Column(children: [
               _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
               if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-              _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+              ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
               pw.Divider(thickness: 0.5),
               pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
                 pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 3)),
@@ -561,7 +561,7 @@ class ReceiptPrinter {
         pw.Divider(color: PdfColors.grey400, thickness: 0.5),
         _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
         if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-        _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+        ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
         pw.Divider(thickness: 1, color: PdfColors.black),
         pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
           pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 3)),
@@ -631,7 +631,7 @@ class ReceiptPrinter {
           pw.SizedBox(width: 200, child: pw.Column(children: [
             _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
             if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
-            _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs),
+            ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
             pw.Divider(thickness: 1, color: PdfColors.black),
             pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
               pw.Text('TOTAL', style: pw.TextStyle(font: b, fontSize: fs + 3)),
@@ -782,7 +782,7 @@ class ReceiptPrinter {
               pw.SizedBox(width: 220, child: pw.Column(children: [
                 _totalRow('Taxable Value', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs - 0.5),
                 if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs - 0.5, valueColor: PdfColors.green800),
-                _totalRow('$taxLabel ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', r, fs - 0.5),
+                ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs - 0.5),
                 pw.Divider(thickness: 1, color: PdfColors.black),
                 pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
                   pw.Text('Grand Total', style: pw.TextStyle(font: b, fontSize: fs + 2)),
@@ -1705,6 +1705,49 @@ class ReceiptPrinter {
             style: pw.TextStyle(font: font, fontSize: fs, color: valueColor)),
       ]),
     );
+  }
+
+  /// Splits a bill's tax by rate, mirroring how CartProvider charged it, so an
+  /// invoice with mixed rates prints one line per rate instead of labelling
+  /// everything with the store-wide rate. Items saved before per-line rates
+  /// existed report 0 and fall back to [fallbackRate].
+  static Map<double, double> _taxByRate(
+      TransactionRecord tx, double fallbackRate) {
+    final out = <double, double>{};
+    final sub = tx.items.fold<double>(0, (s, i) => s + i.total);
+    if (sub <= 0) return out;
+    final factor = (sub - tx.discountAmount) / sub;
+    for (final i in tx.items) {
+      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+      if (rate <= 0) continue;
+      out[rate] = (out[rate] ?? 0) + i.total * factor * rate / 100;
+    }
+    return out;
+  }
+
+  static String _fmtRate(double r) =>
+      r == r.truncateToDouble() ? r.toStringAsFixed(0) : r.toString();
+
+  /// Tax line(s) for the totals block: a single row when every item shares a
+  /// rate, otherwise one row per rate.
+  static List<pw.Widget> _taxRows(TransactionRecord tx, String taxLabel,
+      String taxRate, String currencySymbol, pw.Font font, double fs) {
+    final breakdown = _taxByRate(tx, double.tryParse(taxRate) ?? 0);
+    if (breakdown.length <= 1) {
+      final label = breakdown.isEmpty
+          ? '$taxLabel ($taxRate%)'
+          : '$taxLabel (${_fmtRate(breakdown.keys.first)}%)';
+      return [
+        _totalRow(label,
+            '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', font, fs),
+      ];
+    }
+    final rates = breakdown.keys.toList()..sort();
+    return [
+      for (final r in rates)
+        _totalRow('$taxLabel (${_fmtRate(r)}%)',
+            '$currencySymbol${breakdown[r]!.toStringAsFixed(2)}', font, fs),
+    ];
   }
 
   static pw.Widget _totalRow(String label, String value, pw.Font font, double fs,

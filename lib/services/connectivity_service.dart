@@ -19,6 +19,12 @@ class ConnectivityService extends ChangeNotifier {
   bool get isOnline => _isOnline;
 
   StreamSubscription? _sub;
+  Timer? _pollTimer;
+
+  /// How often to re-read the cloud so a second till sees the first one's
+  /// sales. Without this the app only pulls at startup and terminals drift
+  /// apart over the day.
+  static const Duration _pullInterval = Duration(seconds: 45);
 
   Future<void> init() async {
     final result = await Connectivity().checkConnectivity();
@@ -28,11 +34,33 @@ class ConnectivityService extends ChangeNotifier {
       final online = _hasConnection(results);
       if (online && !_isOnline) {
         _isOnline = true;
-        _syncAll();
+        // Push what we did offline, then catch up on what others changed.
+        await _syncAll();
+        await pullFromCloud();
       } else {
         _isOnline = online;
       }
     });
+
+    startPeriodicPull();
+  }
+
+  void startPeriodicPull() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(_pullInterval, (_) async {
+      if (!_isOnline || _isSyncing) return;
+      if (Supabase.instance.client.auth.currentUser == null) return;
+      try {
+        await pullFromCloud();
+      } catch (e) {
+        debugPrint('Periodic pull failed: $e');
+      }
+    });
+  }
+
+  void stopPeriodicPull() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
   }
 
   bool _hasConnection(List<ConnectivityResult> results) =>
@@ -80,6 +108,7 @@ class ConnectivityService extends ChangeNotifier {
               'sku': p.sku,
               'stock': p.stock,
               'description': p.description,
+              'dealer_name': p.dealerName,
             }).toList(),
           );
           for (final p in unsyncedProducts) {
@@ -259,6 +288,7 @@ class ConnectivityService extends ChangeNotifier {
                 'sku': r['sku'],
                 'stock': r['stock'],
                 'description': (r['description'] as String?) ?? '',
+                'dealer_name': (r['dealer_name'] as String?) ?? '',
                 'synced': 1,
               }))
           .toList();
@@ -382,6 +412,7 @@ class ConnectivityService extends ChangeNotifier {
   @override
   void dispose() {
     _sub?.cancel();
+    _pollTimer?.cancel();
     super.dispose();
   }
 }
