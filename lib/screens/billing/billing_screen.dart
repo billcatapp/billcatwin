@@ -13306,6 +13306,14 @@ end tell
     );
     final stockCtrl = TextEditingController(text: '${p.stock}');
     final dealerCtrl = TextEditingController(text: p.dealerName);
+    // Enter advances through the fields top-to-bottom, last one saves.
+    final nameFocus = FocusNode();
+    final skuFocus = FocusNode();
+    final priceFocus = FocusNode();
+    final stockFocus = FocusNode();
+    final buyingFocus = FocusNode();
+    final taxFocus = FocusNode();
+    final dealerFocus = FocusNode();
     List<String> tags = p.description.isNotEmpty
         ? p.description
               .split(RegExp(r'[,\n]'))
@@ -13375,6 +13383,49 @@ end tell
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setLocal) {
+          Future<void> saveEdit() async {
+            if (!formKey.currentState!.validate()) return;
+            commitFields();
+            final pendingTag = tagInputCtrl.text.trim();
+            if (pendingTag.isNotEmpty && !tags.contains(pendingTag)) {
+              tags.add(pendingTag);
+            }
+            final updated = Product(
+              id: p.id,
+              name: nameCtrl.text.trim(),
+              price: double.tryParse(basePriceText) ?? p.price,
+              buyingPrice: double.tryParse(baseBuyingText) ?? 0.0,
+              taxPercent: double.tryParse(taxPercentCtrl.text) ?? 0.0,
+              category: category,
+              emoji: emoji,
+              sku: skuCtrl.text.trim().isEmpty ? p.sku : skuCtrl.text.trim(),
+              stock: int.tryParse(baseStockText) ?? p.stock,
+              description: tags.join(', '),
+              dealerName: dealerCtrl.text.trim(),
+              barcodeNo: p.barcodeNo,
+            );
+            await LocalDbService.updateProduct(updated);
+            final currentIds = variants.map((v) => v.id).toSet();
+            for (final removedId in originalVariantIds.difference(currentIds)) {
+              await LocalDbService.deleteVariant(removedId);
+            }
+            for (final v in variants) {
+              if (originalVariantIds.contains(v.id)) {
+                await LocalDbService.updateVariant(v);
+              } else {
+                await LocalDbService.insertVariant(v);
+              }
+            }
+            ConnectivityService.instance.syncNow();
+            if (!ctx.mounted) return;
+            setState(() {
+              final idx = _products.indexWhere((x) => x.id == p.id);
+              if (idx != -1) _products[idx] = updated;
+              _variantsByProduct[p.id] = variants;
+            });
+            Navigator.pop(ctx);
+          }
+
           return Dialog(
             backgroundColor: Colors.white,
             shape: RoundedRectangleBorder(
@@ -13569,6 +13620,11 @@ end tell
                                               Expanded(
                                                 child: TextFormField(
                                                   controller: nameCtrl,
+                                                  focusNode: nameFocus,
+                                                  textInputAction:
+                                                      TextInputAction.next,
+                                                  onFieldSubmitted: (_) =>
+                                                      skuFocus.requestFocus(),
                                                   validator: (v) =>
                                                       v != null &&
                                                           v.trim().isNotEmpty
@@ -13740,6 +13796,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: skuCtrl,
+                                            focusNode: skuFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                priceFocus.requestFocus(),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
@@ -13858,6 +13919,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: priceCtrl,
+                                            focusNode: priceFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                stockFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -13893,6 +13959,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: stockCtrl,
+                                            focusNode: stockFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                buyingFocus.requestFocus(),
                                             keyboardType: TextInputType.number,
                                             inputFormatters: [
                                               FilteringTextInputFormatter
@@ -13927,6 +13998,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: buyingPriceCtrl,
+                                            focusNode: buyingFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                taxFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -13955,6 +14031,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: taxPercentCtrl,
+                                            focusNode: taxFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                dealerFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -13989,6 +14070,9 @@ end tell
                                 const SizedBox(height: 6),
                                 TextField(
                                   controller: dealerCtrl,
+                                  focusNode: dealerFocus,
+                                  textInputAction: TextInputAction.done,
+                                  onSubmitted: (_) => saveEdit(),
                                   style: GoogleFonts.inter(
                                     fontSize: 13,
                                     color: AppColors.textDark,
@@ -14198,61 +14282,7 @@ end tell
                           ),
                           const SizedBox(width: 12),
                           ElevatedButton(
-                            onPressed: () async {
-                              if (!formKey.currentState!.validate()) return;
-                              commitFields();
-                              final pendingTag = tagInputCtrl.text.trim();
-                              if (pendingTag.isNotEmpty &&
-                                  !tags.contains(pendingTag)) {
-                                tags.add(pendingTag);
-                              }
-                              final updated = Product(
-                                id: p.id,
-                                name: nameCtrl.text.trim(),
-                                price:
-                                    double.tryParse(basePriceText) ?? p.price,
-                                buyingPrice:
-                                    double.tryParse(baseBuyingText) ?? 0.0,
-                                taxPercent:
-                                    double.tryParse(taxPercentCtrl.text) ?? 0.0,
-                                category: category,
-                                emoji: emoji,
-                                sku: skuCtrl.text.trim().isEmpty
-                                    ? p.sku
-                                    : skuCtrl.text.trim(),
-                                stock: int.tryParse(baseStockText) ?? p.stock,
-                                description: tags.join(', '),
-                                dealerName: dealerCtrl.text.trim(),
-                                barcodeNo: p.barcodeNo,
-                              );
-                              await LocalDbService.updateProduct(updated);
-                              final currentIds = variants
-                                  .map((v) => v.id)
-                                  .toSet();
-                              for (final removedId
-                                  in originalVariantIds.difference(
-                                    currentIds,
-                                  )) {
-                                await LocalDbService.deleteVariant(removedId);
-                              }
-                              for (final v in variants) {
-                                if (originalVariantIds.contains(v.id)) {
-                                  await LocalDbService.updateVariant(v);
-                                } else {
-                                  await LocalDbService.insertVariant(v);
-                                }
-                              }
-                              ConnectivityService.instance.syncNow();
-                              if (!ctx.mounted) return;
-                              setState(() {
-                                final idx = _products.indexWhere(
-                                  (x) => x.id == p.id,
-                                );
-                                if (idx != -1) _products[idx] = updated;
-                                _variantsByProduct[p.id] = variants;
-                              });
-                              Navigator.pop(ctx);
-                            },
+                            onPressed: saveEdit,
                             style: ElevatedButton.styleFrom(
                               backgroundColor: AppColors.primary,
                               foregroundColor: Colors.white,
@@ -14327,6 +14357,14 @@ end tell
     );
     final stockCtrl = TextEditingController();
     final dealerCtrl = TextEditingController();
+    // Enter advances through the fields top-to-bottom, last one saves.
+    final nameFocus = FocusNode();
+    final skuFocus = FocusNode();
+    final priceFocus = FocusNode();
+    final stockFocus = FocusNode();
+    final buyingFocus = FocusNode();
+    final taxFocus = FocusNode();
+    final dealerFocus = FocusNode();
     List<String> tags = [];
     final tagInputCtrl = TextEditingController();
     final tagFocusNode = FocusNode();
@@ -14395,6 +14433,62 @@ end tell
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setLocal) {
+          Future<void> saveNew() async {
+            if (!formKey.currentState!.validate()) return;
+            final sku = skuCtrl.text.trim().isEmpty
+                ? _generateUniqueSku(nameCtrl.text.trim())
+                : skuCtrl.text.trim().toUpperCase();
+            if (_products.any((p) => p.sku == sku)) {
+              _showToast('SKU "$sku" already exists', isError: true);
+              return;
+            }
+            commitFields();
+            final basePrice = double.tryParse(basePriceText);
+            final baseStock = int.tryParse(baseStockText);
+            if (basePrice == null || baseStock == null) {
+              _showToast(
+                'Enter a price and stock for the base product',
+                isError: true,
+              );
+              setLocal(() {
+                selectedVariantId = null;
+                loadFields();
+              });
+              return;
+            }
+            final pendingTag = tagInputCtrl.text.trim();
+            if (pendingTag.isNotEmpty && !tags.contains(pendingTag)) {
+              tags.add(pendingTag);
+            }
+            final newProduct = Product(
+              id: pendingProductId,
+              name: nameCtrl.text.trim(),
+              price: basePrice,
+              buyingPrice: double.tryParse(baseBuyingText) ?? 0.0,
+              taxPercent: double.tryParse(taxPercentCtrl.text) ?? 0.0,
+              category: category,
+              emoji: emoji,
+              sku: sku,
+              stock: baseStock,
+              description: tags.join(', '),
+              dealerName: dealerCtrl.text.trim(),
+            );
+            await LocalDbService.insertProduct(newProduct);
+            for (final v in variants) {
+              await LocalDbService.insertVariant(v);
+            }
+            ConnectivityService.instance.syncNow();
+            if (!ctx.mounted) return;
+            setState(() {
+              _products.add(newProduct);
+              if (variants.isNotEmpty) {
+                _variantsByProduct[pendingProductId] = variants;
+              }
+            });
+            Navigator.pop(ctx);
+            _showToast('${newProduct.name} added to inventory');
+          }
+
           return Dialog(
             backgroundColor: Colors.white,
             shape: RoundedRectangleBorder(
@@ -14584,6 +14678,11 @@ end tell
                                               Expanded(
                                                 child: TextFormField(
                                                   controller: nameCtrl,
+                                                  focusNode: nameFocus,
+                                                  textInputAction:
+                                                      TextInputAction.next,
+                                                  onFieldSubmitted: (_) =>
+                                                      skuFocus.requestFocus(),
                                                   validator: (v) =>
                                                       v != null &&
                                                           v.trim().isNotEmpty
@@ -14757,6 +14856,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: skuCtrl,
+                                            focusNode: skuFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                priceFocus.requestFocus(),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
@@ -14877,6 +14981,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: priceCtrl,
+                                            focusNode: priceFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                stockFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -14914,6 +15023,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: stockCtrl,
+                                            focusNode: stockFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                buyingFocus.requestFocus(),
                                             keyboardType: TextInputType.number,
                                             inputFormatters: [
                                               FilteringTextInputFormatter
@@ -14949,6 +15063,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: buyingPriceCtrl,
+                                            focusNode: buyingFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                taxFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -14977,6 +15096,11 @@ end tell
                                           const SizedBox(height: 6),
                                           TextFormField(
                                             controller: taxPercentCtrl,
+                                            focusNode: taxFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onFieldSubmitted: (_) =>
+                                                dealerFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -15011,6 +15135,9 @@ end tell
                                 const SizedBox(height: 6),
                                 TextField(
                                   controller: dealerCtrl,
+                                  focusNode: dealerFocus,
+                                  textInputAction: TextInputAction.done,
+                                  onSubmitted: (_) => saveNew(),
                                   style: GoogleFonts.inter(
                                     fontSize: 13,
                                     color: AppColors.textDark,
@@ -15221,70 +15348,7 @@ end tell
                           ),
                           const SizedBox(width: 12),
                           ElevatedButton(
-                            onPressed: () async {
-                              if (!formKey.currentState!.validate()) return;
-                              final sku = skuCtrl.text.trim().isEmpty
-                                  ? _generateUniqueSku(nameCtrl.text.trim())
-                                  : skuCtrl.text.trim().toUpperCase();
-                              if (_products.any((p) => p.sku == sku)) {
-                                _showToast(
-                                  'SKU "$sku" already exists',
-                                  isError: true,
-                                );
-                                return;
-                              }
-                              commitFields();
-                              final basePrice = double.tryParse(basePriceText);
-                              final baseStock = int.tryParse(baseStockText);
-                              if (basePrice == null || baseStock == null) {
-                                _showToast(
-                                  'Enter a price and stock for the base product',
-                                  isError: true,
-                                );
-                                setLocal(() {
-                                  selectedVariantId = null;
-                                  loadFields();
-                                });
-                                return;
-                              }
-                              final pendingTag = tagInputCtrl.text.trim();
-                              if (pendingTag.isNotEmpty &&
-                                  !tags.contains(pendingTag)) {
-                                tags.add(pendingTag);
-                              }
-                              final newProduct = Product(
-                                id: pendingProductId,
-                                name: nameCtrl.text.trim(),
-                                price: basePrice,
-                                buyingPrice:
-                                    double.tryParse(baseBuyingText) ?? 0.0,
-                                taxPercent:
-                                    double.tryParse(taxPercentCtrl.text) ?? 0.0,
-                                category: category,
-                                emoji: emoji,
-                                sku: sku,
-                                stock: baseStock,
-                                description: tags.join(', '),
-                                dealerName: dealerCtrl.text.trim(),
-                              );
-                              await LocalDbService.insertProduct(newProduct);
-                              for (final v in variants) {
-                                await LocalDbService.insertVariant(v);
-                              }
-                              ConnectivityService.instance.syncNow();
-                              if (!ctx.mounted) return;
-                              setState(() {
-                                _products.add(newProduct);
-                                if (variants.isNotEmpty) {
-                                  _variantsByProduct[pendingProductId] =
-                                      variants;
-                                }
-                              });
-                              Navigator.pop(ctx);
-                              _showToast(
-                                '${newProduct.name} added to inventory',
-                              );
-                            },
+                            onPressed: saveNew,
                             style: ElevatedButton.styleFrom(
                               backgroundColor: AppColors.primary,
                               foregroundColor: Colors.white,
@@ -19761,10 +19825,9 @@ class _ProductCardState extends State<_ProductCard> {
                         if (widget.variants.isEmpty) {
                           return '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}';
                         }
-                        final prices = widget.variants
-                            .map((v) => v.price)
-                            .toList()
-                          ..sort();
+                        final prices =
+                            widget.variants.map((v) => v.price).toList()
+                              ..sort();
                         return prices.first == prices.last
                             ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
                             : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
