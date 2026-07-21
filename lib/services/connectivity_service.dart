@@ -79,7 +79,8 @@ class ConnectivityService extends ChangeNotifier {
       final pendingDeletes = await LocalDbService.getPendingDeleteProductIds();
       if (pendingDeletes.isNotEmpty) {
         try {
-          await client.from('products')
+          await client
+              .from('products')
               .delete()
               .inFilter('id', pendingDeletes)
               .eq('user_id', userId);
@@ -95,22 +96,28 @@ class ConnectivityService extends ChangeNotifier {
       final unsyncedProducts = await LocalDbService.getUnsyncedProducts();
       if (unsyncedProducts.isNotEmpty) {
         try {
-          await client.from('products').upsert(
-            unsyncedProducts.map((p) => {
-              'id': p.id,
-              'user_id': userId,
-              'name': p.name,
-              'price': p.price,
-              'buying_price': p.buyingPrice,
-              'tax_percent': p.taxPercent,
-              'category': p.category,
-              'emoji': p.emoji,
-              'sku': p.sku,
-              'stock': p.stock,
-              'description': p.description,
-              'dealer_name': p.dealerName,
-            }).toList(),
-          );
+          await client
+              .from('products')
+              .upsert(
+                unsyncedProducts
+                    .map(
+                      (p) => {
+                        'id': p.id,
+                        'user_id': userId,
+                        'name': p.name,
+                        'price': p.price,
+                        'buying_price': p.buyingPrice,
+                        'tax_percent': p.taxPercent,
+                        'category': p.category,
+                        'emoji': p.emoji,
+                        'sku': p.sku,
+                        'stock': p.stock,
+                        'description': p.description,
+                        'dealer_name': p.dealerName,
+                      },
+                    )
+                    .toList(),
+              );
           for (final p in unsyncedProducts) {
             await LocalDbService.markProductSynced(p.id);
           }
@@ -121,10 +128,12 @@ class ConnectivityService extends ChangeNotifier {
       }
 
       // ── Sync product variant deletions ───────────────────────────────────
-      final pendingVariantDeletes = await LocalDbService.getPendingDeleteVariantIds();
+      final pendingVariantDeletes =
+          await LocalDbService.getPendingDeleteVariantIds();
       if (pendingVariantDeletes.isNotEmpty) {
         try {
-          await client.from('product_variants')
+          await client
+              .from('product_variants')
               .delete()
               .inFilter('id', pendingVariantDeletes)
               .eq('user_id', userId);
@@ -140,23 +149,31 @@ class ConnectivityService extends ChangeNotifier {
       final unsyncedVariants = await LocalDbService.getUnsyncedVariants();
       if (unsyncedVariants.isNotEmpty) {
         try {
-          await client.from('product_variants').upsert(
-            unsyncedVariants.map((v) => {
-              'id': v.id,
-              'user_id': userId,
-              'product_id': v.productId,
-              'label': v.label,
-              'price': v.price,
-              'buying_price': v.buyingPrice,
-              'stock': v.stock,
-              'sku': v.sku,
-              'barcode_no': v.barcodeNo,
-            }).toList(),
-          );
+          await client
+              .from('product_variants')
+              .upsert(
+                unsyncedVariants
+                    .map(
+                      (v) => {
+                        'id': v.id,
+                        'user_id': userId,
+                        'product_id': v.productId,
+                        'label': v.label,
+                        'price': v.price,
+                        'buying_price': v.buyingPrice,
+                        'stock': v.stock,
+                        'sku': v.sku,
+                        'barcode_no': v.barcodeNo,
+                      },
+                    )
+                    .toList(),
+              );
           for (final v in unsyncedVariants) {
             await LocalDbService.markVariantSynced(v.id);
           }
-          debugPrint('PUSH: product_variants ok (${unsyncedVariants.length} rows)');
+          debugPrint(
+            'PUSH: product_variants ok (${unsyncedVariants.length} rows)',
+          );
         } catch (e) {
           debugPrint('Variant sync error: $e');
         }
@@ -166,22 +183,28 @@ class ConnectivityService extends ChangeNotifier {
       final unsyncedTx = await LocalDbService.getUnsynced();
       if (unsyncedTx.isNotEmpty) {
         try {
-          await client.from('transactions').upsert(
-            unsyncedTx.map((t) => {
-              'id': t.id,
-              'user_id': userId,
-              'customer_name': t.customerName,
-              'customer_phone': t.customerPhone,
-              'subtotal': t.subtotal,
-              'discount_amount': t.discountAmount,
-              'tax_amount': t.taxAmount,
-              'total': t.total,
-              'payment_method': t.paymentMethod,
-              'created_at': t.createdAt.toIso8601String(),
-              'items': t.items.map((i) => i.toMap()).toList(),
-              'invoice_number': t.invoiceNumber,
-            }).toList(),
-          );
+          await client
+              .from('transactions')
+              .upsert(
+                unsyncedTx
+                    .map(
+                      (t) => {
+                        'id': t.id,
+                        'user_id': userId,
+                        'customer_name': t.customerName,
+                        'customer_phone': t.customerPhone,
+                        'subtotal': t.subtotal,
+                        'discount_amount': t.discountAmount,
+                        'tax_amount': t.taxAmount,
+                        'total': t.total,
+                        'payment_method': t.paymentMethod,
+                        'created_at': t.createdAt.toIso8601String(),
+                        'items': t.items.map((i) => i.toMap()).toList(),
+                        'invoice_number': t.invoiceNumber,
+                      },
+                    )
+                    .toList(),
+              );
           for (final t in unsyncedTx) {
             await LocalDbService.markSynced(t.id);
           }
@@ -194,15 +217,21 @@ class ConnectivityService extends ChangeNotifier {
       final unsyncedCustomers = await LocalDbService.getUnsyncedCustomers();
       if (unsyncedCustomers.isNotEmpty) {
         try {
-          await client.from('customers').upsert(
-            unsyncedCustomers.map((c) => {
-              'id': c.id,
-              'user_id': userId,
-              'name': c.name,
-              'phone': c.phone,
-              'created_at': c.createdAt.toIso8601String(),
-            }).toList(),
-          );
+          await client
+              .from('customers')
+              .upsert(
+                unsyncedCustomers
+                    .map(
+                      (c) => {
+                        'id': c.id,
+                        'user_id': userId,
+                        'name': c.name,
+                        'phone': c.phone,
+                        'created_at': c.createdAt.toIso8601String(),
+                      },
+                    )
+                    .toList(),
+              );
           for (final c in unsyncedCustomers) {
             await LocalDbService.markCustomerSynced(c.id);
           }
@@ -216,9 +245,13 @@ class ConnectivityService extends ChangeNotifier {
       final unsyncedCats = await LocalDbService.getUnsyncedCategories();
       if (unsyncedCats.isNotEmpty) {
         try {
-          await client.from('user_categories').upsert(
-            unsyncedCats.map((name) => {'user_id': userId, 'name': name}).toList(),
-          );
+          await client
+              .from('user_categories')
+              .upsert(
+                unsyncedCats
+                    .map((name) => {'user_id': userId, 'name': name})
+                    .toList(),
+              );
           for (final name in unsyncedCats) {
             await LocalDbService.markCategorySynced(name);
           }
@@ -233,10 +266,24 @@ class ConnectivityService extends ChangeNotifier {
       // deliberately excluded so one machine can't override another's setup.
       // Requires database/add_settings_columns.sql for the last three.
       const knownSettingsCols = {
-        'store_name', 'store_address', 'store_phone', 'store_email', 'store_gstin',
-        'receipt_footer', 'tax_label', 'tax_rate', 'currency_code', 'currency_symbol',
-        'invoice_layout', 'store_terms', 'store_upi_id', 'branch_number', 'logo_url',
-        'wa_access_token', 'wa_phone_number_id', 'auto_print',
+        'store_name',
+        'store_address',
+        'store_phone',
+        'store_email',
+        'store_gstin',
+        'receipt_footer',
+        'tax_label',
+        'tax_rate',
+        'currency_code',
+        'currency_symbol',
+        'invoice_layout',
+        'store_terms',
+        'store_upi_id',
+        'branch_number',
+        'logo_url',
+        'wa_access_token',
+        'wa_phone_number_id',
+        'auto_print',
       };
       final settings = await LocalDbService.getSettings();
       if (settings.isNotEmpty) {
@@ -277,20 +324,24 @@ class ConnectivityService extends ChangeNotifier {
           .select()
           .eq('user_id', userId);
       final products = (productRows as List)
-          .map((r) => Product.fromMap({
-                'id': r['id'],
-                'name': r['name'],
-                'price': (r['price'] as num).toDouble(),
-                'buying_price': (r['buying_price'] as num?)?.toDouble() ?? 0.0,
-                'tax_percent': (r['tax_percent'] as num?)?.toDouble() ?? 0.0,
-                'category': r['category'],
-                'emoji': r['emoji'],
-                'sku': r['sku'],
-                'stock': r['stock'],
-                'description': (r['description'] as String?) ?? '',
-                'dealer_name': (r['dealer_name'] as String?) ?? '',
-                'synced': 1,
-              }))
+          .map(
+            (r) => Product.fromMap({
+              'id': r['id'],
+              'name': r['name'],
+              'price': (r['price'] as num).toDouble(),
+              'buying_price': (r['buying_price'] as num?)?.toDouble() ?? 0.0,
+              'tax_percent': (r['tax_percent'] as num?)?.toDouble() ?? 0.0,
+              'category': r['category'],
+              'emoji': r['emoji'],
+              'sku': r['sku'],
+              'stock': r['stock'],
+              'description': (r['description'] as String?) ?? '',
+              'dealer_name': (r['dealer_name'] as String?) ?? '',
+              // Local-only today; harmless null when the cloud column is absent.
+              'purchase_date': (r['purchase_date'] as String?) ?? '',
+              'synced': 1,
+            }),
+          )
           .toList();
       await LocalDbService.insertProductsSynced(products);
       debugPrint('PULL: products ok (${products.length} rows)');
@@ -304,16 +355,18 @@ class ConnectivityService extends ChangeNotifier {
           .select()
           .eq('user_id', userId);
       final variants = (variantRows as List)
-          .map((r) => ProductVariant.fromMap({
-                'id': r['id'],
-                'product_id': r['product_id'],
-                'label': r['label'],
-                'price': (r['price'] as num).toDouble(),
-                'buying_price': (r['buying_price'] as num?)?.toDouble() ?? 0.0,
-                'stock': r['stock'],
-                'sku': (r['sku'] as String?) ?? '',
-                'barcode_no': (r['barcode_no'] as String?) ?? '',
-              }))
+          .map(
+            (r) => ProductVariant.fromMap({
+              'id': r['id'],
+              'product_id': r['product_id'],
+              'label': r['label'],
+              'price': (r['price'] as num).toDouble(),
+              'buying_price': (r['buying_price'] as num?)?.toDouble() ?? 0.0,
+              'stock': r['stock'],
+              'sku': (r['sku'] as String?) ?? '',
+              'barcode_no': (r['barcode_no'] as String?) ?? '',
+            }),
+          )
           .toList();
       await LocalDbService.insertVariantsSynced(variants);
       debugPrint('PULL: product_variants ok (${variants.length} rows)');
@@ -327,25 +380,31 @@ class ConnectivityService extends ChangeNotifier {
           .select()
           .eq('user_id', userId);
       final txs = (txRows as List)
-          .map((r) => TransactionRecord(
-                id: r['id'],
-                customerName: r['customer_name'],
-                customerPhone: r['customer_phone'],
-                items: (r['items'] as List)
-                    .map((i) => TransactionItem.fromMap(
-                          Map<String, dynamic>.from(i as Map),
-                        ))
-                    .toList(),
-                subtotal: (r['subtotal'] as num).toDouble(),
-                discountAmount: (r['discount_amount'] as num).toDouble(),
-                taxAmount: (r['tax_amount'] as num).toDouble(),
-                total: (r['total'] as num).toDouble(),
-                paymentMethod: r['payment_method'],
-                createdAt: DateTime.parse(r['created_at']),
-              ))
+          .map(
+            (r) => TransactionRecord(
+              id: r['id'],
+              customerName: r['customer_name'],
+              customerPhone: r['customer_phone'],
+              items: (r['items'] as List)
+                  .map(
+                    (i) => TransactionItem.fromMap(
+                      Map<String, dynamic>.from(i as Map),
+                    ),
+                  )
+                  .toList(),
+              subtotal: (r['subtotal'] as num).toDouble(),
+              discountAmount: (r['discount_amount'] as num).toDouble(),
+              taxAmount: (r['tax_amount'] as num).toDouble(),
+              total: (r['total'] as num).toDouble(),
+              paymentMethod: r['payment_method'],
+              createdAt: DateTime.parse(r['created_at']),
+            ),
+          )
           .toList();
       await LocalDbService.insertTransactionsSynced(txs);
-      await LocalDbService.reconcileTransactionsWithCloud(txs.map((t) => t.id).toSet());
+      await LocalDbService.reconcileTransactionsWithCloud(
+        txs.map((t) => t.id).toSet(),
+      );
       debugPrint('PULL: transactions ok (${txs.length} rows)');
     } catch (e) {
       debugPrint('PULL: transactions FAILED: $e');
@@ -357,13 +416,15 @@ class ConnectivityService extends ChangeNotifier {
           .select()
           .eq('user_id', userId);
       final customers = (custRows as List)
-          .map((r) => Customer(
-                id: r['id'],
-                name: r['name'],
-                phone: r['phone'],
-                createdAt: DateTime.parse(r['created_at']),
-                synced: true,
-              ))
+          .map(
+            (r) => Customer(
+              id: r['id'],
+              name: r['name'],
+              phone: r['phone'],
+              createdAt: DateTime.parse(r['created_at']),
+              synced: true,
+            ),
+          )
           .toList();
       await LocalDbService.insertCustomersSynced(customers);
       debugPrint('PULL: customers ok (${customers.length} rows)');

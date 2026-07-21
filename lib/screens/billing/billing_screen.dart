@@ -11151,38 +11151,16 @@ end tell
                   .where((p) => p.category == category)
                   .toList();
               for (final p in affected) {
-                final updated = Product(
-                  id: p.id,
-                  name: p.name,
-                  price: p.price,
-                  buyingPrice: p.buyingPrice,
-                  taxPercent: p.taxPercent,
-                  category: '',
-                  emoji: p.emoji,
-                  sku: p.sku,
-                  stock: p.stock,
-                  description: p.description,
-                  barcodeNo: p.barcodeNo,
-                );
-                await LocalDbService.updateProduct(updated);
+                // copyWith preserves dealerName / purchaseDate / barcodeNo —
+                // reconstructing via the full constructor would silently drop
+                // those (local-only) fields.
+                await LocalDbService.updateProduct(p.copyWith(category: ''));
               }
               setState(() {
                 _userCategories.remove(category);
                 for (int i = 0; i < _products.length; i++) {
                   if (_products[i].category == category) {
-                    _products[i] = Product(
-                      id: _products[i].id,
-                      name: _products[i].name,
-                      price: _products[i].price,
-                      buyingPrice: _products[i].buyingPrice,
-                      taxPercent: _products[i].taxPercent,
-                      category: '',
-                      emoji: _products[i].emoji,
-                      sku: _products[i].sku,
-                      stock: _products[i].stock,
-                      description: _products[i].description,
-                      barcodeNo: _products[i].barcodeNo,
-                    );
+                    _products[i] = _products[i].copyWith(category: '');
                   }
                 }
                 if (_inventoryCategoryFilter == category)
@@ -11218,39 +11196,19 @@ end tell
                   .where((p) => p.category == category)
                   .toList();
               for (final p in affected) {
-                final updated = Product(
-                  id: p.id,
-                  name: p.name,
-                  price: p.price,
-                  buyingPrice: p.buyingPrice,
-                  taxPercent: p.taxPercent,
-                  category: newName,
-                  emoji: p.emoji,
-                  sku: p.sku,
-                  stock: p.stock,
-                  description: p.description,
-                  barcodeNo: p.barcodeNo,
+                // copyWith preserves dealerName / purchaseDate / barcodeNo —
+                // reconstructing via the full constructor would silently drop
+                // those (local-only) fields.
+                await LocalDbService.updateProduct(
+                  p.copyWith(category: newName),
                 );
-                await LocalDbService.updateProduct(updated);
               }
               setState(() {
                 final idx = _userCategories.indexOf(category);
                 if (idx != -1) _userCategories[idx] = newName;
                 for (int i = 0; i < _products.length; i++) {
                   if (_products[i].category == category) {
-                    _products[i] = Product(
-                      id: _products[i].id,
-                      name: _products[i].name,
-                      price: _products[i].price,
-                      buyingPrice: _products[i].buyingPrice,
-                      taxPercent: _products[i].taxPercent,
-                      category: newName,
-                      emoji: _products[i].emoji,
-                      sku: _products[i].sku,
-                      stock: _products[i].stock,
-                      description: _products[i].description,
-                      barcodeNo: _products[i].barcodeNo,
-                    );
+                    _products[i] = _products[i].copyWith(category: newName);
                   }
                 }
                 if (_inventoryCategoryFilter == category)
@@ -12945,6 +12903,9 @@ end tell
     if (!mounted) return;
     bool addMode = true; // true = add to stock, false = set exact
     final dealerCtrl = TextEditingController(text: p.dealerName);
+    // Restocking is a fresh purchase: default to today, but keep an existing
+    // date if the product already has one so a dealer-only edit doesn't move it.
+    DateTime? purchaseDate = _parseDate(p.purchaseDate) ?? DateTime.now();
     final ctrls = <String, TextEditingController>{
       if (variants.isEmpty) p.id: TextEditingController(),
       for (final v in variants) v.id: TextEditingController(),
@@ -13039,6 +13000,14 @@ end tell
                           color: AppColors.textDark,
                         ),
                         decoration: _dlgInputDecor('e.g. Metro Wholesale'),
+                      ),
+                      const SizedBox(height: 14),
+                      _dlgLabel('PURCHASE DATE'),
+                      const SizedBox(height: 6),
+                      _dlgDateField(
+                        ctx: ctx,
+                        value: purchaseDate,
+                        onChanged: (d) => setLocal(() => purchaseDate = d),
                       ),
                     ],
                   ),
@@ -13135,29 +13104,52 @@ end tell
                       ElevatedButton(
                         onPressed: () async {
                           final dealer = dealerCtrl.text.trim();
+                          final pd = purchaseDate != null
+                              ? _isoDate(purchaseDate!)
+                              : '';
                           if (variants.isEmpty) {
                             final next = resultFor(p.stock, ctrls[p.id]!.text);
-                            if (next != p.stock || dealer != p.dealerName) {
+                            final stockChanged = next != p.stock;
+                            // Only stamp the purchase date on an actual restock;
+                            // a dealer-only edit must not invent a date the
+                            // product never had.
+                            final newPd = stockChanged ? pd : p.purchaseDate;
+                            if (stockChanged ||
+                                dealer != p.dealerName ||
+                                newPd != p.purchaseDate) {
                               await LocalDbService.updateProduct(
-                                p.copyWith(stock: next, dealerName: dealer),
+                                p.copyWith(
+                                  stock: next,
+                                  dealerName: dealer,
+                                  purchaseDate: newPd,
+                                ),
                               );
                             }
                           } else {
+                            var anyStockChanged = false;
                             for (final v in variants) {
                               final next = resultFor(
                                 v.stock,
                                 ctrls[v.id]!.text,
                               );
                               if (next != v.stock) {
+                                anyStockChanged = true;
                                 await LocalDbService.updateVariant(
                                   v.copyWith(stock: next),
                                 );
                               }
                             }
-                            // Dealer is recorded on the parent product.
-                            if (dealer != p.dealerName) {
+                            // Dealer and purchase date are recorded on the
+                            // parent product; only stamp the date on a real
+                            // restock (some variant's stock changed).
+                            final newPd = anyStockChanged ? pd : p.purchaseDate;
+                            if (dealer != p.dealerName ||
+                                newPd != p.purchaseDate) {
                               await LocalDbService.updateProduct(
-                                p.copyWith(dealerName: dealer),
+                                p.copyWith(
+                                  dealerName: dealer,
+                                  purchaseDate: newPd,
+                                ),
                               );
                             }
                           }
@@ -13306,6 +13298,7 @@ end tell
     );
     final stockCtrl = TextEditingController(text: '${p.stock}');
     final dealerCtrl = TextEditingController(text: p.dealerName);
+    DateTime? purchaseDate = _parseDate(p.purchaseDate);
     // Enter advances through the fields top-to-bottom, last one saves.
     final nameFocus = FocusNode();
     final skuFocus = FocusNode();
@@ -13402,6 +13395,7 @@ end tell
               stock: int.tryParse(baseStockText) ?? p.stock,
               description: tags.join(', '),
               dealerName: dealerCtrl.text.trim(),
+              purchaseDate: purchaseDate != null ? _isoDate(purchaseDate!) : '',
               barcodeNo: p.barcodeNo,
             );
             await LocalDbService.updateProduct(updated);
@@ -13922,6 +13916,15 @@ end tell
                                   ),
                                 ),
                                 const SizedBox(height: 16),
+                                _dlgLabel('PURCHASE DATE'),
+                                const SizedBox(height: 6),
+                                _dlgDateField(
+                                  ctx: ctx,
+                                  value: purchaseDate,
+                                  onChanged: (d) =>
+                                      setLocal(() => purchaseDate = d),
+                                ),
+                                const SizedBox(height: 16),
                                 Row(
                                   children: [
                                     Expanded(
@@ -14356,6 +14359,7 @@ end tell
     );
     final stockCtrl = TextEditingController();
     final dealerCtrl = TextEditingController();
+    DateTime? purchaseDate = DateTime.now();
     // Enter advances through the fields top-to-bottom, last one saves.
     final nameFocus = FocusNode();
     final skuFocus = FocusNode();
@@ -14471,6 +14475,7 @@ end tell
               stock: baseStock,
               description: tags.join(', '),
               dealerName: dealerCtrl.text.trim(),
+              purchaseDate: purchaseDate != null ? _isoDate(purchaseDate!) : '',
             );
             await LocalDbService.insertProduct(newProduct);
             for (final v in variants) {
@@ -14980,6 +14985,15 @@ end tell
                                   decoration: _dlgInputDecor(
                                     'e.g. Metro Wholesale',
                                   ),
+                                ),
+                                const SizedBox(height: 16),
+                                _dlgLabel('PURCHASE DATE'),
+                                const SizedBox(height: 6),
+                                _dlgDateField(
+                                  ctx: ctx,
+                                  value: purchaseDate,
+                                  onChanged: (d) =>
+                                      setLocal(() => purchaseDate = d),
                                 ),
                                 const SizedBox(height: 16),
                                 // Price + Stock row
@@ -15574,6 +15588,90 @@ end tell
       borderSide: const BorderSide(color: AppColors.error),
     ),
   );
+
+  /// Parses an ISO `yyyy-MM-dd` purchase-date string; null when empty/invalid.
+  static DateTime? _parseDate(String iso) =>
+      iso.trim().isEmpty ? null : DateTime.tryParse(iso.trim());
+
+  /// ISO `yyyy-MM-dd` for a [DateTime] (the on-disk purchase-date format).
+  static String _isoDate(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
+
+  /// Human date, e.g. `21 Jul 2026`.
+  static String _fmtDMY(DateTime d) =>
+      '${d.day} ${_monthName(d.month)} ${d.year}';
+
+  /// Formats a stored ISO purchase-date string for display; '' when unset.
+  static String _fmtPurchaseDate(String iso) {
+    final d = _parseDate(iso);
+    return d == null ? '' : _fmtDMY(d);
+  }
+
+  /// A tappable field that opens a date picker, used for purchase dates in the
+  /// add / edit / restock product dialogs. [onChanged] fires with the picked
+  /// date, or null when the user clears it.
+  Widget _dlgDateField({
+    required BuildContext ctx,
+    required DateTime? value,
+    required ValueChanged<DateTime?> onChanged,
+  }) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: () async {
+        final now = DateTime.now();
+        final firstDate = DateTime(2015);
+        final lastDate = DateTime(now.year + 1, 12, 31);
+        // Clamp into range: a stored date outside [firstDate, lastDate] (e.g.
+        // from a previously wrong system clock) would otherwise trip
+        // showDatePicker's assertion / open a broken, unselectable picker.
+        var initial = value ?? now;
+        if (initial.isBefore(firstDate)) initial = firstDate;
+        if (initial.isAfter(lastDate)) initial = lastDate;
+        final picked = await showDatePicker(
+          context: ctx,
+          initialDate: initial,
+          firstDate: firstDate,
+          lastDate: lastDate,
+        );
+        if (picked != null) onChanged(picked);
+      },
+      child: InputDecorator(
+        decoration: _dlgInputDecor(''),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.event_outlined,
+              size: 16,
+              color: AppColors.textMuted,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                value != null ? _fmtDMY(value) : 'Select purchase date',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  color: value != null
+                      ? AppColors.textDark
+                      : AppColors.textMuted,
+                ),
+              ),
+            ),
+            if (value != null)
+              GestureDetector(
+                onTap: () => onChanged(null),
+                child: const Icon(
+                  Icons.close_rounded,
+                  size: 15,
+                  color: AppColors.textMuted,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 
   static String _monthName(int m) => const [
     '',
@@ -18985,6 +19083,7 @@ end tell
                             ),
                             itemBuilder: (_, idx) {
                               final p = items[idx];
+                              final pd = _fmtPurchaseDate(p.purchaseDate);
                               return Padding(
                                 padding: const EdgeInsets.symmetric(
                                   vertical: 12,
@@ -19014,6 +19113,31 @@ end tell
                                               color: AppColors.textMuted,
                                             ),
                                           ),
+                                          if (pd.isNotEmpty)
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                top: 2,
+                                              ),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  const Icon(
+                                                    Icons.event_outlined,
+                                                    size: 11,
+                                                    color: AppColors.textMuted,
+                                                  ),
+                                                  const SizedBox(width: 3),
+                                                  Text(
+                                                    'Purchased $pd',
+                                                    style: GoogleFonts.inter(
+                                                      fontSize: 10,
+                                                      color:
+                                                          AppColors.textMuted,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
                                         ],
                                       ),
                                     ),
