@@ -13905,6 +13905,7 @@ end tell
                                     ),
                                   ],
                                 ),
+                                const SizedBox(height: 16),
                                 _dlgLabel('DEALER / SUPPLIER'),
                                 const SizedBox(height: 6),
                                 TextField(
@@ -13920,7 +13921,6 @@ end tell
                                     'e.g. Metro Wholesale',
                                   ),
                                 ),
-                                const SizedBox(height: 16),
                                 const SizedBox(height: 16),
                                 Row(
                                   children: [
@@ -14965,6 +14965,7 @@ end tell
                                     ),
                                   ],
                                 ),
+                                const SizedBox(height: 16),
                                 _dlgLabel('DEALER / SUPPLIER'),
                                 const SizedBox(height: 6),
                                 TextField(
@@ -14980,7 +14981,6 @@ end tell
                                     'e.g. Metro Wholesale',
                                   ),
                                 ),
-                                const SizedBox(height: 16),
                                 const SizedBox(height: 16),
                                 // Price + Stock row
                                 Row(
@@ -18671,100 +18671,114 @@ end tell
                   final isUnassigned = name == 'Unassigned';
                   return Column(
                     children: [
-                      Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 4,
-                          vertical: 12,
-                        ),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              flex: 1,
-                              child: Text(
-                                '${i + 1}',
-                                style: GoogleFonts.inter(
-                                  fontSize: 12,
-                                  color: AppColors.textMuted,
+                      InkWell(
+                        onTap: () => _showDealerDetailDialog(name, ps),
+                        borderRadius: BorderRadius.circular(6),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 4,
+                            vertical: 12,
+                          ),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                flex: 1,
+                                child: Text(
+                                  '${i + 1}',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 12,
+                                    color: AppColors.textMuted,
+                                  ),
                                 ),
                               ),
-                            ),
-                            Expanded(
-                              flex: 5,
-                              child: Row(
-                                children: [
-                                  Container(
-                                    width: 22,
-                                    height: 22,
-                                    alignment: Alignment.center,
-                                    decoration: BoxDecoration(
-                                      color:
-                                          (isUnassigned
-                                                  ? AppColors.textMuted
-                                                  : AppColors.accentBlue)
-                                              .withValues(alpha: 0.12),
-                                      borderRadius: BorderRadius.circular(4),
+                              Expanded(
+                                flex: 5,
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      width: 22,
+                                      height: 22,
+                                      alignment: Alignment.center,
+                                      decoration: BoxDecoration(
+                                        color:
+                                            (isUnassigned
+                                                    ? AppColors.textMuted
+                                                    : AppColors.accentBlue)
+                                                .withValues(alpha: 0.12),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: Icon(
+                                        Icons.local_shipping_outlined,
+                                        size: 13,
+                                        color: isUnassigned
+                                            ? AppColors.textMuted
+                                            : AppColors.accentBlue,
+                                      ),
                                     ),
-                                    child: Icon(
-                                      Icons.local_shipping_outlined,
-                                      size: 13,
-                                      color: isUnassigned
-                                          ? AppColors.textMuted
-                                          : AppColors.accentBlue,
+                                    const SizedBox(width: 8),
+                                    Flexible(
+                                      child: Text(
+                                        name,
+                                        style: GoogleFonts.inter(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: isUnassigned
+                                              ? AppColors.textMuted
+                                              : AppColors.textDark,
+                                          fontStyle: isUnassigned
+                                              ? FontStyle.italic
+                                              : FontStyle.normal,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
                                     ),
+                                  ],
+                                ),
+                              ),
+                              Expanded(
+                                flex: 2,
+                                child: Text(
+                                  '${ps.length}',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    color: AppColors.textDark,
                                   ),
-                                  const SizedBox(width: 8),
-                                  Flexible(
-                                    child: Text(
-                                      name,
+                                ),
+                              ),
+                              Expanded(
+                                flex: 2,
+                                child: Text(
+                                  '$stock',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    color: AppColors.textDark,
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                flex: 3,
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.end,
+                                  children: [
+                                    Text(
+                                      '$_currencySymbol${value.toStringAsFixed(2)}',
                                       style: GoogleFonts.inter(
                                         fontSize: 13,
                                         fontWeight: FontWeight.w600,
-                                        color: isUnassigned
-                                            ? AppColors.textMuted
-                                            : AppColors.textDark,
-                                        fontStyle: isUnassigned
-                                            ? FontStyle.italic
-                                            : FontStyle.normal,
+                                        color: AppColors.textDark,
                                       ),
-                                      overflow: TextOverflow.ellipsis,
                                     ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            Expanded(
-                              flex: 2,
-                              child: Text(
-                                '${ps.length}',
-                                style: GoogleFonts.inter(
-                                  fontSize: 13,
-                                  color: AppColors.textDark,
+                                    const SizedBox(width: 6),
+                                    const Icon(
+                                      Icons.chevron_right_rounded,
+                                      size: 16,
+                                      color: AppColors.textMuted,
+                                    ),
+                                  ],
                                 ),
                               ),
-                            ),
-                            Expanded(
-                              flex: 2,
-                              child: Text(
-                                '$stock',
-                                style: GoogleFonts.inter(
-                                  fontSize: 13,
-                                  color: AppColors.textDark,
-                                ),
-                              ),
-                            ),
-                            Expanded(
-                              flex: 3,
-                              child: Text(
-                                '$_currencySymbol${value.toStringAsFixed(2)}',
-                                textAlign: TextAlign.right,
-                                style: GoogleFonts.inter(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                  color: AppColors.textDark,
-                                ),
-                              ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
                       ),
                       if (i < dealers.length - 1)
@@ -18776,6 +18790,290 @@ end tell
           ),
         ),
       ],
+    );
+  }
+
+  // Full purchase breakdown for one dealer/supplier. Reads live from
+  // [_products] each time it's built, so it reflects the latest product edits.
+  void _showDealerDetailDialog(String dealerName, List<Product> _) {
+    final isUnassigned = dealerName == 'Unassigned';
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, _) {
+          // Re-derive from live product state on every build.
+          final items =
+              _products.where((p) {
+                final d = p.dealerName.trim();
+                return isUnassigned ? d.isEmpty : d == dealerName;
+              }).toList()..sort(
+                (a, b) => (b.price * b.stock).compareTo(a.price * a.stock),
+              );
+          final totalStock = items.fold<int>(0, (s, p) => s + p.stock);
+          final stockValue = items.fold<double>(
+            0,
+            (s, p) => s + p.price * p.stock,
+          );
+          final purchaseCost = items.fold<double>(
+            0,
+            (s, p) => s + p.buyingPrice * p.stock,
+          );
+
+          Widget stat(String label, String value) => Expanded(
+            child: Container(
+              margin: const EdgeInsets.only(right: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: AppColors.surfaceVariant,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: GoogleFonts.inter(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.textMuted,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    value,
+                    style: GoogleFonts.manrope(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w800,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+
+          return Dialog(
+            backgroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: 720,
+                maxHeight: MediaQuery.of(ctx).size.height * 0.85,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Header
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 28,
+                      vertical: 20,
+                    ),
+                    decoration: const BoxDecoration(
+                      color: AppColors.surfaceVariant,
+                      borderRadius: BorderRadius.vertical(
+                        top: Radius.circular(16),
+                      ),
+                      border: Border(
+                        bottom: BorderSide(color: AppColors.border),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.local_shipping_outlined,
+                          color: AppColors.primary,
+                          size: 20,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                isUnassigned ? 'Unassigned' : dealerName,
+                                style: GoogleFonts.manrope(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.textDark,
+                                ),
+                              ),
+                              Text(
+                                '${items.length} product${items.length == 1 ? '' : 's'} sourced',
+                                style: GoogleFonts.inter(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w300,
+                                  color: AppColors.textMuted,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          icon: const Icon(
+                            Icons.close_rounded,
+                            size: 18,
+                            color: AppColors.textMuted,
+                          ),
+                          style: IconButton.styleFrom(
+                            minimumSize: const Size(32, 32),
+                            padding: EdgeInsets.zero,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(28, 20, 18, 8),
+                    child: Row(
+                      children: [
+                        stat('TOTAL STOCK', '$totalStock units'),
+                        stat(
+                          'STOCK VALUE',
+                          '$_currencySymbol${stockValue.toStringAsFixed(2)}',
+                        ),
+                        stat(
+                          'PURCHASE COST',
+                          '$_currencySymbol${purchaseCost.toStringAsFixed(2)}',
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Table header
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(28, 8, 28, 6),
+                    child: Row(
+                      children: [
+                        Expanded(flex: 5, child: _dashColHeader('PRODUCT')),
+                        Expanded(flex: 2, child: _dashColHeader('STOCK')),
+                        Expanded(flex: 3, child: _dashColHeader('BUY')),
+                        Expanded(flex: 3, child: _dashColHeader('SELL')),
+                        Expanded(
+                          flex: 3,
+                          child: _dashColHeader('VALUE', right: true),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1, color: AppColors.border),
+                  Flexible(
+                    child: items.isEmpty
+                        ? Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 40),
+                            child: Center(
+                              child: Text(
+                                'No products from this dealer',
+                                style: GoogleFonts.inter(
+                                  fontSize: 13,
+                                  color: AppColors.textMuted,
+                                ),
+                              ),
+                            ),
+                          )
+                        : ListView.separated(
+                            padding: const EdgeInsets.symmetric(horizontal: 28),
+                            shrinkWrap: true,
+                            itemCount: items.length,
+                            separatorBuilder: (_, __) => const Divider(
+                              height: 1,
+                              color: AppColors.border,
+                            ),
+                            itemBuilder: (_, idx) {
+                              final p = items[idx];
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 12,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      flex: 5,
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            p.name,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: GoogleFonts.inter(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w600,
+                                              color: AppColors.textDark,
+                                            ),
+                                          ),
+                                          Text(
+                                            p.sku,
+                                            style: GoogleFonts.inter(
+                                              fontSize: 10,
+                                              color: AppColors.textMuted,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    Expanded(
+                                      flex: 2,
+                                      child: Text(
+                                        '${p.stock}',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 13,
+                                          color: AppColors.textDark,
+                                        ),
+                                      ),
+                                    ),
+                                    Expanded(
+                                      flex: 3,
+                                      child: Text(
+                                        p.buyingPrice > 0
+                                            ? '$_currencySymbol${p.buyingPrice.toStringAsFixed(2)}'
+                                            : '—',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 13,
+                                          color: AppColors.textMuted,
+                                        ),
+                                      ),
+                                    ),
+                                    Expanded(
+                                      flex: 3,
+                                      child: Text(
+                                        '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 13,
+                                          color: AppColors.textDark,
+                                        ),
+                                      ),
+                                    ),
+                                    Expanded(
+                                      flex: 3,
+                                      child: Text(
+                                        '$_currencySymbol${(p.price * p.stock).toStringAsFixed(2)}',
+                                        textAlign: TextAlign.right,
+                                        style: GoogleFonts.inter(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                          color: AppColors.textDark,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 
