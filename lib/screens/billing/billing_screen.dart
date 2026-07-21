@@ -13307,6 +13307,18 @@ end tell
     final buyingFocus = FocusNode();
     final taxFocus = FocusNode();
     final dealerFocus = FocusNode();
+    final dateFocus = FocusNode();
+    // Arrow keys move between fields (Up/Down always; Left/Right at caret edges).
+    _wireArrowNav([
+      (nameFocus, nameCtrl),
+      (skuFocus, skuCtrl),
+      (dealerFocus, dealerCtrl),
+      (dateFocus, null),
+      (priceFocus, priceCtrl),
+      (stockFocus, stockCtrl),
+      (buyingFocus, buyingPriceCtrl),
+      (taxFocus, taxPercentCtrl),
+    ]);
     List<String> tags = p.description.isNotEmpty
         ? p.description
               .split(RegExp(r'[,\n]'))
@@ -13921,6 +13933,7 @@ end tell
                                 _dlgDateField(
                                   ctx: ctx,
                                   value: purchaseDate,
+                                  focusNode: dateFocus,
                                   onChanged: (d) =>
                                       setLocal(() => purchaseDate = d),
                                 ),
@@ -14368,6 +14381,18 @@ end tell
     final buyingFocus = FocusNode();
     final taxFocus = FocusNode();
     final dealerFocus = FocusNode();
+    final dateFocus = FocusNode();
+    // Arrow keys move between fields (Up/Down always; Left/Right at caret edges).
+    _wireArrowNav([
+      (nameFocus, nameCtrl),
+      (skuFocus, skuCtrl),
+      (dealerFocus, dealerCtrl),
+      (dateFocus, null),
+      (priceFocus, priceCtrl),
+      (stockFocus, stockCtrl),
+      (buyingFocus, buyingPriceCtrl),
+      (taxFocus, taxPercentCtrl),
+    ]);
     List<String> tags = [];
     final tagInputCtrl = TextEditingController();
     final tagFocusNode = FocusNode();
@@ -14992,6 +15017,7 @@ end tell
                                 _dlgDateField(
                                   ctx: ctx,
                                   value: purchaseDate,
+                                  focusNode: dateFocus,
                                   onChanged: (d) =>
                                       setLocal(() => purchaseDate = d),
                                 ),
@@ -15609,6 +15635,61 @@ end tell
     return d == null ? '' : _fmtDMY(d);
   }
 
+  static bool _caretAtStart(TextEditingController? c) {
+    if (c == null) return true; // non-text field (date picker): free to jump
+    final s = c.selection;
+    if (!s.isValid || s.baseOffset < 0) return true;
+    return s.isCollapsed && s.baseOffset <= 0;
+  }
+
+  static bool _caretAtEnd(TextEditingController? c) {
+    if (c == null) return true;
+    final s = c.selection;
+    if (!s.isValid || s.baseOffset < 0) return true;
+    return s.isCollapsed && s.baseOffset >= c.text.length;
+  }
+
+  /// Lets the user move between the given form fields with the arrow keys.
+  /// Up/Down always jump to the previous/next field; Left/Right move the text
+  /// caret as usual and only jump once the caret reaches the field's start/end,
+  /// so in-field editing still works. Pass null for the controller of a
+  /// non-text field (e.g. the date picker) so Left/Right jump freely there.
+  void _wireArrowNav(List<(FocusNode, TextEditingController?)> fields) {
+    for (var i = 0; i < fields.length; i++) {
+      final node = fields[i].$1;
+      final ctrl = fields[i].$2;
+      final prev = i > 0 ? fields[i - 1].$1 : null;
+      final next = i < fields.length - 1 ? fields[i + 1].$1 : null;
+      node.onKeyEvent = (n, event) {
+        if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+          return KeyEventResult.ignored;
+        }
+        final key = event.logicalKey;
+        if (key == LogicalKeyboardKey.arrowDown && next != null) {
+          next.requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowUp && prev != null) {
+          prev.requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowRight &&
+            next != null &&
+            _caretAtEnd(ctrl)) {
+          next.requestFocus();
+          return KeyEventResult.handled;
+        }
+        if (key == LogicalKeyboardKey.arrowLeft &&
+            prev != null &&
+            _caretAtStart(ctrl)) {
+          prev.requestFocus();
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      };
+    }
+  }
+
   /// A tappable field that opens a date picker, used for purchase dates in the
   /// add / edit / restock product dialogs. [onChanged] fires with the picked
   /// date, or null when the user clears it.
@@ -15616,8 +15697,10 @@ end tell
     required BuildContext ctx,
     required DateTime? value,
     required ValueChanged<DateTime?> onChanged,
+    FocusNode? focusNode,
   }) {
     return InkWell(
+      focusNode: focusNode,
       borderRadius: BorderRadius.circular(10),
       onTap: () async {
         final now = DateTime.now();
