@@ -13800,7 +13800,7 @@ end tell
                                             textInputAction:
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
-                                                priceFocus.requestFocus(),
+                                                dealerFocus.requestFocus(),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
@@ -13905,6 +13905,22 @@ end tell
                                     ),
                                   ],
                                 ),
+                                _dlgLabel('DEALER / SUPPLIER'),
+                                const SizedBox(height: 6),
+                                TextField(
+                                  controller: dealerCtrl,
+                                  focusNode: dealerFocus,
+                                  textInputAction: TextInputAction.next,
+                                  onSubmitted: (_) => priceFocus.requestFocus(),
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    color: AppColors.textDark,
+                                  ),
+                                  decoration: _dlgInputDecor(
+                                    'e.g. Metro Wholesale',
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
                                 const SizedBox(height: 16),
                                 Row(
                                   children: [
@@ -14033,9 +14049,8 @@ end tell
                                             controller: taxPercentCtrl,
                                             focusNode: taxFocus,
                                             textInputAction:
-                                                TextInputAction.next,
-                                            onFieldSubmitted: (_) =>
-                                                dealerFocus.requestFocus(),
+                                                TextInputAction.done,
+                                            onFieldSubmitted: (_) => saveEdit(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -14064,22 +14079,6 @@ end tell
                                 _finalPriceCard(
                                   priceCtrl.text,
                                   taxPercentCtrl.text,
-                                ),
-                                const SizedBox(height: 18),
-                                _dlgLabel('DEALER / SUPPLIER'),
-                                const SizedBox(height: 6),
-                                TextField(
-                                  controller: dealerCtrl,
-                                  focusNode: dealerFocus,
-                                  textInputAction: TextInputAction.done,
-                                  onSubmitted: (_) => saveEdit(),
-                                  style: GoogleFonts.inter(
-                                    fontSize: 13,
-                                    color: AppColors.textDark,
-                                  ),
-                                  decoration: _dlgInputDecor(
-                                    'e.g. Metro Wholesale',
-                                  ),
                                 ),
                                 const SizedBox(height: 18),
                                 _dlgLabel('TAGS'),
@@ -14860,7 +14859,7 @@ end tell
                                             textInputAction:
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
-                                                priceFocus.requestFocus(),
+                                                dealerFocus.requestFocus(),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
@@ -14966,6 +14965,22 @@ end tell
                                     ),
                                   ],
                                 ),
+                                _dlgLabel('DEALER / SUPPLIER'),
+                                const SizedBox(height: 6),
+                                TextField(
+                                  controller: dealerCtrl,
+                                  focusNode: dealerFocus,
+                                  textInputAction: TextInputAction.next,
+                                  onSubmitted: (_) => priceFocus.requestFocus(),
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    color: AppColors.textDark,
+                                  ),
+                                  decoration: _dlgInputDecor(
+                                    'e.g. Metro Wholesale',
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
                                 const SizedBox(height: 16),
                                 // Price + Stock row
                                 Row(
@@ -15098,9 +15113,8 @@ end tell
                                             controller: taxPercentCtrl,
                                             focusNode: taxFocus,
                                             textInputAction:
-                                                TextInputAction.next,
-                                            onFieldSubmitted: (_) =>
-                                                dealerFocus.requestFocus(),
+                                                TextInputAction.done,
+                                            onFieldSubmitted: (_) => saveNew(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -15129,22 +15143,6 @@ end tell
                                 _finalPriceCard(
                                   priceCtrl.text,
                                   taxPercentCtrl.text,
-                                ),
-                                const SizedBox(height: 18),
-                                _dlgLabel('DEALER / SUPPLIER'),
-                                const SizedBox(height: 6),
-                                TextField(
-                                  controller: dealerCtrl,
-                                  focusNode: dealerFocus,
-                                  textInputAction: TextInputAction.done,
-                                  onSubmitted: (_) => saveNew(),
-                                  style: GoogleFonts.inter(
-                                    fontSize: 13,
-                                    color: AppColors.textDark,
-                                  ),
-                                  decoration: _dlgInputDecor(
-                                    'e.g. Metro Wholesale',
-                                  ),
                                 ),
                                 const SizedBox(height: 18),
                                 _dlgLabel('TAGS'),
