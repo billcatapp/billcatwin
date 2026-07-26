@@ -605,11 +605,28 @@ class _BillingScreenState extends State<BillingScreen> {
       return false;
     }
 
+    // Billing shortcuts: Ctrl+P = Print Bill, Ctrl+C = Paid/Close Bill.
+    final key = event.logicalKey;
+    if (HardwareKeyboard.instance.isControlPressed) {
+      if (key == LogicalKeyboardKey.keyP) {
+        final cart = context.read<CartProvider>();
+        if (cart.items.isNotEmpty && !_isPrinting) _showPrintBillDialog(cart);
+        return true;
+      }
+      if (key == LogicalKeyboardKey.keyC) {
+        final cart = context.read<CartProvider>();
+        if (cart.items.isNotEmpty) _closeBill(context, cart);
+        return true;
+      }
+      // Any other Ctrl combo (copy/paste in fields, etc.) — leave it alone and
+      // don't let it feed the scan buffer.
+      return false;
+    }
+
     final now = DateTime.now();
     final gapMs = now.difference(_lastScanKeyTime).inMilliseconds;
     _lastScanKeyTime = now;
 
-    final key = event.logicalKey;
     if (key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter) {
       final code = _scanBuffer;
@@ -11922,16 +11939,38 @@ end tell
                         ),
                         child: Column(
                           children: [
-                            Text(
-                              p.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: GoogleFonts.inter(
-                                fontSize: 9,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.black87,
-                              ),
-                            ),
+                            // Split "Name (Variant)" so the variant shows on its
+                            // own line, matching the printed label.
+                            ...() {
+                              final mm = RegExp(r'^(.*)\s*\((.+)\)\s*$')
+                                  .firstMatch(p.name);
+                              final main =
+                                  mm != null ? mm.group(1)!.trim() : p.name;
+                              final variant = mm?.group(2)?.trim();
+                              return [
+                                Text(
+                                  main,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: GoogleFonts.inter(
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.black87,
+                                  ),
+                                ),
+                                if (variant != null && variant.isNotEmpty)
+                                  Text(
+                                    variant,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 8,
+                                      fontWeight: FontWeight.w500,
+                                      color: Colors.black54,
+                                    ),
+                                  ),
+                              ];
+                            }(),
                             const SizedBox(height: 6),
                             SizedBox(
                               height: 48,
@@ -12306,15 +12345,11 @@ end tell
           pw.SvgImage(
             svg: svgStr,
             width: cellW - pad * 2,
-            height: (cellH - 2 * PdfPageFormat.mm) * 0.62,
+            height: (cellH - 2 * PdfPageFormat.mm) * 0.58,
           ),
-          pw.Text(
-            p.name,
-            maxLines: 1,
-            overflow: pw.TextOverflow.clip,
-            style: pw.TextStyle(font: bold, fontSize: 4.5, letterSpacing: 0.4),
-            textAlign: pw.TextAlign.center,
-          ),
+          // Same design as the bulk Print Barcodes label: variant on its own
+          // line, tax-inclusive final price.
+          ..._labelNameWidgets(p.name, bold),
           pw.Text(
             '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
             style: pw.TextStyle(font: bold, fontSize: 4.5),
@@ -12847,17 +12882,6 @@ end tell
                 color: AppColors.textDark,
               ),
               items: [
-                if (showBase)
-                  const DropdownMenuItem(
-                    value: '__base__',
-                    child: Text('Base product'),
-                  ),
-                ...variants.map(
-                  (v) => DropdownMenuItem(
-                    value: v.id,
-                    child: Text(v.label, overflow: TextOverflow.ellipsis),
-                  ),
-                ),
                 DropdownMenuItem(
                   value: '__add__',
                   child: Row(
@@ -12878,6 +12902,17 @@ end tell
                         ),
                       ),
                     ],
+                  ),
+                ),
+                if (showBase)
+                  const DropdownMenuItem(
+                    value: '__base__',
+                    child: Text('Base product'),
+                  ),
+                ...variants.map(
+                  (v) => DropdownMenuItem(
+                    value: v.id,
+                    child: Text(v.label, overflow: TextOverflow.ellipsis),
                   ),
                 ),
               ],
@@ -20811,46 +20846,28 @@ class _CartRowState extends State<_CartRow> {
           ),
           SizedBox(
             width: 96,
-            child: Builder(
-              builder: (_) {
-                final rate = widget.item.product.taxPercent > 0
-                    ? widget.item.product.taxPercent
-                    : widget.cart.taxRate;
-                final lineTax = widget.item.total * rate / 100;
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    // Line total incl. tax — what this line adds to the bill.
-                    Text(
-                      '${widget.currencySymbol}${(widget.item.total + lineTax).toStringAsFixed(2)}',
-                      style: GoogleFonts.inter(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                        color: AppColors.primary,
-                      ),
-                    ),
-                    const SizedBox(height: 1),
-                    Text(
-                      '${widget.currencySymbol}${widget.item.total.toStringAsFixed(2)}'
-                      '${rate > 0 ? ' + ${widget.currencySymbol}${lineTax.toStringAsFixed(2)}' : ''}',
-                      style: GoogleFonts.inter(
-                        fontSize: 9,
-                        color: AppColors.textMuted,
-                        fontWeight: FontWeight.w400,
-                      ),
-                    ),
-                    if (rate > 0)
-                      Text(
-                        '${widget.taxLabel} ${rate == rate.truncateToDouble() ? rate.toStringAsFixed(0) : rate}%',
-                        style: GoogleFonts.inter(
-                          fontSize: 8.5,
-                          color: AppColors.textMuted.withValues(alpha: 0.65),
-                          fontWeight: FontWeight.w300,
-                        ),
-                      ),
-                  ],
-                );
-              },
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                // Line total (pre-tax); tax is shown once in the summary below.
+                Text(
+                  '${widget.currencySymbol}${widget.item.total.toStringAsFixed(2)}',
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.primary,
+                  ),
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  '${widget.currencySymbol}${widget.item.unitPrice.toStringAsFixed(2)}/unit',
+                  style: GoogleFonts.inter(
+                    fontSize: 9,
+                    color: AppColors.textMuted.withValues(alpha: 0.6),
+                    fontWeight: FontWeight.w300,
+                  ),
+                ),
+              ],
             ),
           ),
           SizedBox(
