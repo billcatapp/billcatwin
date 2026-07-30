@@ -27,6 +27,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:barcode/barcode.dart' as bc;
 import '../../services/receipt_printer.dart';
+import '../../services/thermal_printer.dart';
 import '../../services/whatsapp_service.dart' as _wa;
 import '../auth/login_screen.dart';
 
@@ -263,6 +264,9 @@ class _BillingScreenState extends State<BillingScreen> {
   Printer? _activePrinter;
   String _paperSize = 'A4';
   bool _autoPrint = false;
+  // Remembered state of the Print Bill dialog's toggles between opens.
+  bool _sendToPrinterPref = false;
+  bool _sendWhatsAppPref = false;
 
   // Barcode print last-used settings
   double _barcodeLabelW = 58;
@@ -472,6 +476,8 @@ class _BillingScreenState extends State<BillingScreen> {
           ? s['logo_url']!
           : metaLogoUrl);
       _autoPrint = (s['auto_print'] ?? '0') == '1';
+      _sendToPrinterPref = (s['print_send_to_printer'] ?? '0') == '1';
+      _sendWhatsAppPref = (s['print_send_whatsapp'] ?? '0') == '1';
       _storeUpiId = s['store_upi_id'] ?? _storeUpiId;
       _branchNumber = s['branch_number'] ?? _branchNumber;
       _ownerPasscode = s['owner_passcode'] ?? '';
@@ -3907,7 +3913,12 @@ class _BillingScreenState extends State<BillingScreen> {
       _editAutoPrint = _autoPrint;
       _editInvoiceLayout = _invoiceLayout;
       _editPrintOrientation = _printOrientation;
-      _editPrinterTab = 'Regular';
+      // Derive the tab from the saved paper size — hardcoding 'Regular' while
+      // paper is a thermal size (e.g. '3 inch') left the Paper Size dropdown
+      // with a value not in its item list, crashing the Settings screen.
+      _editPrinterTab = ['A4', 'A5'].contains(_paperSize)
+          ? 'Regular'
+          : 'Thermal';
       _editStoreTerms = _storeTerms;
       _editLogoPath = _logoPath;
       _editLogoUrl = _logoUrl;
@@ -8358,15 +8369,28 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // ── Printer dialog ───────────────────────────────────────────────────────────
 
+  // Heuristic: does this printer name look like an 80mm thermal/receipt unit?
+  bool _looksThermal(String name) {
+    final n = name.toLowerCase();
+    return n.contains('thermal') ||
+        n.contains('receipt') ||
+        n.contains('pos') ||
+        n.contains('80mm') ||
+        n.contains('58mm') ||
+        RegExp(r'\b(pos|rp|tm|xp)[-_ ]?\d').hasMatch(n) ||
+        n.contains('80');
+  }
+
   void _showPrinterDialog() async {
     if (!mounted) return;
     // Open dialog immediately — load printers in the background
     List<Printer> systemPrinters = [];
 
-    const paperSizes = ['A4', 'A5', '2 inch', '3 inch', '4 inch', 'Custom'];
     Printer? selPrinter = _activePrinter;
     bool isPdfExport = _selectedPrinter == 'PDF Export';
     String paper = _paperSize;
+    // Regular = A4/A5, Thermal = 80mm roll (stored as a thermal paper size).
+    bool isThermal = !['A4', 'A5'].contains(paper);
     bool autoPrint = _autoPrint;
 
     Widget printerRow(
@@ -8435,7 +8459,21 @@ class _BillingScreenState extends State<BillingScreen> {
                 final printers = await Printing.listPrinters().timeout(
                   const Duration(seconds: 5),
                 );
-                if (ctx.mounted) setLocal(() => systemPrinters = printers);
+                if (ctx.mounted) {
+                  setLocal(() {
+                    systemPrinters = printers;
+                    // Re-select the last-saved printer by name, so reopening
+                    // the dialog shows it already chosen.
+                    if (selPrinter == null && !isPdfExport) {
+                      for (final pr in printers) {
+                        if (pr.name == _selectedPrinter) {
+                          selPrinter = pr;
+                          break;
+                        }
+                      }
+                    }
+                  });
+                }
               } catch (_) {
                 if (ctx.mounted) setLocal(() {});
               }
@@ -8525,6 +8563,12 @@ class _BillingScreenState extends State<BillingScreen> {
                         onTap: () => setLocal(() {
                           selPrinter = p;
                           isPdfExport = false;
+                          // Auto-switch to Thermal when the printer name looks
+                          // like an 80mm thermal/receipt printer.
+                          if (_looksThermal(p.name)) {
+                            isThermal = true;
+                            paper = '3 inch';
+                          }
                         }),
                       ),
                     ),
@@ -8533,47 +8577,119 @@ class _BillingScreenState extends State<BillingScreen> {
                   const Divider(height: 1, color: AppColors.border),
                   const SizedBox(height: 20),
 
-                  // Paper size
-                  _dialogSectionLabel('PAPER SIZE'),
+                  // Printer type
+                  _dialogSectionLabel('PRINTER TYPE'),
                   const SizedBox(height: 12),
                   Row(
-                    children: paperSizes.map((s) {
-                      final sel = paper == s;
-                      return Expanded(
+                    children: [
+                      Expanded(
                         child: GestureDetector(
-                          onTap: () => setLocal(() => paper = s),
+                          onTap: () => setLocal(() {
+                            isThermal = false;
+                            paper = 'A4';
+                          }),
                           child: Container(
-                            margin: EdgeInsets.only(
-                              right: s != paperSizes.last ? 8 : 0,
-                            ),
-                            padding: const EdgeInsets.symmetric(vertical: 10),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
                             decoration: BoxDecoration(
-                              color: sel
+                              color: !isThermal
                                   ? AppColors.primary
                                   : AppColors.surfaceVariant,
                               borderRadius: BorderRadius.circular(8),
                               border: Border.all(
-                                color: sel
+                                color: !isThermal
                                     ? AppColors.primary
                                     : AppColors.border,
                               ),
                             ),
-                            child: Center(
-                              child: Text(
-                                s,
-                                style: GoogleFonts.inter(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                  color: sel
+                            child: Column(
+                              children: [
+                                Icon(
+                                  Icons.print_rounded,
+                                  size: 20,
+                                  color: !isThermal
                                       ? Colors.white
                                       : AppColors.textMuted,
                                 ),
-                              ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  'Regular',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: !isThermal
+                                        ? Colors.white
+                                        : AppColors.textMuted,
+                                  ),
+                                ),
+                                Text(
+                                  'A4 / A5',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 10,
+                                    color: !isThermal
+                                        ? Colors.white.withValues(alpha: 0.8)
+                                        : AppColors.textMuted,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ),
-                      );
-                    }).toList(),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => setLocal(() {
+                            isThermal = true;
+                            paper = '3 inch';
+                          }),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            decoration: BoxDecoration(
+                              color: isThermal
+                                  ? AppColors.primary
+                                  : AppColors.surfaceVariant,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: isThermal
+                                    ? AppColors.primary
+                                    : AppColors.border,
+                              ),
+                            ),
+                            child: Column(
+                              children: [
+                                Icon(
+                                  Icons.receipt_long_rounded,
+                                  size: 20,
+                                  color: isThermal
+                                      ? Colors.white
+                                      : AppColors.textMuted,
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  'Thermal',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: isThermal
+                                        ? Colors.white
+                                        : AppColors.textMuted,
+                                  ),
+                                ),
+                                Text(
+                                  '80mm roll',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 10,
+                                    color: isThermal
+                                        ? Colors.white.withValues(alpha: 0.8)
+                                        : AppColors.textMuted,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
 
                   const SizedBox(height: 20),
@@ -8835,8 +8951,9 @@ class _BillingScreenState extends State<BillingScreen> {
       _printRecord(_snapshotCart(cart), docType: docType, toPrinter: toPrinter);
 
   void _showPrintBillDialog(CartProvider cart) {
-    bool sendToPrinter = false;
-    bool sendWhatsApp = false;
+    // Restore the toggles to however they were last left.
+    bool sendToPrinter = _sendToPrinterPref;
+    bool sendWhatsApp = _sendWhatsAppPref;
     String docType = 'Invoice';
     final phoneCtrl = TextEditingController(text: cart.customerPhone);
 
@@ -9138,6 +9255,13 @@ class _BillingScreenState extends State<BillingScreen> {
                       child: ElevatedButton.icon(
                         onPressed: () {
                           final snapshot = _snapshotCart(cart);
+                          // Remember the toggle states for next time.
+                          _sendToPrinterPref = sendToPrinter;
+                          _sendWhatsAppPref = sendWhatsApp;
+                          LocalDbService.saveSettings({
+                            'print_send_to_printer': sendToPrinter ? '1' : '0',
+                            'print_send_whatsapp': sendWhatsApp ? '1' : '0',
+                          });
                           Navigator.pop(ctx);
                           if (sendToPrinter)
                             _printCurrentBill(
@@ -9249,6 +9373,26 @@ class _BillingScreenState extends State<BillingScreen> {
               break;
             }
           }
+        }
+        // Thermal printers ignore rasterised PDFs — send raw ESC/POS text
+        // straight to the spooler instead. Only the PDF path handles A4/A5.
+        final effPaper = paperSize ?? _paperSize;
+        final isThermal = !['A4', 'A5'].contains(effPaper);
+        if (isThermal && target != null) {
+          final escBytes = ThermalPrinter.buildReceipt(
+            tx,
+            storeName: _storeName,
+            storeAddress: _storeAddress,
+            storePhone: _storePhone,
+            storeGstin: _storeGstin,
+            receiptFooter: _receiptFooter,
+            taxLabel: _taxLabel,
+            taxRate: _taxRateDisplay,
+            currencySymbol: _currencySymbol,
+          );
+          final printed = ThermalPrinter.rawPrint(target.name, escBytes);
+          if (printed) return; // printed via ESC/POS
+          // Fall through to the PDF path if text printing failed.
         }
         if (target != null) {
           final ok = await Printing.directPrintPdf(

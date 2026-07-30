@@ -49,6 +49,9 @@ dependencies:
   pdf: ^3.11.1
   barcode: ^2.2.5
   webview_flutter: ^4.13.1
+  # Raw ESC/POS thermal printing on Windows (winspool via FFI).
+  win32: ^5.9.0
+  ffi: ^2.1.0
 
 dev_dependencies:
   flutter_test:
