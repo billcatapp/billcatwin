@@ -73,9 +73,12 @@ class _LoginScreenState extends State<LoginScreen> {
       if (!mounted) return;
       final userId = response.user?.id;
       if (userId != null) {
+        // No clearAll: the DB file is per-user and may hold offline work
+        // (unsynced sales, pending deletions) from a previous session that
+        // must be pushed, not wiped. Pull merges around it.
         await LocalDbService.initForUser(userId);
-        await LocalDbService.clearAll();
         await ConnectivityService.instance.pullFromCloud();
+        await ConnectivityService.instance.syncNow();
       }
       if (!mounted) return;
       Navigator.pushReplacement(

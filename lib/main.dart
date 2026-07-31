@@ -78,10 +78,21 @@ class _BillCatAppState extends State<BillCatApp> {
 
     Supabase.instance.client.auth.onAuthStateChange.listen((data) async {
       final user = data.session?.user;
+      if (data.event == AuthChangeEvent.signedOut) {
+        // Drop the previous user's live sync channel.
+        await ConnectivityService.instance.onUserChanged();
+        return;
+      }
       if (data.event == AuthChangeEvent.signedIn && user != null) {
+        // NOTE: no clearAll here — the DB file is per-user, and wiping it
+        // would destroy offline sales and delete-tombstones that were never
+        // pushed. Pull merges/reconciles instead, then push sends pending
+        // work up.
         await LocalDbService.initForUser(user.id);
-        await LocalDbService.clearAll();
         await ConnectivityService.instance.pullFromCloud();
+        await ConnectivityService.instance.syncNow();
+        // Open the live sync channel for this user.
+        await ConnectivityService.instance.onUserChanged();
 
         final provider = user.appMetadata['provider'] as String?;
         if (provider == 'google') {

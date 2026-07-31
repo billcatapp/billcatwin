@@ -1875,7 +1875,25 @@ class _BillingScreenState extends State<BillingScreen> {
                         if (item is Product) {
                           return _ProductCard(
                             product: item,
-                            onTap: () => _addToCartOrPickVariant(item, cart),
+                            onTap: () {
+                              final variants =
+                                  _variantsByProduct[item.id] ??
+                                  const <ProductVariant>[];
+                              if (variants.isEmpty) {
+                                // No variants → add straight to the cart.
+                                cart.addProduct(item);
+                              } else {
+                                // Has variants → slide the variant cards out
+                                // inline (tap again to collapse), same as the
+                                // chevron arrow.
+                                setState(() {
+                                  _expandedVariantProductId =
+                                      _expandedVariantProductId == item.id
+                                      ? null
+                                      : item.id;
+                                });
+                              }
+                            },
                             currencySymbol: _currencySymbol,
                             variants: _variantsByProduct[item.id] ?? const [],
                             effectiveTaxRate: item.taxPercent > 0
@@ -8834,7 +8852,12 @@ class _BillingScreenState extends State<BillingScreen> {
           ),
           ElevatedButton(
             onPressed: () async {
-              await LocalDbService.clearAll();
+              // Push any pending offline work before signing out. No
+              // clearAll: the DB file is per-user, and wiping it would
+              // destroy unsynced sales / pending deletions forever.
+              try {
+                await ConnectivityService.instance.syncNow();
+              } catch (_) {}
               await SupabaseService.signOut();
               if (!context.mounted) return;
               Navigator.pushAndRemoveUntil(
@@ -17939,18 +17962,34 @@ end tell
   }
 
   Future<void> _deleteTransaction(String id) async {
+    // Soft-delete locally (hidden immediately, tombstone marks it for cloud
+    // removal). Refresh the UI right away so the row disappears instantly.
     await LocalDbService.deleteTransaction(id);
+    _loadDashboardData();
     try {
       final userId = Supabase.instance.client.auth.currentUser?.id;
       if (userId != null) {
-        await Supabase.instance.client
+        // .select() returns the rows actually deleted. If the cloud delete
+        // removes nothing (e.g. no DELETE policy), the list is empty and we
+        // must KEEP the tombstone — otherwise the row is re-pulled and the
+        // deletion "comes back". syncNow retries the delete each cycle.
+        final removed = await Supabase.instance.client
             .from('transactions')
             .delete()
             .eq('id', id)
-            .eq('user_id', userId);
+            .eq('user_id', userId)
+            .select('id');
+        debugPrint('CLOUD DELETE: id=$id removed=${removed.length} rows');
+        if (removed.isNotEmpty) {
+          // Confirmed gone from the cloud — safe to drop the local tombstone.
+          await LocalDbService.purgeDeletedTransaction(id);
+        }
       }
-    } catch (_) {}
-    _loadDashboardData();
+    } catch (e) {
+      // Offline / failed: the tombstone stays and syncNow retries the delete.
+      debugPrint('CLOUD DELETE ERROR: $e');
+    }
+    ConnectivityService.instance.syncNow();
   }
 
   // ── Customer detail popup ─────────────────────────────────────────────────
@@ -18322,18 +18361,29 @@ end tell
   }
 
   Future<void> _deleteCustomer(Customer c) async {
+    // Soft-delete locally (hidden immediately, tombstone marks it for cloud
+    // removal), same pattern as transactions.
     await LocalDbService.deleteCustomer(c.id);
+    _loadReportCustomers();
     try {
       final userId = Supabase.instance.client.auth.currentUser?.id;
       if (userId != null) {
-        await Supabase.instance.client
+        // Purge the tombstone only when the cloud confirms the row is gone;
+        // otherwise it stays hidden and syncNow retries the delete.
+        final removed = await Supabase.instance.client
             .from('customers')
             .delete()
             .eq('id', c.id)
-            .eq('user_id', userId);
+            .eq('user_id', userId)
+            .select('id');
+        if (removed.isNotEmpty) {
+          await LocalDbService.purgeDeletedCustomer(c.id);
+        }
       }
-    } catch (_) {}
-    _loadReportCustomers();
+    } catch (_) {
+      // Offline / failed: the tombstone stays and syncNow retries the delete.
+    }
+    ConnectivityService.instance.syncNow();
   }
 
   // ── Owner / Staff access ──────────────────────────────────────────────────

@@ -40,7 +40,7 @@ class LocalDbService {
     final dbPath = await _appSupportPath();
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 12,
+      version: 15,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try {
@@ -122,6 +122,46 @@ class LocalDbService {
             );
           } catch (_) {}
         }
+        if (oldVersion < 13) {
+          try {
+            await db.execute(
+              'ALTER TABLE transactions ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0',
+            );
+          } catch (_) {}
+        }
+        if (oldVersion < 14) {
+          // Same soft-delete pattern as products/transactions, so customer
+          // and category deletions sync to the cloud instead of resurrecting.
+          try {
+            await db.execute(
+              'ALTER TABLE customers ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0',
+            );
+          } catch (_) {}
+          try {
+            await db.execute(
+              'ALTER TABLE categories ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0',
+            );
+          } catch (_) {}
+        }
+        if (oldVersion < 15) {
+          // Per-row revision counter. Every local write that marks a row
+          // unsynced also bumps rev; the push marks synced=1 only if rev is
+          // unchanged, so an edit made while an upsert is in flight is never
+          // silently dropped from the sync queue.
+          for (final t in [
+            'products',
+            'product_variants',
+            'transactions',
+            'customers',
+            'categories',
+          ]) {
+            try {
+              await db.execute(
+                'ALTER TABLE $t ADD COLUMN rev INTEGER NOT NULL DEFAULT 0',
+              );
+            } catch (_) {}
+          }
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -138,7 +178,8 @@ class LocalDbService {
       sku TEXT NOT NULL DEFAULT '',
       barcode_no TEXT NOT NULL DEFAULT '',
       synced INTEGER NOT NULL DEFAULT 0,
-      deleted INTEGER NOT NULL DEFAULT 0
+      deleted INTEGER NOT NULL DEFAULT 0,
+      rev INTEGER NOT NULL DEFAULT 0
     )
   ''';
 
@@ -159,7 +200,8 @@ class LocalDbService {
         dealer_name TEXT NOT NULL DEFAULT '',
         purchase_date TEXT NOT NULL DEFAULT '',
         synced INTEGER NOT NULL DEFAULT 0,
-        deleted INTEGER NOT NULL DEFAULT 0
+        deleted INTEGER NOT NULL DEFAULT 0,
+        rev INTEGER NOT NULL DEFAULT 0
       )
     ''');
     await db.execute('''
@@ -175,7 +217,9 @@ class LocalDbService {
         total REAL NOT NULL,
         payment_method TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        synced INTEGER NOT NULL DEFAULT 0
+        synced INTEGER NOT NULL DEFAULT 0,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        rev INTEGER NOT NULL DEFAULT 0
       )
     ''');
     await db.execute('''
@@ -185,13 +229,17 @@ class LocalDbService {
         phone TEXT,
         address TEXT,
         created_at TEXT NOT NULL,
-        synced INTEGER NOT NULL DEFAULT 0
+        synced INTEGER NOT NULL DEFAULT 0,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        rev INTEGER NOT NULL DEFAULT 0
       )
     ''');
     await db.execute('''
       CREATE TABLE categories (
         name TEXT PRIMARY KEY,
-        synced INTEGER NOT NULL DEFAULT 0
+        synced INTEGER NOT NULL DEFAULT 0,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        rev INTEGER NOT NULL DEFAULT 0
       )
     ''');
     await db.execute('''
@@ -215,14 +263,47 @@ class LocalDbService {
 
   // ── Settings ──────────────────────────────────────────────────────────────
 
+  /// Local-only dirty marker for settings. Holds an increasing counter so a
+  /// push can clear exactly the edits it uploaded: an edit made WHILE the
+  /// upload was in flight bumps the counter and stays dirty for the next
+  /// cycle. The underscore prefix keeps it out of the cloud push (the
+  /// knownSettingsCols filter) and it is ignored by the UI.
+  static const String settingsDirtyKey = '_settings_dirty';
+
   static Future<Map<String, String>> getSettings() async {
     final database = await db;
     final rows = await database.query('settings');
     return {for (final r in rows) r['key'] as String: r['value'] as String};
   }
 
+  /// Save settings edited ON THIS DEVICE — marks them dirty so the sync
+  /// engine pushes them (and only then). Cloud pulls must use
+  /// [saveSettingsFromCloud] instead, or every pull would masquerade as a
+  /// local edit and ping-pong between devices.
   static Future<void> saveSettings(Map<String, String> settings) async {
     final database = await db;
+    final current =
+        int.tryParse((await getSettings())[settingsDirtyKey] ?? '') ?? 0;
+    await _saveSettingsRaw(database, {
+      ...settings,
+      settingsDirtyKey: '${current + 1}',
+    });
+  }
+
+  /// Apply settings that came FROM the cloud — no dirty marking.
+  static Future<void> saveSettingsFromCloud(
+    Map<String, String> settings,
+  ) async {
+    final database = await db;
+    final filtered = Map<String, String>.from(settings)
+      ..remove(settingsDirtyKey);
+    await _saveSettingsRaw(database, filtered);
+  }
+
+  static Future<void> _saveSettingsRaw(
+    Database database,
+    Map<String, String> settings,
+  ) async {
     final batch = database.batch();
     for (final e in settings.entries) {
       batch.insert('settings', {
@@ -233,44 +314,121 @@ class LocalDbService {
     await batch.commit(noResult: true);
   }
 
+  /// Current dirty token, or null when there are no unpushed local edits.
+  static Future<String?> getSettingsDirtyToken() async =>
+      (await getSettings())[settingsDirtyKey];
+
+  /// Clears the dirty marker ONLY if it still holds [token] — an edit made
+  /// during the push bumped it, and must survive to be pushed next cycle.
+  static Future<void> clearSettingsDirtyIfToken(String token) async {
+    final database = await db;
+    await database.delete(
+      'settings',
+      where: 'key = ? AND value = ?',
+      whereArgs: [settingsDirtyKey, token],
+    );
+  }
+
   // ── Categories ────────────────────────────────────────────────────────────
 
   static Future<List<String>> getCategories() async {
     final database = await db;
-    final rows = await database.query('categories', orderBy: 'name ASC');
+    final rows = await database.query(
+      'categories',
+      where: 'deleted = 0',
+      orderBy: 'name ASC',
+    );
     return rows.map((r) => r['name'] as String).toList();
   }
 
   static Future<void> saveCategory(String name) async {
     final database = await db;
-    await database.insert('categories', {
-      'name': name,
-      'synced': 0,
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    // Re-adding a name that still has a pending-delete tombstone resurrects
+    // the row instead of being swallowed by the insert's conflict-ignore.
+    final revived = await database.rawUpdate(
+      'UPDATE categories SET deleted = 0, synced = 0, rev = rev + 1 '
+      'WHERE name = ? AND deleted = 1',
+      [name],
+    );
+    if (revived == 0) {
+      await database.insert('categories', {
+        'name': name,
+        'synced': 0,
+        'deleted': 0,
+      }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
   }
 
   static Future<void> renameCategory(String oldName, String newName) async {
     final database = await db;
-    await database.delete(
-      'categories',
-      where: 'name = ?',
-      whereArgs: [oldName],
+    // Tombstone the old name (so the rename removes it from the cloud too —
+    // a plain local delete would resurrect on the next pull), add the new one.
+    await database.rawUpdate(
+      'UPDATE categories SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE name = ?',
+      [oldName],
     );
-    await database.insert('categories', {
-      'name': newName,
-      'synced': 0,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await saveCategory(newName);
   }
 
   static Future<void> deleteCategory(String name) async {
     final database = await db;
-    await database.delete('categories', where: 'name = ?', whereArgs: [name]);
+    // Soft-delete: hidden immediately, pushed as a cloud deletion.
+    await database.rawUpdate(
+      'UPDATE categories SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE name = ?',
+      [name],
+    );
   }
 
   static Future<List<String>> getUnsyncedCategories() async {
     final database = await db;
-    final rows = await database.query('categories', where: 'synced = 0');
+    final rows = await database.query(
+      'categories',
+      where: 'synced = 0 AND deleted = 0',
+    );
     return rows.map((r) => r['name'] as String).toList();
+  }
+
+  /// Same as [getUnsyncedCategories] but also returns each row's rev, read in
+  /// the SAME query so the push can mark-synced conditionally on it.
+  static Future<(List<String>, Map<String, int>)>
+  getUnsyncedCategoriesWithRev() async {
+    final database = await db;
+    final rows = await database.query(
+      'categories',
+      where: 'synced = 0 AND deleted = 0',
+    );
+    return (
+      rows.map((r) => r['name'] as String).toList(),
+      {
+        for (final r in rows)
+          r['name'] as String: (r['rev'] as int?) ?? 0,
+      },
+    );
+  }
+
+  // Categories deleted locally but not yet removed from Supabase.
+  static Future<List<String>> getPendingDeleteCategoryNames() async {
+    final database = await db;
+    final rows = await database.query(
+      'categories',
+      columns: ['name'],
+      where: 'deleted = 1 AND synced = 0',
+    );
+    return rows.map((r) => r['name'] as String).toList();
+  }
+
+  // Call after confirming Supabase deletion — hard-removes the local row.
+  // The deleted=1 guard means a row the user re-added (revived tombstone)
+  // while the cloud delete was in flight survives and is re-pushed.
+  static Future<void> purgeDeletedCategory(String name) async {
+    final database = await db;
+    await database.delete(
+      'categories',
+      where: 'name = ? AND deleted = 1',
+      whereArgs: [name],
+    );
   }
 
   static Future<void> markCategorySynced(String name) async {
@@ -285,18 +443,61 @@ class LocalDbService {
 
   static Future<void> insertCategoriesSynced(List<String> names) async {
     final database = await db;
-    final batch = database.batch();
-    for (final name in names) {
-      batch.insert('categories', {
-        'name': name,
-        'synced': 1,
-      }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    }
-    await batch.commit(noResult: true);
+    // One transaction so the tombstone check and the writes are atomic — a
+    // delete tapped mid-merge can't slip between the snapshot and the batch.
+    await database.transaction((txn) async {
+      // Don't resurrect names whose deletion hasn't reached the cloud yet.
+      final pendingDeletes = {
+        for (final r in await txn.query(
+          'categories',
+          columns: ['name'],
+          where: 'deleted = 1',
+        ))
+          r['name'] as String,
+      };
+      final batch = txn.batch();
+      for (final name in names) {
+        if (pendingDeletes.contains(name)) continue;
+        batch.insert('categories', {
+          'name': name,
+          'synced': 1,
+          'deleted': 0,
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+      await batch.commit(noResult: true);
+    });
   }
 
-  // ── Clear all local data (call on logout) ─────────────────────────────────
+  /// Removes local synced categories that no longer exist in the cloud, so a
+  /// deletion done on another device disappears here too. Only runs after a
+  /// successful cloud fetch, so an empty set is a real "no categories" state.
+  static Future<void> reconcileCategoriesWithCloud(
+    Set<String> cloudNames,
+  ) async {
+    final database = await db;
+    final rows = await database.query(
+      'categories',
+      columns: ['name'],
+      where: 'synced = 1 AND deleted = 0',
+    );
+    for (final row in rows) {
+      final name = row['name'] as String;
+      if (!cloudNames.contains(name)) {
+        await database.delete(
+          'categories',
+          where: 'name = ?',
+          whereArgs: [name],
+        );
+      }
+    }
+  }
 
+  // ── Clear all local data ──────────────────────────────────────────────────
+  // DANGER: wipes pending unsynced rows and delete-tombstones too. The DB
+  // file is already per-user (billcat_<userId>.db), so login/logout flows
+  // must NOT call this — pullFromCloud's merge + reconcile keeps the local
+  // copy fresh without destroying unpushed work. Kept only for an explicit
+  // "reset local data" action.
   static Future<void> clearAll() async {
     final database = await db;
     await database.delete('products');
@@ -335,48 +536,53 @@ class LocalDbService {
   /// throw away the user's unsent edit.
   static Future<void> insertProductsSynced(List<Product> products) async {
     final database = await db;
-    final existing = {
-      for (final r in await database.query(
-        'products',
-        columns: ['id', 'synced', 'deleted'],
-      ))
-        r['id'] as String: (
-          synced: (r['synced'] as int?) ?? 1,
-          deleted: (r['deleted'] as int?) ?? 0,
-        ),
-    };
-    final batch = database.batch();
-    for (final p in products) {
-      final map = p.toMap();
-      map['synced'] = 1;
-      map['deleted'] = 0;
-      final local = existing[p.id];
-      if (local == null) {
-        batch.insert(
+    // One transaction so the pending-state snapshot and the writes are
+    // atomic — an edit or delete tapped mid-merge can't be clobbered.
+    await database.transaction((txn) async {
+      final existing = {
+        for (final r in await txn.query(
           'products',
-          map,
-          conflictAlgorithm: ConflictAlgorithm.ignore,
-        );
-      } else if (local.synced == 1 && local.deleted == 0) {
-        // purchase_date and barcode_no are local-only product columns (never
-        // stored in the cloud), so keep whatever is already on the local row
-        // instead of clobbering it with the empty value that comes back from a
-        // cloud refresh.
-        map.remove('purchase_date');
-        map.remove('barcode_no');
-        batch.update('products', map, where: 'id = ?', whereArgs: [p.id]);
+          columns: ['id', 'synced', 'deleted'],
+        ))
+          r['id'] as String: (
+            synced: (r['synced'] as int?) ?? 1,
+            deleted: (r['deleted'] as int?) ?? 0,
+          ),
+      };
+      final batch = txn.batch();
+      for (final p in products) {
+        final map = p.toMap();
+        map['synced'] = 1;
+        map['deleted'] = 0;
+        final local = existing[p.id];
+        if (local == null) {
+          batch.insert(
+            'products',
+            map,
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          );
+        } else if (local.synced == 1 && local.deleted == 0) {
+          // purchase_date is local-only (never stored in the cloud) — keep
+          // the local value. barcode_no now syncs, but an empty cloud value
+          // must never clobber a locally assigned number.
+          map.remove('purchase_date');
+          if ((map['barcode_no'] as String? ?? '').isEmpty) {
+            map.remove('barcode_no');
+          }
+          batch.update('products', map, where: 'id = ?', whereArgs: [p.id]);
+        }
       }
-    }
-    await batch.commit(noResult: true);
+      await batch.commit(noResult: true);
+    });
   }
 
   static Future<void> updateProductStock(String id, int newStock) async {
     final database = await db;
-    await database.update(
-      'products',
-      {'stock': newStock},
-      where: 'id = ?',
-      whereArgs: [id],
+    // synced = 0 + rev bump so the stock change is pushed and can't be
+    // masked by an in-flight sync's mark-synced.
+    await database.rawUpdate(
+      'UPDATE products SET stock = ?, synced = 0, rev = rev + 1 WHERE id = ?',
+      [newStock, id],
     );
   }
 
@@ -395,25 +601,26 @@ class LocalDbService {
 
   static Future<void> updateProduct(Product p) async {
     final database = await db;
-    await database.update(
-      'products',
-      {
-        'name': p.name,
-        'price': p.price,
-        'buying_price': p.buyingPrice,
-        'tax_percent': p.taxPercent,
-        'category': p.category,
-        'emoji': p.emoji,
-        'sku': p.sku,
-        'stock': p.stock,
-        'description': p.description,
-        'barcode_no': p.barcodeNo,
-        'dealer_name': p.dealerName,
-        'purchase_date': p.purchaseDate,
-        'synced': 0,
-      },
-      where: 'id = ?',
-      whereArgs: [p.id],
+    await database.rawUpdate(
+      'UPDATE products SET name = ?, price = ?, buying_price = ?, '
+      'tax_percent = ?, category = ?, emoji = ?, sku = ?, stock = ?, '
+      'description = ?, barcode_no = ?, dealer_name = ?, purchase_date = ?, '
+      'synced = 0, rev = rev + 1 WHERE id = ?',
+      [
+        p.name,
+        p.price,
+        p.buyingPrice,
+        p.taxPercent,
+        p.category,
+        p.emoji,
+        p.sku,
+        p.stock,
+        p.description,
+        p.barcodeNo,
+        p.dealerName,
+        p.purchaseDate,
+        p.id,
+      ],
     );
   }
 
@@ -433,19 +640,20 @@ class LocalDbService {
 
   static Future<void> assignMissingBarcodeNos() async {
     final database = await db;
-    // Only assign to products with a truly empty barcode_no — never overwrite existing
+    // Only assign to products with a truly empty barcode_no — never overwrite
+    // existing. synced = 0 so the assigned number reaches other devices
+    // (otherwise each device runs its own sequence and numbers collide).
     final rows = await database.query(
       'products',
       columns: ['id'],
-      where: "barcode_no = '' OR barcode_no IS NULL",
+      where: "(barcode_no = '' OR barcode_no IS NULL) AND deleted = 0",
     );
     for (final row in rows) {
       final next = await getNextBarcodeNo();
-      await database.update(
-        'products',
-        {'barcode_no': next},
-        where: 'id = ?',
-        whereArgs: [row['id']],
+      await database.rawUpdate(
+        'UPDATE products SET barcode_no = ?, synced = 0, rev = rev + 1 '
+        "WHERE id = ? AND (barcode_no = '' OR barcode_no IS NULL)",
+        [next, row['id']],
       );
     }
   }
@@ -459,11 +667,10 @@ class LocalDbService {
     );
     for (final row in rows) {
       final next = await getNextBarcodeNo();
-      await database.update(
-        'product_variants',
-        {'barcode_no': next, 'synced': 0},
-        where: 'id = ?',
-        whereArgs: [row['id']],
+      await database.rawUpdate(
+        'UPDATE product_variants SET barcode_no = ?, synced = 0, '
+        "rev = rev + 1 WHERE id = ? AND (barcode_no = '' OR barcode_no IS NULL)",
+        [next, row['id']],
       );
     }
   }
@@ -471,17 +678,15 @@ class LocalDbService {
   static Future<void> deleteProduct(String id) async {
     final database = await db;
     // Soft-delete: mark for cloud removal, hidden from UI immediately
-    await database.update(
-      'products',
-      {'deleted': 1, 'synced': 0},
-      where: 'id = ?',
-      whereArgs: [id],
+    await database.rawUpdate(
+      'UPDATE products SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [id],
     );
-    await database.update(
-      'product_variants',
-      {'deleted': 1, 'synced': 0},
-      where: 'product_id = ?',
-      whereArgs: [id],
+    await database.rawUpdate(
+      'UPDATE product_variants SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE product_id = ?',
+      [id],
     );
   }
 
@@ -495,6 +700,40 @@ class LocalDbService {
     return rows.map(Product.fromMap).toList();
   }
 
+  /// Same as [getUnsyncedProducts] but also returns each row's rev from the
+  /// SAME query, so the push can mark-synced conditionally on it.
+  static Future<(List<Product>, Map<String, int>)>
+  getUnsyncedProductsWithRev() async {
+    final database = await db;
+    final rows = await database.query(
+      'products',
+      where: 'synced = 0 AND deleted = 0',
+    );
+    return (
+      rows.map(Product.fromMap).toList(),
+      {for (final r in rows) r['id'] as String: (r['rev'] as int?) ?? 0},
+    );
+  }
+
+  /// Marks a row synced ONLY if it hasn't changed since the push snapshot
+  /// (rev must match) and hasn't been deleted meanwhile. A row edited or
+  /// deleted during the network round trip keeps synced = 0 and is re-pushed
+  /// on the next cycle instead of being silently dropped.
+  static Future<void> markSyncedIfRev(
+    String table,
+    String keyColumn,
+    Object key,
+    int rev,
+  ) async {
+    final database = await db;
+    await database.update(
+      table,
+      {'synced': 1},
+      where: '$keyColumn = ? AND rev = ? AND deleted = 0',
+      whereArgs: [key, rev],
+    );
+  }
+
   // Products marked deleted locally but not yet removed from Supabase
   static Future<List<String>> getPendingDeleteProductIds() async {
     final database = await db;
@@ -506,10 +745,15 @@ class LocalDbService {
     return rows.map((r) => r['id'] as String).toList();
   }
 
-  // Call after confirming Supabase deletion — hard-deletes the local row
+  // Call after confirming Supabase deletion — hard-deletes the local row.
+  // deleted=1 guard: never purge a row that was revived meanwhile.
   static Future<void> purgeDeletedProduct(String id) async {
     final database = await db;
-    await database.delete('products', where: 'id = ?', whereArgs: [id]);
+    await database.delete(
+      'products',
+      where: 'id = ? AND deleted = 1',
+      whereArgs: [id],
+    );
   }
 
   static Future<void> markProductSynced(String id) async {
@@ -564,80 +808,73 @@ class LocalDbService {
   }
 
   /// Same merge rule as [insertProductsSynced]: refresh from the cloud unless
-  /// the local row still has unsent changes.
+  /// the local row still has unsent changes. Transaction-wrapped so the
+  /// pending-state snapshot and the writes are atomic.
   static Future<void> insertVariantsSynced(
     List<ProductVariant> variants,
   ) async {
     final database = await db;
-    final existing = {
-      for (final r in await database.query(
-        'product_variants',
-        columns: ['id', 'synced', 'deleted'],
-      ))
-        r['id'] as String: (
-          synced: (r['synced'] as int?) ?? 1,
-          deleted: (r['deleted'] as int?) ?? 0,
-        ),
-    };
-    final batch = database.batch();
-    for (final v in variants) {
-      final map = v.toMap();
-      map['synced'] = 1;
-      map['deleted'] = 0;
-      final local = existing[v.id];
-      if (local == null) {
-        batch.insert(
+    await database.transaction((txn) async {
+      final existing = {
+        for (final r in await txn.query(
           'product_variants',
-          map,
-          conflictAlgorithm: ConflictAlgorithm.ignore,
-        );
-      } else if (local.synced == 1 && local.deleted == 0) {
-        batch.update(
-          'product_variants',
-          map,
-          where: 'id = ?',
-          whereArgs: [v.id],
-        );
+          columns: ['id', 'synced', 'deleted'],
+        ))
+          r['id'] as String: (
+            synced: (r['synced'] as int?) ?? 1,
+            deleted: (r['deleted'] as int?) ?? 0,
+          ),
+      };
+      final batch = txn.batch();
+      for (final v in variants) {
+        final map = v.toMap();
+        map['synced'] = 1;
+        map['deleted'] = 0;
+        final local = existing[v.id];
+        if (local == null) {
+          batch.insert(
+            'product_variants',
+            map,
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          );
+        } else if (local.synced == 1 && local.deleted == 0) {
+          batch.update(
+            'product_variants',
+            map,
+            where: 'id = ?',
+            whereArgs: [v.id],
+          );
+        }
       }
-    }
-    await batch.commit(noResult: true);
+      await batch.commit(noResult: true);
+    });
   }
 
   static Future<void> updateVariant(ProductVariant v) async {
     final database = await db;
-    await database.update(
-      'product_variants',
-      {
-        'label': v.label,
-        'price': v.price,
-        'buying_price': v.buyingPrice,
-        'stock': v.stock,
-        'sku': v.sku,
-        'barcode_no': v.barcodeNo,
-        'synced': 0,
-      },
-      where: 'id = ?',
-      whereArgs: [v.id],
+    await database.rawUpdate(
+      'UPDATE product_variants SET label = ?, price = ?, buying_price = ?, '
+      'stock = ?, sku = ?, barcode_no = ?, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [v.label, v.price, v.buyingPrice, v.stock, v.sku, v.barcodeNo, v.id],
     );
   }
 
   static Future<void> updateVariantStock(String id, int newStock) async {
     final database = await db;
-    await database.update(
-      'product_variants',
-      {'stock': newStock, 'synced': 0},
-      where: 'id = ?',
-      whereArgs: [id],
+    await database.rawUpdate(
+      'UPDATE product_variants SET stock = ?, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [newStock, id],
     );
   }
 
   static Future<void> deleteVariant(String id) async {
     final database = await db;
-    await database.update(
-      'product_variants',
-      {'deleted': 1, 'synced': 0},
-      where: 'id = ?',
-      whereArgs: [id],
+    await database.rawUpdate(
+      'UPDATE product_variants SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [id],
     );
   }
 
@@ -648,6 +885,21 @@ class LocalDbService {
       where: 'synced = 0 AND deleted = 0',
     );
     return rows.map(ProductVariant.fromMap).toList();
+  }
+
+  /// Rev-carrying variant of [getUnsyncedVariants] (same query, see
+  /// [getUnsyncedProductsWithRev]).
+  static Future<(List<ProductVariant>, Map<String, int>)>
+  getUnsyncedVariantsWithRev() async {
+    final database = await db;
+    final rows = await database.query(
+      'product_variants',
+      where: 'synced = 0 AND deleted = 0',
+    );
+    return (
+      rows.map(ProductVariant.fromMap).toList(),
+      {for (final r in rows) r['id'] as String: (r['rev'] as int?) ?? 0},
+    );
   }
 
   static Future<List<String>> getPendingDeleteVariantIds() async {
@@ -662,7 +914,11 @@ class LocalDbService {
 
   static Future<void> purgeDeletedVariant(String id) async {
     final database = await db;
-    await database.delete('product_variants', where: 'id = ?', whereArgs: [id]);
+    await database.delete(
+      'product_variants',
+      where: 'id = ? AND deleted = 1',
+      whereArgs: [id],
+    );
   }
 
   static Future<void> markVariantSynced(String id) async {
@@ -696,11 +952,10 @@ class LocalDbService {
         if (rows.isNotEmpty) {
           final current = rows.first['stock'] as int;
           final updated = (current - item.quantity).clamp(0, current);
-          await database.update(
-            'product_variants',
-            {'stock': updated, 'synced': 0},
-            where: 'id = ?',
-            whereArgs: [item.variantId],
+          await database.rawUpdate(
+            'UPDATE product_variants SET stock = ?, synced = 0, '
+            'rev = rev + 1 WHERE id = ?',
+            [updated, item.variantId],
           );
         }
         continue;
@@ -714,11 +969,10 @@ class LocalDbService {
       if (rows.isNotEmpty) {
         final current = rows.first['stock'] as int;
         final updated = (current - item.quantity).clamp(0, current);
-        await database.update(
-          'products',
-          {'stock': updated, 'synced': 0},
-          where: 'id = ?',
-          whereArgs: [item.productId],
+        await database.rawUpdate(
+          'UPDATE products SET stock = ?, synced = 0, rev = rev + 1 '
+          'WHERE id = ?',
+          [updated, item.productId],
         );
       }
     }
@@ -734,23 +988,41 @@ class LocalDbService {
     List<TransactionRecord> txs,
   ) async {
     final database = await db;
-    final batch = database.batch();
-    for (final t in txs) {
-      final map = t.toMap();
-      map['synced'] = 1;
-      batch.insert(
-        'transactions',
-        map,
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-    }
-    await batch.commit(noResult: true);
+    // One transaction so the tombstone snapshot and the REPLACE writes are
+    // atomic — a delete tapped mid-merge can't have its tombstone clobbered
+    // (which would silently undo the deletion).
+    await database.transaction((txn) async {
+      // Don't resurrect a row the user just deleted locally but whose cloud
+      // deletion hasn't synced yet.
+      final pendingDeletes = {
+        for (final r in await txn.query(
+          'transactions',
+          columns: ['id'],
+          where: 'deleted = 1',
+        ))
+          r['id'] as String,
+      };
+      final batch = txn.batch();
+      for (final t in txs) {
+        if (pendingDeletes.contains(t.id)) continue;
+        final map = t.toMap();
+        map['synced'] = 1;
+        map['deleted'] = 0;
+        batch.insert(
+          'transactions',
+          map,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      await batch.commit(noResult: true);
+    });
   }
 
   static Future<List<TransactionRecord>> getTransactions() async {
     final database = await db;
     final rows = await database.query(
       'transactions',
+      where: 'deleted = 0',
       orderBy: 'created_at DESC',
     );
     return rows.map(TransactionRecord.fromMap).toList();
@@ -764,7 +1036,7 @@ class LocalDbService {
         '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
     final rows = await database.query(
       'transactions',
-      where: "created_at LIKE ?",
+      where: "created_at LIKE ? AND deleted = 0",
       whereArgs: ['$prefix%'],
       orderBy: 'created_at DESC',
     );
@@ -779,7 +1051,7 @@ class LocalDbService {
     final f = from.toIso8601String().substring(0, 10);
     final t = to.toIso8601String().substring(0, 10);
     final rows = await database.rawQuery(
-      "SELECT * FROM transactions WHERE substr(created_at,1,10) >= ? AND substr(created_at,1,10) <= ? ORDER BY created_at DESC",
+      "SELECT * FROM transactions WHERE substr(created_at,1,10) >= ? AND substr(created_at,1,10) <= ? AND deleted = 0 ORDER BY created_at DESC",
       [f, t],
     );
     return rows.map(TransactionRecord.fromMap).toList();
@@ -787,13 +1059,29 @@ class LocalDbService {
 
   static Future<List<TransactionRecord>> getUnsynced() async {
     final database = await db;
+    // Exclude soft-deleted rows — those are pushed as deletions, not upserts.
     final rows = await database.query(
       'transactions',
-      where: 'synced = ?',
-      whereArgs: [0],
+      where: 'synced = 0 AND deleted = 0',
       orderBy: 'created_at ASC',
     );
     return rows.map(TransactionRecord.fromMap).toList();
+  }
+
+  /// Rev-carrying variant of [getUnsynced] (same query, see
+  /// [getUnsyncedProductsWithRev]).
+  static Future<(List<TransactionRecord>, Map<String, int>)>
+  getUnsyncedWithRev() async {
+    final database = await db;
+    final rows = await database.query(
+      'transactions',
+      where: 'synced = 0 AND deleted = 0',
+      orderBy: 'created_at ASC',
+    );
+    return (
+      rows.map(TransactionRecord.fromMap).toList(),
+      {for (final r in rows) r['id'] as String: (r['rev'] as int?) ?? 0},
+    );
   }
 
   static Future<void> markSynced(String id) async {
@@ -808,26 +1096,95 @@ class LocalDbService {
 
   static Future<void> deleteTransaction(String id) async {
     final database = await db;
-    await database.delete('transactions', where: 'id = ?', whereArgs: [id]);
+    // Soft-delete: hide it now, mark for cloud removal. A hard delete alone
+    // would be undone by the next pull, which re-downloads it from Supabase.
+    await database.rawUpdate(
+      'UPDATE transactions SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [id],
+    );
+  }
+
+  // Transactions deleted locally but not yet removed from Supabase.
+  static Future<List<String>> getPendingDeleteTransactionIds() async {
+    final database = await db;
+    final rows = await database.query(
+      'transactions',
+      columns: ['id'],
+      where: 'deleted = 1 AND synced = 0',
+    );
+    return rows.map((r) => r['id'] as String).toList();
+  }
+
+  // Call after confirming Supabase deletion — hard-removes the local row.
+  static Future<void> purgeDeletedTransaction(String id) async {
+    final database = await db;
+    await database.delete(
+      'transactions',
+      where: 'id = ? AND deleted = 1',
+      whereArgs: [id],
+    );
   }
 
   // Removes synced transactions that no longer exist in Supabase (cloud is source of truth for deletes)
   static Future<void> reconcileTransactionsWithCloud(
     Set<String> cloudIds,
   ) async {
-    if (cloudIds.isEmpty) return;
+    await reconcileTableWithCloud('transactions', cloudIds);
+  }
+
+  /// Removes local rows (synced = 1 only) that no longer exist in the cloud —
+  /// the cloud is the source of truth for deletions done on other devices.
+  /// Rows with pending local changes (synced = 0 / deleted = 1) are never
+  /// touched. Callers only invoke this after a SUCCESSFUL cloud fetch, so an
+  /// empty set is a real "zero rows" state and must reconcile too (otherwise
+  /// deleting the last row on one device never propagates to the others).
+  static Future<void> reconcileTableWithCloud(
+    String table,
+    Set<String> cloudIds,
+  ) async {
     final database = await db;
     final rows = await database.query(
-      'transactions',
+      table,
       columns: ['id'],
       where: 'synced = 1',
     );
     for (final row in rows) {
       final id = row['id'] as String;
       if (!cloudIds.contains(id)) {
-        await database.delete('transactions', where: 'id = ?', whereArgs: [id]);
+        await database.delete(table, where: 'id = ?', whereArgs: [id]);
       }
     }
+  }
+
+  // ── Realtime removals: another device deleted the row in the cloud ────────
+  // The cloud row is already gone, so these hard-delete locally (no tombstone).
+
+  static Future<void> removeLocalTransaction(String id) async {
+    final database = await db;
+    await database.delete('transactions', where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> removeLocalProduct(String id) async {
+    final database = await db;
+    await database.delete('products', where: 'id = ?', whereArgs: [id]);
+    // Its variants are deleted separately in the cloud, but clearing them
+    // here too is idempotent and keeps the grid consistent immediately.
+    await database.delete(
+      'product_variants',
+      where: 'product_id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  static Future<void> removeLocalVariant(String id) async {
+    final database = await db;
+    await database.delete('product_variants', where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> removeLocalCustomer(String id) async {
+    final database = await db;
+    await database.delete('customers', where: 'id = ?', whereArgs: [id]);
   }
 
   static Future<int> unsyncedCount() async {
@@ -847,9 +1204,11 @@ class LocalDbService {
   }) async {
     final database = await db;
     if (phone != null && phone.isNotEmpty) {
+      // Only live rows block a re-add; a pending-delete tombstone with the
+      // same phone must not keep the customer "deleted" forever.
       final existing = await database.query(
         'customers',
-        where: 'phone = ?',
+        where: 'phone = ? AND deleted = 0',
         whereArgs: [phone],
         limit: 1,
       );
@@ -862,27 +1221,54 @@ class LocalDbService {
       'address': address ?? '',
       'created_at': DateTime.now().toIso8601String(),
       'synced': 0,
+      'deleted': 0,
     }, conflictAlgorithm: ConflictAlgorithm.ignore);
   }
 
+  /// Merges cloud customers into the local table with the same guard as
+  /// products: never overwrite a row with unsent local changes, and never
+  /// resurrect one whose deletion hasn't reached the cloud yet.
+  /// Transaction-wrapped so the snapshot and writes are atomic.
   static Future<void> insertCustomersSynced(List<Customer> customers) async {
     final database = await db;
-    final batch = database.batch();
-    for (final c in customers) {
-      final map = c.toMap();
-      map['synced'] = 1;
-      batch.insert(
-        'customers',
-        map,
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-    }
-    await batch.commit(noResult: true);
+    await database.transaction((txn) async {
+      final existing = {
+        for (final r in await txn.query(
+          'customers',
+          columns: ['id', 'synced', 'deleted'],
+        ))
+          r['id'] as String: (
+            synced: (r['synced'] as int?) ?? 1,
+            deleted: (r['deleted'] as int?) ?? 0,
+          ),
+      };
+      final batch = txn.batch();
+      for (final c in customers) {
+        final map = c.toMap();
+        map['synced'] = 1;
+        map['deleted'] = 0;
+        final local = existing[c.id];
+        if (local == null) {
+          batch.insert(
+            'customers',
+            map,
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          );
+        } else if (local.synced == 1 && local.deleted == 0) {
+          batch.update('customers', map, where: 'id = ?', whereArgs: [c.id]);
+        }
+      }
+      await batch.commit(noResult: true);
+    });
   }
 
   static Future<List<Customer>> getCustomers() async {
     final database = await db;
-    final rows = await database.query('customers', orderBy: 'name ASC');
+    final rows = await database.query(
+      'customers',
+      where: 'deleted = 0',
+      orderBy: 'name ASC',
+    );
     return rows.map(Customer.fromMap).toList();
   }
 
@@ -890,10 +1276,24 @@ class LocalDbService {
     final database = await db;
     final rows = await database.query(
       'customers',
-      where: 'synced = ?',
-      whereArgs: [0],
+      where: 'synced = 0 AND deleted = 0',
     );
     return rows.map(Customer.fromMap).toList();
+  }
+
+  /// Rev-carrying variant of [getUnsyncedCustomers] (same query, see
+  /// [getUnsyncedProductsWithRev]).
+  static Future<(List<Customer>, Map<String, int>)>
+  getUnsyncedCustomersWithRev() async {
+    final database = await db;
+    final rows = await database.query(
+      'customers',
+      where: 'synced = 0 AND deleted = 0',
+    );
+    return (
+      rows.map(Customer.fromMap).toList(),
+      {for (final r in rows) r['id'] as String: (r['rev'] as int?) ?? 0},
+    );
   }
 
   static Future<void> markCustomerSynced(String id) async {
@@ -908,7 +1308,34 @@ class LocalDbService {
 
   static Future<void> deleteCustomer(String id) async {
     final database = await db;
-    await database.delete('customers', where: 'id = ?', whereArgs: [id]);
+    // Soft-delete: hidden immediately, pushed as a cloud deletion. A hard
+    // delete alone would be undone by the next pull.
+    await database.rawUpdate(
+      'UPDATE customers SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [id],
+    );
+  }
+
+  // Customers deleted locally but not yet removed from Supabase.
+  static Future<List<String>> getPendingDeleteCustomerIds() async {
+    final database = await db;
+    final rows = await database.query(
+      'customers',
+      columns: ['id'],
+      where: 'deleted = 1 AND synced = 0',
+    );
+    return rows.map((r) => r['id'] as String).toList();
+  }
+
+  // Call after confirming Supabase deletion — hard-removes the local row.
+  static Future<void> purgeDeletedCustomer(String id) async {
+    final database = await db;
+    await database.delete(
+      'customers',
+      where: 'id = ? AND deleted = 1',
+      whereArgs: [id],
+    );
   }
 
   static Future<List<TransactionRecord>> getTransactionsByCustomer(
@@ -919,13 +1346,13 @@ class LocalDbService {
     List<Map<String, dynamic>> rows;
     if (phone != null && phone.isNotEmpty) {
       rows = await database.rawQuery(
-        "SELECT * FROM transactions WHERE customer_name = ? OR customer_phone = ? ORDER BY created_at DESC",
+        "SELECT * FROM transactions WHERE (customer_name = ? OR customer_phone = ?) AND deleted = 0 ORDER BY created_at DESC",
         [name, phone],
       );
     } else {
       rows = await database.query(
         'transactions',
-        where: 'customer_name = ?',
+        where: 'customer_name = ? AND deleted = 0',
         whereArgs: [name],
         orderBy: 'created_at DESC',
       );
