@@ -27,6 +27,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:barcode/barcode.dart' as bc;
 import '../../services/receipt_printer.dart';
+import '../../services/thermal_logo.dart';
 import '../../services/thermal_printer.dart';
 import '../../services/whatsapp_service.dart' as _wa;
 import '../auth/login_screen.dart';
@@ -9402,6 +9403,7 @@ class _BillingScreenState extends State<BillingScreen> {
         final effPaper = paperSize ?? _paperSize;
         final isThermal = !['A4', 'A5'].contains(effPaper);
         if (isThermal && target != null) {
+          final logo = await decodeReceiptLogo(_logoPath);
           final escBytes = ThermalPrinter.buildReceipt(
             tx,
             storeName: _storeName,
@@ -9412,6 +9414,8 @@ class _BillingScreenState extends State<BillingScreen> {
             taxLabel: _taxLabel,
             taxRate: _taxRateDisplay,
             currencySymbol: _currencySymbol,
+            storeUpiId: _storeUpiId,
+            logo: logo,
           );
           final printed = ThermalPrinter.rawPrint(target.name, escBytes);
           if (printed) return; // printed via ESC/POS
