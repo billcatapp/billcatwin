@@ -76,6 +76,28 @@ class UpdateService {
     return info.version;
   }
 
+  /// The updater script leaves %TEMP%\billcat_update.log behind ONLY when a
+  /// previous "Install Update" failed to apply (it deletes the log on
+  /// success). Returns the failure reason and removes the log so the message
+  /// surfaces once — without this, a failed update silently relaunches the
+  /// old version and the user just sees "same version" with no explanation.
+  static Future<String?> consumeFailedUpdateLog() async {
+    try {
+      final tmp = Platform.environment['TEMP'] ?? Platform.environment['TMP'];
+      if (tmp == null) return null;
+      final f = File('$tmp\\billcat_update.log');
+      if (!await f.exists()) return null;
+      final content = await f.readAsString();
+      await f.delete();
+      // Last "failed" line carries the actual copy error, if any.
+      final failLines =
+          content.split('\n').where((l) => l.contains('failed')).toList();
+      return failLines.isNotEmpty ? failLines.last.trim() : content.trim();
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Downloads the zip, extracts it, replaces the running app, and relaunches.
   /// [onProgress] is called with 0.0–1.0. The app exits at 1.0 and relaunches.
   static Future<void> installUpdate(
@@ -169,6 +191,14 @@ class UpdateService {
       r'$maxWait = 20; $waited = 0' '\n'
       r'while ((Get-Process -Name "billcat" -ErrorAction SilentlyContinue) -and ($waited -lt $maxWait)) {' '\n'
       r'    Start-Sleep -Milliseconds 500; $waited += 0.5' '\n'
+      r'}' '\n'
+      // A leftover second instance keeps billcat.exe locked, which would make
+      // every copy attempt fail and silently relaunch the old version. The
+      // user asked for the update — stop the straggler.
+      r'if (Get-Process -Name "billcat" -ErrorAction SilentlyContinue) {' '\n'
+      r'    Add-Content $log "[$(Get-Date)] BillCat still running after $maxWait s - stopping it..."' '\n'
+      r'    Stop-Process -Name "billcat" -Force -ErrorAction SilentlyContinue' '\n'
+      r'    Start-Sleep -Milliseconds 1000' '\n'
       r'}' '\n'
       r'Add-Content $log "[$(Get-Date)] Copying files..."' '\n'
       r'$copyAttempts = 0; $copyOk = $false' '\n'

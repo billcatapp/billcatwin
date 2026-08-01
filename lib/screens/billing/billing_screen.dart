@@ -536,6 +536,19 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   Future<void> _checkForUpdate() async {
+    // Surface a previous failed self-update (the old version relaunching
+    // "successfully" otherwise looks like the update simply didn't happen).
+    try {
+      final failReason = await UpdateService.consumeFailedUpdateLog();
+      if (failReason != null && mounted) {
+        _showToast(
+          'The last update could not be applied automatically. '
+          'Please download the installer from the update banner. '
+          '($failReason)',
+          isError: true,
+        );
+      }
+    } catch (_) {}
     try {
       final info = await UpdateService.checkForUpdate();
       if (mounted && info != null) setState(() => _updateInfo = info);
