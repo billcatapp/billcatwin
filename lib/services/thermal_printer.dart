@@ -233,11 +233,10 @@ class ThermalPrinter {
       _line(b, _row(gtLabel, gtValue));
       b.addAll([_esc, 0x21, 0x00]);
     }
-    _sep(b);
+    b.add(_lf); // model: payment row sits right under the total, no rule
 
     // ── Payment ──────────────────────────────────────────────────────────
     _line(b, _row('Payment Method', tx.paymentMethod));
-    _sep(b);
 
     // ── UPI QR (when the store has a UPI id configured) ──────────────────
     if (storeUpiId.isNotEmpty) {
