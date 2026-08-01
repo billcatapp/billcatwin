@@ -70,6 +70,32 @@ class ConnectivityService extends ChangeNotifier {
   bool _pullInFlight = false;
   final Map<String, Set<String>> _liveIdsDuringPull = {};
 
+  /// Account-level settings that sync across devices. Everything else
+  /// (selected printer, paper size, orientation, auto-print, logo_path,
+  /// print-dialog toggles...) is DEVICE-SPECIFIC and must never be pushed to
+  /// or pulled from the cloud — an unfiltered pull let one machine's paper
+  /// size silently overwrite another's thermal setup. Both the push and the
+  /// pull filter on this same set.
+  static const Set<String> _syncedSettingsCols = {
+    'store_name',
+    'store_address',
+    'store_phone',
+    'store_email',
+    'store_gstin',
+    'receipt_footer',
+    'tax_label',
+    'tax_rate',
+    'currency_code',
+    'currency_symbol',
+    'invoice_layout',
+    'store_terms',
+    'store_upi_id',
+    'branch_number',
+    'logo_url',
+    'wa_access_token',
+    'wa_phone_number_id',
+  };
+
   /// Fallback pull cadence while the realtime channel is down.
   static const Duration _pullFast = Duration(seconds: 15);
 
@@ -676,30 +702,11 @@ class ConnectivityService extends ChangeNotifier {
 
       // ── Push settings (only when edited locally) ─────────────────────────
       // Business-level settings that follow the account across devices.
-      // Device-specific ones (printer, paper size, orientation, logo_path)
-      // are deliberately excluded so one machine can't override another's
-      // setup. Requires database/add_settings_columns.sql for the last three.
+      // Device-specific ones (printer, paper size, orientation, auto-print,
+      // logo_path) are deliberately excluded so one machine can't override
+      // another's setup — see [_syncedSettingsCols], which the pull uses
+      // symmetrically.
       if (_staleUser(userId)) return;
-      const knownSettingsCols = {
-        'store_name',
-        'store_address',
-        'store_phone',
-        'store_email',
-        'store_gstin',
-        'receipt_footer',
-        'tax_label',
-        'tax_rate',
-        'currency_code',
-        'currency_symbol',
-        'invoice_layout',
-        'store_terms',
-        'store_upi_id',
-        'branch_number',
-        'logo_url',
-        'wa_access_token',
-        'wa_phone_number_id',
-        'auto_print',
-      };
       try {
         // Dirty token read FIRST: an edit landing during the upsert bumps it,
         // so the conditional clear below leaves it dirty for the next cycle.
@@ -707,7 +714,9 @@ class ConnectivityService extends ChangeNotifier {
         if (dirtyToken != null) {
           final settings = await LocalDbService.getSettings();
           final filtered = Map.fromEntries(
-            settings.entries.where((e) => knownSettingsCols.contains(e.key)),
+            settings.entries.where(
+              (e) => _syncedSettingsCols.contains(e.key),
+            ),
           );
           if (filtered.isNotEmpty) {
             await client.from('user_settings').upsert({
@@ -871,11 +880,17 @@ class ConnectivityService extends ChangeNotifier {
       if (settingsRow != null) {
         final map = Map<String, dynamic>.from(settingsRow as Map);
         map.remove('user_id');
-        // Skip nulls (columns absent from the cloud schema) but KEEP empty
-        // strings — clearing a field on one device must propagate.
+        // Only account-level keys may come from the cloud — device-specific
+        // settings (printer, paper size, ...) stay exactly as the user set
+        // them on THIS machine. Skip nulls (columns absent from the cloud
+        // schema) but KEEP empty strings — clearing a field on one device
+        // must propagate.
         final settings = Map<String, String>.fromEntries(
           map.entries
-              .where((e) => e.value != null)
+              .where(
+                (e) =>
+                    _syncedSettingsCols.contains(e.key) && e.value != null,
+              )
               .map((e) => MapEntry(e.key, e.value.toString())),
         );
         if (_staleUser(userId)) return;
