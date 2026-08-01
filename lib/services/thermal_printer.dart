@@ -211,7 +211,21 @@ class ThermalPrinter {
       _line(b, _row('Discount', '-${money(tx.discountAmount)}'));
     }
     if (tx.taxAmount > 0) {
-      final label = taxRate.isNotEmpty ? '$taxLabel ($taxRate%)' : taxLabel;
+      // The passed taxRate is the store-wide default, which is wrong when
+      // the tax came from per-product rates (a 0% store rate printed
+      // "GST (0%)" next to a real tax amount). Derive the effective rate
+      // from the bill's own numbers instead.
+      var rateStr = taxRate;
+      final base = tx.subtotal - tx.discountAmount;
+      if (base > 0) {
+        final r = tx.taxAmount / base * 100;
+        rateStr = (r - r.roundToDouble()).abs() < 0.05
+            ? r.round().toString()
+            : r.toStringAsFixed(1);
+      }
+      final label = rateStr.isNotEmpty && rateStr != '0'
+          ? '$taxLabel ($rateStr%)'
+          : taxLabel;
       _line(b, _row(label, money(tx.taxAmount)));
     }
     _sep(b);

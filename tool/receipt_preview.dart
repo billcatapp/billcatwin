@@ -6,52 +6,47 @@ import 'dart:io';
 import 'package:billcat/models/transaction_record.dart';
 import 'package:billcat/services/thermal_printer.dart';
 
+// Same format as LocalDbService.generateInvoiceId (which needs sqflite).
+String LocalDbService_generateInvoiceIdStub() {
+  final now = DateTime.now();
+  final prefix = 'INV${now.year % 100}${now.month.toString().padLeft(2, '0')}';
+  final suffix = now.millisecondsSinceEpoch.toString().substring(7);
+  return '$prefix$suffix';
+}
+
 void main(List<String> args) {
   final tx = TransactionRecord(
     id: 'test',
-    invoiceNumber: '9482-A84F-912C',
-    customerName: 'Jamie Richardson',
-    customerPhone: '+1 (555) 012-3456',
+    invoiceNumber: LocalDbService_generateInvoiceIdStub(),
+    customerName: 'fouzi',
+    customerPhone: '9659394812',
     items: const [
       TransactionItem(
         productId: '1',
-        productName: 'Modern Desk Lamp - Matte Black',
-        price: 145.00,
-        quantity: 1,
-      ),
-      TransactionItem(
-        productId: '2',
-        productName: 'USB-C Braided Cable 2m',
-        price: 19.00,
-        quantity: 2,
-      ),
-      TransactionItem(
-        productId: '3',
-        productName: 'Leather Desk Pad - Obsidian',
-        price: 89.50,
+        productName: 'BOYS ETHNIC SET (NB - 1Y)',
+        price: 1070.00,
         quantity: 1,
       ),
     ],
-    subtotal: 272.50,
-    discountAmount: 10.00,
-    taxAmount: 21.80,
-    total: 284.30,
-    paymentMethod: 'Card',
-    createdAt: DateTime(2023, 10, 24, 14, 32, 5),
+    subtotal: 1070.00,
+    discountAmount: 107.00,
+    taxAmount: 48.15,
+    total: 1011.15,
+    paymentMethod: 'cash',
+    createdAt: DateTime.now(),
   );
 
   final bytes = ThermalPrinter.buildReceipt(
     tx,
-    storeName: 'Boutique Supply Co.',
-    storeAddress: '11th Cross, Thillainagar, Trichy - 620017',
-    storePhone: '+91 431 2765432',
-    storeGstin: '33AAAAAA0000A1Z5',
-    receiptFooter:
-        'Thank you for shopping with us.\nReturns accepted within 30 days with receipt.',
-    taxLabel: 'Tax',
-    taxRate: '8',
+    storeName: 'R3 Kids Boutique',
+    storeAddress: 'C-17, 3rd Cross, Thillai Nagar, Trichy - 620017',
+    storePhone: '+91 98006 46123, +91 63822 86970',
+    storeGstin: '',
+    receiptFooter: 'Thank you for your purchase!',
+    taxLabel: 'GST',
+    taxRate: '0',
     currencySymbol: '₹',
-    storeUpiId: 'boutique@upi',
+    storeUpiId: 'r3kids@upi',
   );
 
   stdout.writeln(_decode(bytes));

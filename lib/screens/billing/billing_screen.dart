@@ -8924,6 +8924,7 @@ class _BillingScreenState extends State<BillingScreen> {
           ElevatedButton(
             onPressed: () {
               cart.clearCart();
+              _pendingInvoiceNumber = null;
               Navigator.pop(context);
             },
             style: ElevatedButton.styleFrom(
@@ -8980,12 +8981,24 @@ class _BillingScreenState extends State<BillingScreen> {
         invoiceNumber: invoiceNumber,
       );
 
+  /// Invoice number for the bill currently being rung up. Generated the
+  /// first time the bill is printed and reused at checkout, so the number on
+  /// the printed receipt always matches the saved sale. Cleared when the
+  /// bill is closed or cleared.
+  String? _pendingInvoiceNumber;
+
   void _printCurrentBill(
     CartProvider cart, {
     String docType = 'Invoice',
     bool toPrinter = false,
-  }) =>
-      _printRecord(_snapshotCart(cart), docType: docType, toPrinter: toPrinter);
+  }) {
+    _pendingInvoiceNumber ??= LocalDbService.generateInvoiceId();
+    _printRecord(
+      _snapshotCart(cart, invoiceNumber: _pendingInvoiceNumber),
+      docType: docType,
+      toPrinter: toPrinter,
+    );
+  }
 
   void _showPrintBillDialog(CartProvider cart) {
     // Restore the toggles to however they were last left.
@@ -9593,7 +9606,10 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
             ElevatedButton(
               onPressed: () async {
-                final invNum = LocalDbService.generateInvoiceId();
+                // Reuse the number already printed on this bill, if any.
+                final invNum =
+                    _pendingInvoiceNumber ?? LocalDbService.generateInvoiceId();
+                _pendingInvoiceNumber = null;
                 final snapshot = _snapshotCart(cart, invoiceNumber: invNum);
                 final phone = cart.customerPhone;
                 Navigator.pop(ctx);
