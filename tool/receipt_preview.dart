@@ -3,8 +3,46 @@
 //   default: decode the byte stream and show a 48-column text preview
 //   --print: also send the raw bytes to the POS80 printer
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:billcat/models/transaction_record.dart';
 import 'package:billcat/services/thermal_printer.dart';
+
+/// Synthetic sample logo (rounded black box with two white stripes, like the
+/// model mockup) — exercises the ESC/POS raster path without needing
+/// dart:ui. In the app the real logo comes from Settings via
+/// decodeReceiptLogo.
+LogoBitmap sampleLogo() {
+  const w = 160, h = 64, r = 12;
+  final wb = (w + 7) ~/ 8;
+  final rows = Uint8List(wb * h);
+  bool outsideCorner(int x, int y, int cx, int cy) {
+    final dx = x - cx, dy = y - cy;
+    return dx * dx + dy * dy > r * r;
+  }
+
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      var black = true;
+      if (x < r && y < r && outsideCorner(x, y, r, r)) black = false;
+      if (x >= w - r && y < r && outsideCorner(x, y, w - r - 1, r)) {
+        black = false;
+      }
+      if (x < r && y >= h - r && outsideCorner(x, y, r, h - r - 1)) {
+        black = false;
+      }
+      if (x >= w - r &&
+          y >= h - r &&
+          outsideCorner(x, y, w - r - 1, h - r - 1)) {
+        black = false;
+      }
+      // Two white stripes.
+      if (y >= 20 && y <= 26 && x >= 24 && x <= w - 24) black = false;
+      if (y >= 38 && y <= 44 && x >= 24 && x <= w - 24) black = false;
+      if (black) rows[y * wb + (x >> 3)] |= 0x80 >> (x & 7);
+    }
+  }
+  return LogoBitmap(w, h, rows);
+}
 
 // Same format as LocalDbService.generateInvoiceId (which needs sqflite).
 String LocalDbService_generateInvoiceIdStub() {
@@ -47,6 +85,7 @@ void main(List<String> args) {
     taxRate: '0',
     currencySymbol: '₹',
     storeUpiId: 'r3kids@upi',
+    logo: sampleLogo(),
   );
 
   stdout.writeln(_decode(bytes));

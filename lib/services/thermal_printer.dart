@@ -24,10 +24,11 @@ class ThermalPrinter {
   // 80mm, font A: 48 characters per line.
   static const int width = 48;
 
-  // Item table columns: NAME | QTY | PRICE  (28 + 6 + 14 = 48).
-  static const int _nameW = 28;
-  static const int _qtyW = 6;
-  static const int _priceW = 14;
+  // Item table columns: NAME | QTY | TAX% | PRICE  (24 + 5 + 6 + 13 = 48).
+  static const int _nameW = 24;
+  static const int _qtyW = 5;
+  static const int _taxW = 6;
+  static const int _priceW = 13;
 
   static const _esc = 0x1B;
   static const _gs = 0x1D;
@@ -181,22 +182,48 @@ class ThermalPrinter {
     }
 
     // ── Item table: ITEM | QTY | PRICE ───────────────────────────────────
+    // Each line is shown TAX-INCLUSIVE (the item's GST share folded into
+    // its price) and no separate GST row is printed — display only, the
+    // charged totals are untouched. Items sold before per-item rates were
+    // recorded (taxPercent 0) fall back to the bill's effective rate.
+    final fallbackRate =
+        (tx.taxAmount > 0 && (tx.subtotal - tx.discountAmount) > 0)
+        ? tx.taxAmount / (tx.subtotal - tx.discountAmount) * 100
+        : 0.0;
+    double lineInclusive(TransactionItem i) {
+      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+      return i.total * (1 + rate / 100);
+    }
+
+    String pct(double rate) {
+      if (rate <= 0) return '0%';
+      return (rate - rate.roundToDouble()).abs() < 0.05
+          ? '${rate.round()}%'
+          : '${rate.toStringAsFixed(1)}%';
+    }
+
     b.addAll([_esc, 0x21, 0x08]); // bold
     _line(
       b,
       'ITEM'.padRight(_nameW) +
           'QTY'.padLeft(4).padRight(_qtyW) +
+          'TAX%'.padLeft(_taxW) +
           'PRICE'.padLeft(_priceW),
     );
     b.addAll([_esc, 0x21, 0x00]);
     b.add(_lf);
+    var inclusiveSubtotal = 0.0;
     for (final i in tx.items) {
+      final incl = lineInclusive(i);
+      inclusiveSubtotal += incl;
+      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
       final nameLines = _wrap(i.displayName, _nameW);
       _line(
         b,
         nameLines.first.padRight(_nameW) +
             '${i.quantity}'.padLeft(4).padRight(_qtyW) +
-            money(i.total).padLeft(_priceW),
+            pct(rate).padLeft(_taxW) +
+            money(incl).padLeft(_priceW),
       );
       for (final l in nameLines.skip(1)) {
         _line(b, l);
@@ -205,28 +232,10 @@ class ThermalPrinter {
     }
     _sep(b);
 
-    // ── Totals ───────────────────────────────────────────────────────────
-    _line(b, _row('Subtotal', money(tx.subtotal)));
+    // ── Totals (lines already tax-inclusive — no separate GST row) ───────
+    _line(b, _row('Subtotal', money(inclusiveSubtotal)));
     if (tx.discountAmount > 0) {
       _line(b, _row('Discount', '-${money(tx.discountAmount)}'));
-    }
-    if (tx.taxAmount > 0) {
-      // The passed taxRate is the store-wide default, which is wrong when
-      // the tax came from per-product rates (a 0% store rate printed
-      // "GST (0%)" next to a real tax amount). Derive the effective rate
-      // from the bill's own numbers instead.
-      var rateStr = taxRate;
-      final base = tx.subtotal - tx.discountAmount;
-      if (base > 0) {
-        final r = tx.taxAmount / base * 100;
-        rateStr = (r - r.roundToDouble()).abs() < 0.05
-            ? r.round().toString()
-            : r.toStringAsFixed(1);
-      }
-      final label = rateStr.isNotEmpty && rateStr != '0'
-          ? '$taxLabel ($rateStr%)'
-          : taxLabel;
-      _line(b, _row(label, money(tx.taxAmount)));
     }
     _sep(b);
 

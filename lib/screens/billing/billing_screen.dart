@@ -16798,6 +16798,7 @@ end tell
     final rows = txList.where((t) {
       if (q.isEmpty) return true;
       return (t.customerName ?? '').toLowerCase().contains(q) ||
+          (t.invoiceNumber?.toLowerCase().contains(q) ?? false) ||
           t.items.any((i) => i.productName.toLowerCase().contains(q));
     }).toList();
 
@@ -17377,7 +17378,7 @@ end tell
                                 color: AppColors.textDark,
                               ),
                               decoration: InputDecoration(
-                                hintText: 'Search customer, items...',
+                                hintText: 'Search invoice, customer, items...',
                                 hintStyle: GoogleFonts.inter(
                                   fontSize: 12,
                                   color: AppColors.textMuted,
@@ -17453,6 +17454,8 @@ end tell
                     final inv = t.id.substring(0, 6).toUpperCase();
                     return (t.customerName?.toLowerCase().contains(q) ??
                             false) ||
+                        (t.invoiceNumber?.toLowerCase().contains(q) ??
+                            false) ||
                         t.items.any(
                           (i) => i.productName.toLowerCase().contains(q),
                         ) ||
@@ -17463,7 +17466,11 @@ end tell
                   return filtered.asMap().entries.map((entry) {
                     final idx = entry.key;
                     final t = entry.value;
-                    final invoiceNo = '#${t.id.substring(0, 6).toUpperCase()}';
+                    // Show the real invoice number (as printed on receipts);
+                    // fall back to the short id for older sales without one.
+                    final invoiceNo = t.invoiceNumber?.isNotEmpty == true
+                        ? t.invoiceNumber!
+                        : '#${t.id.substring(0, 6).toUpperCase()}';
                     final itemCount = t.items.fold(0, (s, i) => s + i.quantity);
                     final customer = (t.customerName?.isNotEmpty == true)
                         ? t.customerName!
@@ -17585,7 +17592,9 @@ end tell
     final h = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
     final timeStr =
         '$h:${dt.minute.toString().padLeft(2, '0')} ${dt.hour < 12 ? 'AM' : 'PM'}';
-    final invoiceNo = '#${t.id.substring(0, 6).toUpperCase()}';
+    final invoiceNo = t.invoiceNumber?.isNotEmpty == true
+        ? t.invoiceNumber!
+        : '#${t.id.substring(0, 6).toUpperCase()}';
 
     showDialog(
       context: context,
