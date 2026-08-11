@@ -131,6 +131,11 @@ class CartProvider extends ChangeNotifier {
   void setQuantity(String productId, int quantity, {int stock = 999999}) {
     final i = _items.indexWhere((e) => e.lineKey == productId);
     if (i < 0) return;
+    // clamp throws when the upper bound is below the lower one, so a line
+    // whose product has run down to zero (or holds a bad negative stock)
+    // would kill the quantity field. Reject the edit as before rather than
+    // capping to 1, which would silently rewrite a billed quantity.
+    if (stock < 1) return;
     final clamped = quantity.clamp(1, stock);
     _items[i].quantity = clamped;
     notifyListeners();

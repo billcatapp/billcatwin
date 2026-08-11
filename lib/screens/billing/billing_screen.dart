@@ -9613,7 +9613,21 @@ class _BillingScreenState extends State<BillingScreen> {
                 final snapshot = _snapshotCart(cart, invoiceNumber: invNum);
                 final phone = cart.customerPhone;
                 Navigator.pop(ctx);
-                await cart.checkout(invoiceNumber: invNum);
+                try {
+                  await cart.checkout(invoiceNumber: invNum);
+                } catch (e) {
+                  // The checkout is atomic, so nothing was saved: keep the
+                  // cart and the invoice number intact for a clean retry and
+                  // tell the user, instead of leaving a dead-looking button.
+                  _pendingInvoiceNumber = invNum;
+                  // Guard on the State, not on `context`: that one belongs to
+                  // the cart's Consumer, which is unmounted whenever the view
+                  // swaps (opening Settings mid-checkout) — and dropping the
+                  // reason is the exact silence this fix exists to remove.
+                  if (!mounted) return;
+                  _showToast('Could not save the bill: $e', isError: true);
+                  return;
+                }
                 _customerNameCtrl.clear();
                 _customerPhoneCtrl.clear();
                 _loadProducts();
@@ -20333,10 +20347,11 @@ class _ProductCardState extends State<_ProductCard> {
                                 widget.product.id,
                               )
                             : cart.quantityInCart(widget.product.id);
-                        final remaining = (totalStock - inCart).clamp(
-                          0,
-                          totalStock,
-                        );
+                        // Plain subtraction, not clamp: clamp throws when the
+                        // stored stock is negative, which would fail the whole
+                        // tile's build and leave it dead to taps.
+                        final left = totalStock - inCart;
+                        final remaining = left < 0 ? 0 : left;
                         final outOfStock = remaining == 0;
                         return Stack(
                           children: [
@@ -20665,10 +20680,10 @@ class _VariantCardState extends State<_VariantCard> {
       widget.product.id,
       widget.variant.id,
     );
-    final remaining = (widget.variant.stock - inCart).clamp(
-      0,
-      widget.variant.stock,
-    );
+    // See _ProductCard: clamp would throw on a negative stored stock and take
+    // the whole card's build down with it.
+    final left = widget.variant.stock - inCart;
+    final remaining = left < 0 ? 0 : left;
     final outOfStock = remaining == 0;
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0.0, end: 1.0),

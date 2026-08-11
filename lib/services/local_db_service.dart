@@ -39,6 +39,80 @@ class LocalDbService {
 
   static Future<Database> _open(String userId) async {
     final dbPath = await _appSupportPath();
+    final database = await _openVersioned(dbPath, userId);
+    await _healSchema(database);
+    return database;
+  }
+
+  /// Columns added by migrations, and the definition to restore them with.
+  /// Every ALTER in [_openVersioned] is wrapped in `catch (_) {}` so a
+  /// migration that fails once (a second app instance holding the file lock
+  /// during an update is the usual cause) is swallowed while the version
+  /// still stamps as current — leaving the column missing forever. Reads
+  /// tolerate that, but every write does `rev = rev + 1`, so checkout,
+  /// delete and edit would fail on that device from then on with no message.
+  /// [_healSchema] re-adds anything missing on each open.
+  static const Map<String, Map<String, String>> _expectedColumns = {
+    'products': {
+      'deleted': 'INTEGER NOT NULL DEFAULT 0',
+      'buying_price': 'REAL NOT NULL DEFAULT 0',
+      'tax_percent': 'REAL NOT NULL DEFAULT 0',
+      'description': 'TEXT NOT NULL DEFAULT ""',
+      'barcode_no': "TEXT NOT NULL DEFAULT ''",
+      'dealer_name': "TEXT NOT NULL DEFAULT ''",
+      'purchase_date': "TEXT NOT NULL DEFAULT ''",
+      'rev': 'INTEGER NOT NULL DEFAULT 0',
+    },
+    'product_variants': {
+      'deleted': 'INTEGER NOT NULL DEFAULT 0',
+      'rev': 'INTEGER NOT NULL DEFAULT 0',
+    },
+    'transactions': {
+      'invoice_number': 'TEXT',
+      'deleted': 'INTEGER NOT NULL DEFAULT 0',
+      'rev': 'INTEGER NOT NULL DEFAULT 0',
+    },
+    'customers': {
+      'address': 'TEXT',
+      'deleted': 'INTEGER NOT NULL DEFAULT 0',
+      'rev': 'INTEGER NOT NULL DEFAULT 0',
+    },
+    'categories': {
+      'deleted': 'INTEGER NOT NULL DEFAULT 0',
+      'rev': 'INTEGER NOT NULL DEFAULT 0',
+    },
+  };
+
+  static Future<void> _healSchema(Database db) async {
+    // Idempotent: only ever creates what is absent, never rewrites data.
+    try {
+      await db.execute(_productVariantsTableSql);
+    } catch (_) {}
+    for (final table in _expectedColumns.entries) {
+      final Set<String> present;
+      try {
+        present = {
+          for (final r in await db.rawQuery('PRAGMA table_info(${table.key})'))
+            r['name'] as String,
+        };
+      } catch (_) {
+        continue;
+      }
+      // Empty means the table itself is absent; that is onCreate's job, and
+      // ALTERing it here would only throw.
+      if (present.isEmpty) continue;
+      for (final column in table.value.entries) {
+        if (present.contains(column.key)) continue;
+        try {
+          await db.execute(
+            'ALTER TABLE ${table.key} ADD COLUMN ${column.key} ${column.value}',
+          );
+        } catch (_) {}
+      }
+    }
+  }
+
+  static Future<Database> _openVersioned(String dbPath, String userId) async {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
       version: 15,
@@ -934,55 +1008,77 @@ class LocalDbService {
 
   // ── Transactions ──────────────────────────────────────────────────────────
 
+  /// Stock left after selling [quantity] of a row currently holding [raw].
+  /// Never below zero, and tolerant of rows that already hold a bad value
+  /// (negative, REAL or NULL) — those would otherwise abort a checkout that
+  /// had already written its sale row.
+  static int _stockAfterSale(Object? raw, int quantity) {
+    final current = (raw is num) ? raw.toInt() : 0;
+    final updated = current - quantity;
+    return updated < 0 ? 0 : updated;
+  }
+
+  /// Saves a completed sale: the transaction row, the stock deductions and
+  /// the customer auto-save are one atomic unit, so a failure part-way
+  /// through leaves NOTHING behind. Previously the sale row committed first
+  /// and a later failure stranded a phantom bill that still synced to the
+  /// cloud while the on-screen cart never cleared.
   static Future<void> insertTransaction(TransactionRecord t) async {
     final database = await db;
-    await database.insert(
-      'transactions',
-      t.toMap(),
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-    // Deduct stock for each sold item and mark product/variant unsynced for cloud push
-    for (final item in t.items) {
-      if (item.variantId != null) {
-        final rows = await database.query(
-          'product_variants',
+    await database.transaction((txn) async {
+      await txn.insert(
+        'transactions',
+        t.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      // Deduct stock for each sold item and mark product/variant unsynced for cloud push
+      for (final item in t.items) {
+        if (item.variantId != null) {
+          final rows = await txn.query(
+            'product_variants',
+            where: 'id = ?',
+            whereArgs: [item.variantId],
+            limit: 1,
+          );
+          if (rows.isNotEmpty) {
+            final updated = _stockAfterSale(
+              rows.first['stock'],
+              item.quantity,
+            );
+            await txn.rawUpdate(
+              'UPDATE product_variants SET stock = ?, synced = 0, '
+              'rev = rev + 1 WHERE id = ?',
+              [updated, item.variantId],
+            );
+          }
+          continue;
+        }
+        final rows = await txn.query(
+          'products',
           where: 'id = ?',
-          whereArgs: [item.variantId],
+          whereArgs: [item.productId],
           limit: 1,
         );
         if (rows.isNotEmpty) {
-          final current = rows.first['stock'] as int;
-          final updated = (current - item.quantity).clamp(0, current);
-          await database.rawUpdate(
-            'UPDATE product_variants SET stock = ?, synced = 0, '
-            'rev = rev + 1 WHERE id = ?',
-            [updated, item.variantId],
+          final updated = _stockAfterSale(rows.first['stock'], item.quantity);
+          await txn.rawUpdate(
+            'UPDATE products SET stock = ?, synced = 0, rev = rev + 1 '
+            'WHERE id = ?',
+            [updated, item.productId],
           );
         }
-        continue;
       }
-      final rows = await database.query(
-        'products',
-        where: 'id = ?',
-        whereArgs: [item.productId],
-        limit: 1,
-      );
-      if (rows.isNotEmpty) {
-        final current = rows.first['stock'] as int;
-        final updated = (current - item.quantity).clamp(0, current);
-        await database.rawUpdate(
-          'UPDATE products SET stock = ?, synced = 0, rev = rev + 1 '
-          'WHERE id = ?',
-          [updated, item.productId],
+      if (t.customerName != null && t.customerName!.isNotEmpty) {
+        // Must go through the executor-scoped helper: calling the public
+        // method here would grab the outer database handle and deadlock
+        // behind this very transaction.
+        await _upsertCustomerByPhone(
+          txn,
+          name: t.customerName!,
+          phone: t.customerPhone,
         );
       }
-    }
-    if (t.customerName != null && t.customerName!.isNotEmpty) {
-      await upsertCustomerByPhone(
-        name: t.customerName!,
-        phone: t.customerPhone,
-      );
-    }
+    });
   }
 
   static Future<void> insertTransactionsSynced(
@@ -1204,10 +1300,26 @@ class LocalDbService {
     String? address,
   }) async {
     final database = await db;
+    await _upsertCustomerByPhone(
+      database,
+      name: name,
+      phone: phone,
+      address: address,
+    );
+  }
+
+  /// Body of [upsertCustomerByPhone], scoped to whichever executor is passed
+  /// so it can also run inside an open transaction (see [insertTransaction]).
+  static Future<void> _upsertCustomerByPhone(
+    DatabaseExecutor exec, {
+    required String name,
+    String? phone,
+    String? address,
+  }) async {
     if (phone != null && phone.isNotEmpty) {
       // Only live rows block a re-add; a pending-delete tombstone with the
       // same phone must not keep the customer "deleted" forever.
-      final existing = await database.query(
+      final existing = await exec.query(
         'customers',
         where: 'phone = ? AND deleted = 0',
         whereArgs: [phone],
@@ -1215,7 +1327,7 @@ class LocalDbService {
       );
       if (existing.isNotEmpty) return;
     }
-    await database.insert('customers', {
+    await exec.insert('customers', {
       'id': const Uuid().v4(),
       'name': name,
       'phone': phone ?? '',
