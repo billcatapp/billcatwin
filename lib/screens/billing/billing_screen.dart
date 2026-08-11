@@ -19703,13 +19703,19 @@ end tell
     return Dialog(
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       backgroundColor: Colors.white,
-      child: SizedBox(
-        width: 320,
-        child: Padding(
-          padding: const EdgeInsets.all(32),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
+      // Type the passcode instead of tapping it: the number pad stays for
+      // touch tills, but a keyboard is faster on a counter PC. Safe to grab
+      // the keys — the global scan handler stands down while a dialog is up.
+      child: Focus(
+        autofocus: true,
+        onKeyEvent: (_, event) => _passcodeKey(event, digits),
+        child: SizedBox(
+          width: 320,
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
               Container(
                 width: 56,
                 height: 56,
@@ -19835,11 +19841,53 @@ end tell
                   ),
                 ),
               ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
     );
+  }
+
+  /// Keyboard entry for the passcode dialogs: digits fill the dots, backspace
+  /// clears the last one. The four-digit check runs off [digits] itself, so
+  /// typing the last digit submits exactly like tapping it does.
+  KeyEventResult _passcodeKey(KeyEvent event, ValueNotifier<String> digits) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.backspace) {
+      if (digits.value.isNotEmpty) {
+        digits.value = digits.value.substring(0, digits.value.length - 1);
+      }
+      return KeyEventResult.handled;
+    }
+    // character covers the number row; the numpad reports its own keys and
+    // can arrive with a null character depending on the layout.
+    var typed = event.character;
+    if (typed == null || typed.isEmpty) {
+      final numpad = <LogicalKeyboardKey, String>{
+        LogicalKeyboardKey.numpad0: '0',
+        LogicalKeyboardKey.numpad1: '1',
+        LogicalKeyboardKey.numpad2: '2',
+        LogicalKeyboardKey.numpad3: '3',
+        LogicalKeyboardKey.numpad4: '4',
+        LogicalKeyboardKey.numpad5: '5',
+        LogicalKeyboardKey.numpad6: '6',
+        LogicalKeyboardKey.numpad7: '7',
+        LogicalKeyboardKey.numpad8: '8',
+        LogicalKeyboardKey.numpad9: '9',
+      };
+      typed = numpad[event.logicalKey];
+    }
+    if (typed == null ||
+        typed.length != 1 ||
+        typed.codeUnitAt(0) < 0x30 ||
+        typed.codeUnitAt(0) > 0x39) {
+      return KeyEventResult.ignored;
+    }
+    if (digits.value.length < 4) digits.value = digits.value + typed;
+    return KeyEventResult.handled;
   }
 
   Widget _txDetailRow(String label, String value, {Color? valueColor}) =>
