@@ -1026,6 +1026,37 @@ class LocalDbService {
   static Future<void> insertTransaction(TransactionRecord t) async {
     final database = await db;
     await database.transaction((txn) async {
+      await _writeTransactionRow(txn, t);
+      if (t.customerName != null && t.customerName!.isNotEmpty) {
+        // Must go through the executor-scoped helper: calling the public
+        // method here would grab the outer database handle and deadlock
+        // behind this very transaction.
+        await _upsertCustomerByPhone(
+          txn,
+          name: t.customerName!,
+          phone: t.customerPhone,
+        );
+      }
+    });
+  }
+
+  /// Records a return or exchange. Identical atomic write to a sale, except
+  /// the record's item quantities are negative, so the same arithmetic puts
+  /// the goods back into stock instead of taking them out. The customer is
+  /// not re-saved: a return is always raised against an existing bill.
+  static Future<void> insertReturn(TransactionRecord t) async {
+    final database = await db;
+    await database.transaction((txn) async {
+      await _writeTransactionRow(txn, t);
+    });
+  }
+
+  /// The row write plus its stock movements, scoped to one transaction.
+  static Future<void> _writeTransactionRow(
+    DatabaseExecutor txn,
+    TransactionRecord t,
+  ) async {
+    {
       await txn.insert(
         'transactions',
         t.toMap(),
@@ -1068,17 +1099,7 @@ class LocalDbService {
           );
         }
       }
-      if (t.customerName != null && t.customerName!.isNotEmpty) {
-        // Must go through the executor-scoped helper: calling the public
-        // method here would grab the outer database handle and deadlock
-        // behind this very transaction.
-        await _upsertCustomerByPhone(
-          txn,
-          name: t.customerName!,
-          phone: t.customerPhone,
-        );
-      }
-    });
+    }
   }
 
   static Future<void> insertTransactionsSynced(

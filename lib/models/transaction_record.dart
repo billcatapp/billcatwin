@@ -83,6 +83,31 @@ class TransactionRecord {
     this.synced = false,
   });
 
+  /// Prefixes that mark a record as reversing an earlier bill. Returns are
+  /// stored as their own record with negative amounts and quantities — no
+  /// extra column — so they net off in every total that already sums sales.
+  static const String returnPrefix = 'RTN-';
+  static const String exchangePrefix = 'EXC-';
+
+  /// The invoice this record reverses, or null for an ordinary sale.
+  String? get returnOfInvoice {
+    final n = invoiceNumber;
+    if (n == null) return null;
+    if (n.startsWith(returnPrefix)) return n.substring(returnPrefix.length);
+    if (n.startsWith(exchangePrefix)) return n.substring(exchangePrefix.length);
+    return null;
+  }
+
+  /// Judged by the prefix alone: an ordinary sale discounted past zero also
+  /// carries a negative total, and must not be mistaken for a return.
+  bool get isReturn => returnOfInvoice != null;
+
+  bool get isExchange => invoiceNumber?.startsWith(exchangePrefix) ?? false;
+
+  /// 'EXCHANGE' / 'RETURN' for reversing records, null for a normal sale.
+  String? get reversalLabel =>
+      !isReturn ? null : (isExchange ? 'EXCHANGE' : 'RETURN');
+
   Map<String, dynamic> toMap() => {
     'id': id,
     'invoice_number': invoiceNumber,

@@ -1051,7 +1051,9 @@ class _BillingScreenState extends State<BillingScreen> {
           map[item.productName] = (e.$1 + item.quantity, e.$2 + item.total);
         }
       }
-      final sorted = map.entries.toList()
+      // Returns carry negative quantities so a product nets down correctly,
+      // but one that only ever came back is not a top seller.
+      final sorted = map.entries.where((e) => e.value.$1 > 0).toList()
         ..sort((a, b) => b.value.$1.compareTo(a.value.$1));
       return sorted
           .take(5)
@@ -1096,23 +1098,25 @@ class _BillingScreenState extends State<BillingScreen> {
     setState(() {
       _dashSales = sales;
       _dashTxCount = txCount;
-      _dashItemsSold = items;
+      // Item counts net returns off, which is right when both fall in the
+      // period — but a return of an older bill must not read as a minus count.
+      _dashItemsSold = items < 0 ? 0 : items;
       _dashAvgOrder = txCount > 0 ? sales / txCount : 0;
       _dashYestSales = ySales;
       _dashYestTxCount = yTxCount;
-      _dashYestItems = yItems;
+      _dashYestItems = yItems < 0 ? 0 : yItems;
       _dashYestAvg = yTxCount > 0 ? ySales / yTxCount : 0;
       _dashWeekSales = weekSales;
       _dashMonthSales = monthSales;
       _dashYearSales = yearSales;
       _dashWeekTxCount = weekTx.length;
-      _dashWeekItems = weekItems;
+      _dashWeekItems = weekItems < 0 ? 0 : weekItems;
       _dashWeekAvg = weekTx.isNotEmpty ? weekSales / weekTx.length : 0;
       _dashMonthTxCount = monthTx.length;
-      _dashMonthItems = monthItems;
+      _dashMonthItems = monthItems < 0 ? 0 : monthItems;
       _dashMonthAvg = monthTx.isNotEmpty ? monthSales / monthTx.length : 0;
       _dashYearTxCount = yearTx.length;
-      _dashYearItems = yearItems;
+      _dashYearItems = yearItems < 0 ? 0 : yearItems;
       _dashYearAvg = yearTx.isNotEmpty ? yearSales / yearTx.length : 0;
       _chartBarsToday = chartToday;
       _chartBarsWeek = chartWeek;
@@ -1468,6 +1472,12 @@ class _BillingScreenState extends State<BillingScreen> {
             _utilitiesDropdownTab(),
           ],
           const Spacer(),
+          _topBarIconBtn(
+            Icons.assignment_return_outlined,
+            'Return / Exchange',
+            _showReturnDialog,
+          ),
+          const SizedBox(width: 8),
           // Lock icon only shown when staff access control is enabled
           if (_ownerLockEnabled) ...[
             _topBarIconBtn(
@@ -8986,6 +8996,1096 @@ class _BillingScreenState extends State<BillingScreen> {
   /// the printed receipt always matches the saved sale. Cleared when the
   /// bill is closed or cleared.
   String? _pendingInvoiceNumber;
+
+  // ── Return / exchange ────────────────────────────────────────────────────
+  //
+  // A return is saved as its own bill with negative amounts and negative item
+  // quantities, numbered RTN-/EXC- after the bill it reverses. That makes the
+  // stock arithmetic put the goods back with no new code, nets the money off
+  // in every existing total, and needs no new database column — so it syncs
+  // to the other tills through the engine already in place. The whole
+  // exchange — goods back, goods out, and the difference — is settled inside
+  // the one dialog, so nothing is ever carried into the ordinary cart.
+
+  /// Invoice reference a reversal points back at.
+  String _reversalBaseRef(TransactionRecord t) =>
+      t.invoiceNumber?.isNotEmpty == true
+      ? t.invoiceNumber!
+      : t.id.substring(0, 6).toUpperCase();
+
+  /// Quantity of each line of [original] that earlier returns already took
+  /// back, keyed the same way the cart keys lines. Stops the same item being
+  /// returned twice and inflating stock.
+  Map<String, int> _alreadyReturned(
+    TransactionRecord original,
+    List<TransactionRecord> all,
+  ) {
+    final ref = _reversalBaseRef(original);
+    final out = <String, int>{};
+    for (final r in all) {
+      if (r.returnOfInvoice != ref) continue;
+      for (final i in r.items) {
+        final key = '${i.productId}::${i.variantId ?? ''}';
+        out[key] = (out[key] ?? 0) + i.quantity.abs();
+      }
+    }
+    return out;
+  }
+
+  /// Builds the reversing record for [qtyByIndex] of [original]'s lines.
+  /// Discount and tax come back in the same proportion they were charged, so
+  /// a partial return refunds exactly what that part of the bill collected.
+  TransactionRecord _buildReversalRecord({
+    required TransactionRecord original,
+    required Map<int, int> qtyByIndex,
+    required String paymentMethod,
+    required bool exchange,
+  }) {
+    final origSub = original.subtotal;
+    final discountFactor = origSub > 0
+        ? (origSub - original.discountAmount) / origSub
+        : 1.0;
+    // Bills predating per-item rates carry taxPercent 0 on EVERY line, and
+    // only those need the blended fallback. Once any line carries its own
+    // rate, a stored 0 means the line really was sold exempt — the cart skips
+    // rate <= 0 when charging — so it has to come back exempt too, or a
+    // partial return refunds tax that was never collected on it.
+    final anyLineRate = original.items.any((l) => l.taxPercent > 0);
+    final taxedBase = origSub - original.discountAmount;
+    final fallbackRate = (!anyLineRate && taxedBase > 0)
+        ? original.taxAmount / taxedBase * 100
+        : 0.0;
+
+    final items = <TransactionItem>[];
+    var sub = 0.0;
+    // Each line's share of the tax, weighted by its own rate, for the lines
+    // coming back and for the whole bill. Scaling one against the other means
+    // a full return reproduces the tax the bill actually charged to the paisa,
+    // even when the lines carry different rates, while a partial return takes
+    // back only what those lines contributed.
+    var taxWeightReturned = 0.0;
+    var taxWeightAll = 0.0;
+    for (var i = 0; i < original.items.length; i++) {
+      final line = original.items[i];
+      final rate = line.taxPercent > 0 ? line.taxPercent : fallbackRate;
+      taxWeightAll += line.price * line.quantity * discountFactor * rate / 100;
+      final qty = qtyByIndex[i] ?? 0;
+      if (qty <= 0) continue;
+      final gross = line.price * qty;
+      sub += gross;
+      taxWeightReturned += gross * discountFactor * rate / 100;
+      items.add(
+        TransactionItem(
+          productId: line.productId,
+          productName: line.productName,
+          description: line.description,
+          price: line.price,
+          // Negative quantity is what puts the stock back.
+          quantity: -qty,
+          variantId: line.variantId,
+          variantLabel: line.variantLabel,
+          taxPercent: line.taxPercent,
+        ),
+      );
+    }
+    final tax = taxWeightAll > 0
+        ? original.taxAmount * (taxWeightReturned / taxWeightAll)
+        : 0.0;
+    final discount = origSub > 0
+        ? original.discountAmount * (sub / origSub)
+        : 0.0;
+    final prefix = exchange
+        ? TransactionRecord.exchangePrefix
+        : TransactionRecord.returnPrefix;
+    return TransactionRecord(
+      id: const Uuid().v4(),
+      invoiceNumber: '$prefix${_reversalBaseRef(original)}',
+      customerName: original.customerName,
+      customerPhone: original.customerPhone,
+      items: items,
+      subtotal: -sub,
+      discountAmount: -discount,
+      taxAmount: -tax,
+      total: -(sub - discount + tax),
+      paymentMethod: paymentMethod,
+      createdAt: DateTime.now(),
+    );
+  }
+
+  Future<void> _saveReversal(TransactionRecord record) async {
+    await LocalDbService.insertReturn(record);
+    await ConnectivityService.instance.refreshUnsyncedCount();
+    if (ConnectivityService.instance.isOnline) {
+      ConnectivityService.instance.syncNow();
+    }
+    _loadProducts();
+    _loadDashboardData();
+  }
+
+  /// Prices the goods handed over in an exchange exactly as the cart would:
+  /// each line at its own rate, falling back to the store rate, no discount.
+  TransactionRecord _buildExchangeSale(
+    List<_ExchangeAdd> adds, {
+    required String paymentMethod,
+    String? invoiceNumber,
+    String? customerName,
+    String? customerPhone,
+  }) {
+    final storeRate = double.tryParse(_taxRateDisplay) ?? 0;
+    final items = <TransactionItem>[];
+    var sub = 0.0;
+    var tax = 0.0;
+    for (final a in adds) {
+      final gross = a.price * a.qty;
+      final rate = a.product.taxPercent > 0 ? a.product.taxPercent : storeRate;
+      sub += gross;
+      if (rate > 0) tax += gross * rate / 100;
+      items.add(
+        TransactionItem(
+          productId: a.product.id,
+          productName: a.product.name,
+          description: a.product.description,
+          price: a.price,
+          quantity: a.qty,
+          variantId: a.variant?.id,
+          variantLabel: a.variant?.label,
+          taxPercent: rate,
+        ),
+      );
+    }
+    return TransactionRecord(
+      id: const Uuid().v4(),
+      invoiceNumber: invoiceNumber,
+      customerName: customerName,
+      customerPhone: customerPhone,
+      items: items,
+      subtotal: sub,
+      discountAmount: 0,
+      taxAmount: tax,
+      total: sub + tax,
+      paymentMethod: paymentMethod,
+      createdAt: DateTime.now(),
+    );
+  }
+
+  /// Every sellable line, base products and variants alike, for the
+  /// add-a-product search inside the return dialog.
+  List<_ExchangeAdd> _sellableMatches(String raw) {
+    final q = raw.trim().toLowerCase();
+    if (q.isEmpty) return const [];
+    final out = <_ExchangeAdd>[];
+    for (final p in _products) {
+      final variants = _variantsByProduct[p.id] ?? const <ProductVariant>[];
+      if (variants.isEmpty) {
+        if (p.name.toLowerCase().contains(q) ||
+            p.sku.toLowerCase().contains(q) ||
+            (p.barcodeNo.isNotEmpty && p.barcodeNo.toLowerCase() == q)) {
+          out.add(_ExchangeAdd(product: p));
+        }
+        continue;
+      }
+      for (final v in variants) {
+        if (p.name.toLowerCase().contains(q) ||
+            v.label.toLowerCase().contains(q) ||
+            v.sku.toLowerCase().contains(q) ||
+            (v.barcodeNo.isNotEmpty && v.barcodeNo.toLowerCase() == q)) {
+          out.add(_ExchangeAdd(product: p, variant: v));
+        }
+      }
+    }
+    return out.take(6).toList();
+  }
+
+  /// An exact barcode hit, so a scanner gun can add straight off Enter.
+  _ExchangeAdd? _scanMatch(String raw) {
+    final code = raw.trim();
+    if (code.isEmpty) return null;
+    for (final p in _products) {
+      final variants = _variantsByProduct[p.id] ?? const <ProductVariant>[];
+      for (final v in variants) {
+        if (v.barcodeNo.isNotEmpty && v.barcodeNo == code) {
+          return _ExchangeAdd(product: p, variant: v);
+        }
+      }
+      if (variants.isEmpty && p.barcodeNo.isNotEmpty && p.barcodeNo == code) {
+        return _ExchangeAdd(product: p);
+      }
+    }
+    return null;
+  }
+
+  Future<void> _showReturnDialog() async {
+    final all = await LocalDbService.getTransactions();
+    if (!mounted) return;
+    // Only real sales can be returned — never a return itself.
+    final sales = all.where((t) => !t.isReturn).toList();
+
+    var query = '';
+    TransactionRecord? picked;
+    // Line index -> 'return' or 'exchange'. Absent means "keeping it".
+    var mode = <int, String>{};
+    var cap = <int, int>{};
+    final adds = <_ExchangeAdd>[];
+    final addCtrl = TextEditingController();
+    var addQuery = '';
+    var payMethod = 'cash';
+    var busy = false;
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          Map<int, int> selectedQty() => {
+            for (final e in mode.entries)
+              if ((cap[e.key] ?? 0) > 0) e.key: cap[e.key]!,
+          };
+
+          TransactionRecord? reversalOf(TransactionRecord bill) {
+            final q = selectedQty();
+            if (q.isEmpty) return null;
+            return _buildReversalRecord(
+              original: bill,
+              qtyByIndex: q,
+              paymentMethod: payMethod,
+              // Anything handed back out makes this an exchange.
+              exchange: adds.isNotEmpty ||
+                  mode.values.any((m) => m == 'exchange'),
+            );
+          }
+
+          final returningTotal = picked == null
+              ? 0.0
+              : (reversalOf(picked!)?.total.abs() ?? 0.0);
+          final newSale = adds.isEmpty
+              ? null
+              : _buildExchangeSale(adds, paymentMethod: payMethod);
+          final newTotal = newSale?.total ?? 0.0;
+          final difference = newTotal - returningTotal;
+          final collecting = difference > 0;
+          final nothingChosen = returningTotal <= 0 && adds.isEmpty;
+
+          void selectBill(TransactionRecord t) {
+            final done = _alreadyReturned(t, all);
+            final caps = <int, int>{};
+            for (var i = 0; i < t.items.length; i++) {
+              final line = t.items[i];
+              final key = '${line.productId}::${line.variantId ?? ''}';
+              final left = line.quantity - (done[key] ?? 0);
+              caps[i] = left < 0 ? 0 : left;
+            }
+            setLocal(() {
+              picked = t;
+              cap = caps;
+              mode = {};
+              adds.clear();
+              payMethod = const {
+                'cash': 'cash',
+                'card': 'card',
+                'upi': 'upi',
+              }[t.paymentMethod] ??
+                  'cash';
+            });
+          }
+
+          void addLine(_ExchangeAdd a) {
+            final i = adds.indexWhere((e) => e.key == a.key);
+            setLocal(() {
+              if (i >= 0) {
+                adds[i].qty++;
+              } else {
+                adds.add(a);
+              }
+              addCtrl.clear();
+              addQuery = '';
+            });
+          }
+
+          /// Builds the receipt for what the customer walks out with: the new
+          /// goods when there are any, otherwise the returned ones.
+          TransactionRecord? receiptRecord() {
+            if (picked == null) return null;
+            if (adds.isNotEmpty) {
+              return _buildExchangeSale(
+                adds,
+                paymentMethod: payMethod,
+                invoiceNumber: LocalDbService.generateInvoiceId(),
+                customerName: picked!.customerName,
+                customerPhone: picked!.customerPhone,
+              );
+            }
+            return reversalOf(picked!);
+          }
+
+          Future<void> complete() async {
+            if (busy || picked == null || nothingChosen) return;
+            setLocal(() => busy = true);
+            try {
+              // Re-check the allowance against live data: another till (or
+              // another dialog) may have returned these lines meanwhile.
+              final fresh = await LocalDbService.getTransactions();
+              final done = _alreadyReturned(picked!, fresh);
+              final safe = <int, int>{};
+              final counted = <String, int>{};
+              for (final e in selectedQty().entries) {
+                final line = picked!.items[e.key];
+                final key = '${line.productId}::${line.variantId ?? ''}';
+                final left =
+                    line.quantity - (done[key] ?? 0) - (counted[key] ?? 0);
+                final take = e.value < left ? e.value : left;
+                if (take <= 0) continue;
+                safe[e.key] = take;
+                counted[key] = (counted[key] ?? 0) + take;
+              }
+              if (safe.isNotEmpty) {
+                await _saveReversal(
+                  _buildReversalRecord(
+                    original: picked!,
+                    qtyByIndex: safe,
+                    paymentMethod: payMethod,
+                    exchange: adds.isNotEmpty ||
+                        mode.values.any((m) => m == 'exchange'),
+                  ),
+                );
+              }
+              if (adds.isNotEmpty) {
+                await LocalDbService.insertTransaction(
+                  _buildExchangeSale(
+                    adds,
+                    paymentMethod: payMethod,
+                    invoiceNumber: LocalDbService.generateInvoiceId(),
+                    customerName: picked!.customerName,
+                    customerPhone: picked!.customerPhone,
+                  ),
+                );
+                await ConnectivityService.instance.refreshUnsyncedCount();
+                if (ConnectivityService.instance.isOnline) {
+                  ConnectivityService.instance.syncNow();
+                }
+                _loadProducts();
+                _loadDashboardData();
+              }
+            } catch (e) {
+              if (ctx.mounted) setLocal(() => busy = false);
+              if (!mounted) return;
+              _showToast('Could not save: $e', isError: true);
+              return;
+            }
+            if (ctx.mounted) Navigator.pop(ctx);
+            if (!mounted) return;
+            final amt =
+                '$_currencySymbol${difference.abs().toStringAsFixed(2)}';
+            _showToast(
+              adds.isEmpty
+                  ? 'Return complete — $amt refunded.'
+                  : collecting
+                      ? 'Exchange complete — $amt collected.'
+                      : 'Exchange complete — $amt refunded.',
+            );
+          }
+
+          final filteredBills = () {
+            final q = query.trim().toLowerCase();
+            final list = q.isEmpty
+                ? sales
+                : sales.where((t) {
+                    return (t.invoiceNumber?.toLowerCase().contains(q) ??
+                            false) ||
+                        (t.customerName?.toLowerCase().contains(q) ?? false) ||
+                        (t.customerPhone?.toLowerCase().contains(q) ?? false) ||
+                        t.id.substring(0, 6).toLowerCase().contains(q) ||
+                        t.items.any(
+                          (i) => i.productName.toLowerCase().contains(q),
+                        );
+                  }).toList();
+            return list.take(40).toList();
+          }();
+
+          return Dialog(
+            backgroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: SizedBox(
+              width: 720,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // ── Header ──
+                  Container(
+                    padding: const EdgeInsets.fromLTRB(24, 16, 12, 14),
+                    decoration: const BoxDecoration(
+                      color: AppColors.surfaceVariant,
+                      borderRadius: BorderRadius.vertical(
+                        top: Radius.circular(16),
+                      ),
+                      border: Border(
+                        bottom: BorderSide(color: AppColors.border),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.assignment_return_outlined,
+                          size: 18,
+                          color: AppColors.primary,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            picked == null
+                                ? 'Return / Exchange'
+                                : 'Return / Exchange — '
+                                    '${_reversalBaseRef(picked!)}',
+                            style: GoogleFonts.manrope(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              color: AppColors.textDark,
+                            ),
+                          ),
+                        ),
+                        if (picked != null)
+                          TextButton(
+                            onPressed: busy
+                                ? null
+                                : () => setLocal(() {
+                                      picked = null;
+                                      mode = {};
+                                      cap = {};
+                                      adds.clear();
+                                      query = '';
+                                      addCtrl.clear();
+                                      addQuery = '';
+                                    }),
+                            child: Text(
+                              'Change bill',
+                              style: GoogleFonts.inter(fontSize: 12),
+                            ),
+                          ),
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded, size: 18),
+                          onPressed: busy ? null : () => Navigator.pop(ctx),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  if (picked == null) ...[
+                    // ── Pick the bill ──
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                      child: TextField(
+                        autofocus: true,
+                        onChanged: (v) => setLocal(() => query = v),
+                        style: GoogleFonts.inter(fontSize: 13),
+                        decoration: _dlgInputDecor(
+                          'Search invoice, customer, phone or item...',
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      height: 340,
+                      child: filteredBills.isEmpty
+                          ? Center(
+                              child: Text(
+                                'No bills found',
+                                style: GoogleFonts.inter(
+                                  fontSize: 13,
+                                  color: AppColors.textMuted,
+                                ),
+                              ),
+                            )
+                          : ListView.separated(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 20,
+                              ),
+                              itemCount: filteredBills.length,
+                              separatorBuilder: (_, _) => const Divider(
+                                height: 1,
+                                color: AppColors.border,
+                              ),
+                              itemBuilder: (_, i) {
+                                final t = filteredBills[i];
+                                final n = t.items.fold(
+                                  0,
+                                  (s, e) => s + e.quantity,
+                                );
+                                return InkWell(
+                                  onTap: () => selectBill(t),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 11,
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        Expanded(
+                                          flex: 4,
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                _reversalBaseRef(t),
+                                                style: GoogleFonts.inter(
+                                                  fontSize: 12.5,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: AppColors.primary,
+                                                ),
+                                              ),
+                                              Text(
+                                                '${t.createdAt.day.toString().padLeft(2, '0')}/'
+                                                '${t.createdAt.month.toString().padLeft(2, '0')}/'
+                                                '${t.createdAt.year}  ·  $n item'
+                                                '${n == 1 ? '' : 's'}',
+                                                style: GoogleFonts.inter(
+                                                  fontSize: 11,
+                                                  color: AppColors.textMuted,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                        Expanded(
+                                          flex: 3,
+                                          child: Text(
+                                            t.customerName?.isNotEmpty == true
+                                                ? t.customerName!
+                                                : '—',
+                                            style: GoogleFonts.inter(
+                                              fontSize: 12.5,
+                                              color: AppColors.textDark,
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                        Text(
+                                          '$_currencySymbol'
+                                          '${t.total.toStringAsFixed(2)}',
+                                          style: GoogleFonts.inter(
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w700,
+                                            color: AppColors.textDark,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                    const SizedBox(height: 12),
+                  ] else ...[
+                    // ── Add a product (typed or scanned) ──
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          TextField(
+                            controller: addCtrl,
+                            autofocus: true,
+                            enabled: !busy,
+                            onChanged: (v) => setLocal(() => addQuery = v),
+                            onSubmitted: (v) {
+                              final hit =
+                                  _scanMatch(v) ?? _sellableMatches(v).firstOrNull;
+                              if (hit != null) addLine(hit);
+                            },
+                            style: GoogleFonts.inter(fontSize: 13),
+                            decoration: _dlgInputDecor(
+                              'Scan barcode or search a product to add...',
+                            ).copyWith(
+                              prefixIcon: const Icon(
+                                Icons.qr_code_scanner_rounded,
+                                size: 18,
+                                color: AppColors.textMuted,
+                              ),
+                            ),
+                          ),
+                          ...() {
+                            final matches = _sellableMatches(addQuery);
+                            if (matches.isEmpty) return <Widget>[];
+                            return [
+                              const SizedBox(height: 6),
+                              Container(
+                                decoration: BoxDecoration(
+                                  border: Border.all(color: AppColors.border),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Column(
+                                  children: [
+                                    for (final m in matches)
+                                      InkWell(
+                                        onTap: () => addLine(m),
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 12,
+                                            vertical: 9,
+                                          ),
+                                          child: Row(
+                                            children: [
+                                              Expanded(
+                                                child: Text(
+                                                  m.name,
+                                                  style: GoogleFonts.inter(
+                                                    fontSize: 12.5,
+                                                    color: AppColors.textDark,
+                                                  ),
+                                                ),
+                                              ),
+                                              Text(
+                                                '$_currencySymbol'
+                                                '${m.price.toStringAsFixed(2)}',
+                                                style: GoogleFonts.inter(
+                                                  fontSize: 12.5,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: AppColors.textDark,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ];
+                          }(),
+                        ],
+                      ),
+                    ),
+
+                    // ── The bill's lines, and anything being given out ──
+                    Flexible(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _dlgLabel('ITEMS ON THIS BILL'),
+                            const SizedBox(height: 8),
+                            for (var i = 0; i < picked!.items.length; i++)
+                              _returnLineRow(
+                                line: picked!.items[i],
+                                remaining: cap[i] ?? 0,
+                                selected: mode[i],
+                                onPick: busy
+                                    ? null
+                                    : (m) => setLocal(() {
+                                          if (mode[i] == m) {
+                                            mode.remove(i);
+                                          } else {
+                                            mode[i] = m;
+                                          }
+                                        }),
+                              ),
+                            if (adds.isNotEmpty) ...[
+                              const SizedBox(height: 14),
+                              _dlgLabel('NEW ITEMS ON THIS INVOICE'),
+                              const SizedBox(height: 8),
+                              for (final a in adds)
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 8),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              a.name,
+                                              style: GoogleFonts.inter(
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w600,
+                                                color: AppColors.textDark,
+                                              ),
+                                            ),
+                                            Text(
+                                              '$_currencySymbol'
+                                              '${a.price.toStringAsFixed(2)}'
+                                              '  ·  in stock ${a.stock}',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 11,
+                                                color: AppColors.textMuted,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      _qtyStepBtn(
+                                        Icons.remove_rounded,
+                                        busy
+                                            ? null
+                                            : () => setLocal(() {
+                                                  if (a.qty > 1) {
+                                                    a.qty--;
+                                                  } else {
+                                                    adds.remove(a);
+                                                  }
+                                                }),
+                                      ),
+                                      SizedBox(
+                                        width: 34,
+                                        child: Text(
+                                          '${a.qty}',
+                                          textAlign: TextAlign.center,
+                                          style: GoogleFonts.inter(
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w700,
+                                            color: AppColors.textDark,
+                                          ),
+                                        ),
+                                      ),
+                                      _qtyStepBtn(
+                                        Icons.add_rounded,
+                                        busy
+                                            ? null
+                                            : () => setLocal(() => a.qty++),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      IconButton(
+                                        iconSize: 16,
+                                        visualDensity: VisualDensity.compact,
+                                        icon: const Icon(
+                                          Icons.close_rounded,
+                                          color: AppColors.textMuted,
+                                        ),
+                                        onPressed: busy
+                                            ? null
+                                            : () =>
+                                                setLocal(() => adds.remove(a)),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                            ],
+                            const SizedBox(height: 4),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                    // ── Money and actions ──
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+                      decoration: const BoxDecoration(
+                        border: Border(
+                          top: BorderSide(color: AppColors.border),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          _reviewRow(
+                            'OLD BILL AMOUNT',
+                            '$_currencySymbol'
+                                '${picked!.total.toStringAsFixed(2)}',
+                          ),
+                          const SizedBox(height: 6),
+                          _reviewRow(
+                            'RETURNING',
+                            '-$_currencySymbol'
+                                '${returningTotal.toStringAsFixed(2)}',
+                            color: AppColors.success,
+                          ),
+                          const SizedBox(height: 6),
+                          _reviewRow(
+                            'NEW ITEMS',
+                            '$_currencySymbol'
+                                '${newTotal.toStringAsFixed(2)}',
+                          ),
+                          const SizedBox(height: 10),
+                          const Divider(height: 1, color: AppColors.border),
+                          const SizedBox(height: 10),
+                          Row(
+                            children: [
+                              Text(
+                                collecting
+                                    ? 'COLLECT FROM CUSTOMER'
+                                    : 'REFUND TO CUSTOMER',
+                                style: GoogleFonts.inter(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.textDark,
+                                  letterSpacing: 1.5,
+                                ),
+                              ),
+                              const Spacer(),
+                              Text(
+                                '$_currencySymbol'
+                                '${difference.abs().toStringAsFixed(2)}',
+                                style: GoogleFonts.manrope(
+                                  fontSize: 24,
+                                  fontWeight: FontWeight.w900,
+                                  color: collecting
+                                      ? AppColors.primary
+                                      : AppColors.success,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+                          Row(
+                            children: [
+                              OutlinedButton.icon(
+                                onPressed: busy || nothingChosen
+                                    ? null
+                                    : () {
+                                        final r = receiptRecord();
+                                        if (r != null) {
+                                          _printRecord(r, toPrinter: true);
+                                        }
+                                      },
+                                icon: const Icon(Icons.print_outlined, size: 15),
+                                label: Text(
+                                  'PRINT RECEIPT',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    letterSpacing: 0.5,
+                                  ),
+                                ),
+                                style: OutlinedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 14,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              OutlinedButton.icon(
+                                onPressed: busy || nothingChosen
+                                    ? null
+                                    : () {
+                                        final r = receiptRecord();
+                                        if (r == null) return;
+                                        _sendInvoiceViaWhatsApp(
+                                          r,
+                                          picked!.customerPhone ?? '',
+                                        );
+                                      },
+                                icon: const Icon(
+                                  Icons.chat_bubble_outline_rounded,
+                                  size: 15,
+                                ),
+                                label: Text(
+                                  'E-BILL',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    letterSpacing: 0.5,
+                                  ),
+                                ),
+                                style: OutlinedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 14,
+                                    vertical: 14,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  onPressed: busy || nothingChosen
+                                      ? null
+                                      : complete,
+                                  icon: busy
+                                      ? const SizedBox(
+                                          width: 14,
+                                          height: 14,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: Colors.white,
+                                          ),
+                                        )
+                                      : const Icon(
+                                          Icons.check_circle_outline_rounded,
+                                          size: 16,
+                                        ),
+                                  label: Text(
+                                    adds.isEmpty
+                                        ? 'COMPLETE REFUND'
+                                        : 'COMPLETE EXCHANGE',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                      letterSpacing: 0.5,
+                                    ),
+                                  ),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: AppColors.success,
+                                    foregroundColor: Colors.white,
+                                    elevation: 0,
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 14,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    addCtrl.dispose();
+  }
+
+  Widget _reviewRow(String label, String value, {Color? color}) {
+    return Row(
+      children: [
+        Text(
+          label,
+          style: GoogleFonts.inter(
+            fontSize: 10,
+            fontWeight: FontWeight.w500,
+            color: AppColors.textMuted,
+            letterSpacing: 1.5,
+          ),
+        ),
+        const Spacer(),
+        Text(
+          value,
+          style: GoogleFonts.inter(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: color ?? AppColors.textDark,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// One line of the original bill: pick RETURN or EXCHANGE and the row turns
+  /// green. A line already sent back on an earlier return is locked.
+  Widget _returnLineRow({
+    required TransactionItem line,
+    required int remaining,
+    required String? selected,
+    required void Function(String mode)? onPick,
+  }) {
+    final exhausted = remaining <= 0;
+    final on = selected != null;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(
+        color: on
+            ? AppColors.success.withValues(alpha: 0.08)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: on ? AppColors.success : AppColors.border,
+          width: on ? 1.5 : 1,
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  line.displayName,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: exhausted ? AppColors.textMuted : AppColors.textDark,
+                  ),
+                ),
+                Text(
+                  exhausted
+                      ? 'already returned'
+                      : '$_currencySymbol${line.price.toStringAsFixed(2)}'
+                          '  ·  ${remaining < line.quantity ? '$remaining of ${line.quantity} left' : 'qty ${line.quantity}'}',
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (!exhausted) ...[
+            _pickChip(
+              'RETURN',
+              selected == 'return',
+              onPick == null ? null : () => onPick('return'),
+            ),
+            const SizedBox(width: 6),
+            _pickChip(
+              'EXCHANGE',
+              selected == 'exchange',
+              onPick == null ? null : () => onPick('exchange'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _pickChip(String label, bool on, VoidCallback? onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: on ? AppColors.success : Colors.white,
+          borderRadius: BorderRadius.circular(100),
+          border: Border.all(
+            color: on ? AppColors.success : AppColors.border,
+            width: on ? 2 : 1,
+          ),
+        ),
+        child: Text(
+          label,
+          style: GoogleFonts.inter(
+            fontSize: 9.5,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.5,
+            color: on ? Colors.white : AppColors.textMuted,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _qtyStepBtn(IconData icon, VoidCallback? onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        width: 26,
+        height: 26,
+        decoration: BoxDecoration(
+          border: Border.all(color: AppColors.border),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Icon(
+          icon,
+          size: 14,
+          color: onTap == null ? AppColors.border : AppColors.textDark,
+        ),
+      ),
+    );
+  }
 
   void _printCurrentBill(
     CartProvider cart, {
@@ -17485,7 +18585,12 @@ end tell
                     final invoiceNo = t.invoiceNumber?.isNotEmpty == true
                         ? t.invoiceNumber!
                         : '#${t.id.substring(0, 6).toUpperCase()}';
-                    final itemCount = t.items.fold(0, (s, i) => s + i.quantity);
+                    // Returns carry negative quantities so they net off in
+                    // totals; the count itself reads as a plain number.
+                    final itemCount = t.items
+                        .fold(0, (s, i) => s + i.quantity)
+                        .abs();
+                    final reversal = t.reversalLabel;
                     final customer = (t.customerName?.isNotEmpty == true)
                         ? t.customerName!
                         : '—';
@@ -17521,13 +18626,47 @@ end tell
                                 ),
                                 Expanded(
                                   flex: 3,
-                                  child: Text(
-                                    invoiceNo,
-                                    style: GoogleFonts.inter(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: AppColors.primary,
-                                    ),
+                                  child: Row(
+                                    children: [
+                                      Flexible(
+                                        child: Text(
+                                          invoiceNo,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: GoogleFonts.inter(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: reversal != null
+                                                ? AppColors.error
+                                                : AppColors.primary,
+                                          ),
+                                        ),
+                                      ),
+                                      if (reversal != null) ...[
+                                        const SizedBox(width: 6),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 6,
+                                            vertical: 2,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: AppColors.error.withValues(
+                                              alpha: 0.09,
+                                            ),
+                                            borderRadius:
+                                                BorderRadius.circular(4),
+                                          ),
+                                          child: Text(
+                                            reversal,
+                                            style: GoogleFonts.inter(
+                                              fontSize: 8.5,
+                                              fontWeight: FontWeight.w700,
+                                              color: AppColors.error,
+                                              letterSpacing: 0.5,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ],
                                   ),
                                 ),
                                 Expanded(
@@ -17565,12 +18704,16 @@ end tell
                                 Expanded(
                                   flex: 2,
                                   child: Text(
-                                    '$_currencySymbol${t.total.toStringAsFixed(2)}',
+                                    reversal != null
+                                        ? '-$_currencySymbol${t.total.abs().toStringAsFixed(2)}'
+                                        : '$_currencySymbol${t.total.toStringAsFixed(2)}',
                                     textAlign: TextAlign.right,
                                     style: GoogleFonts.inter(
                                       fontSize: 13,
                                       fontWeight: FontWeight.w700,
-                                      color: AppColors.textDark,
+                                      color: reversal != null
+                                          ? AppColors.error
+                                          : AppColors.textDark,
                                     ),
                                   ),
                                 ),
@@ -21900,4 +23043,24 @@ class _BarcodePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_BarcodePainter old) => old.data != data;
+}
+
+/// A product being handed out in an exchange, before it becomes a sale line.
+/// Mutable quantity so the dialog's steppers can adjust it in place.
+class _ExchangeAdd {
+  _ExchangeAdd({required this.product, this.variant, this.qty = 1});
+
+  final Product product;
+  final ProductVariant? variant;
+  int qty;
+
+  String get key =>
+      variant == null ? product.id : '${product.id}::${variant!.id}';
+
+  String get name =>
+      variant == null ? product.name : '${product.name} (${variant!.label})';
+
+  double get price => variant?.price ?? product.price;
+
+  int get stock => variant?.stock ?? product.stock;
 }
