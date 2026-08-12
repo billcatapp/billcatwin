@@ -578,6 +578,9 @@ class ConnectivityService extends ChangeNotifier {
                         'created_at': t.createdAt.toIso8601String(),
                         'items': t.items.map((i) => i.toMap()).toList(),
                         'invoice_number': t.invoiceNumber,
+                        'balance_due': t.balanceDue,
+                        'hybrid_cash': t.hybridCash,
+                        'hybrid_upi': t.hybridUpi,
                       },
                     )
                     .toList(),
@@ -970,6 +973,9 @@ class ConnectivityService extends ChangeNotifier {
       total: _asDouble(r['total']),
       paymentMethod: r['payment_method'] as String,
       createdAt: DateTime.parse(r['created_at'] as String),
+      balanceDue: _asDouble(r['balance_due']),
+      hybridCash: _asDouble(r['hybrid_cash']),
+      hybridUpi: _asDouble(r['hybrid_upi']),
     );
   }
 

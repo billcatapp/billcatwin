@@ -177,6 +177,9 @@ class _BillingScreenState extends State<BillingScreen> {
   bool _acSkipRefocus = false;
   final _customerNameCtrl = TextEditingController();
   final _customerPhoneCtrl = TextEditingController();
+  // Hybrid split fields (Cash / UPI), shown when Hybrid is the payment method.
+  final _hybridCashCtrl = TextEditingController();
+  final _hybridUpiCtrl = TextEditingController();
   final _customerNameFocus = FocusNode();
   final _customerPhoneFocus = FocusNode();
   final _addCustomerFocus = FocusNode();
@@ -235,6 +238,10 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // Sales report period
   String _reportSalesPeriod = 'This Week';
+  // Custom sales period: a specific day, month or year the owner picks.
+  DateTimeRange? _customSalesRange;
+  List<TransactionRecord> _customTxList = [];
+  String _customPeriodLabel = 'Custom';
   List<TransactionRecord> _txListToday = [];
   List<TransactionRecord> _txListWeek = [];
   List<TransactionRecord> _txListMonth = [];
@@ -1153,6 +1160,8 @@ class _BillingScreenState extends State<BillingScreen> {
     _searchFocus.dispose();
     _customerNameCtrl.dispose();
     _customerPhoneCtrl.dispose();
+    _hybridCashCtrl.dispose();
+    _hybridUpiCtrl.dispose();
     _customerNameFocus.dispose();
     _customerPhoneFocus.dispose();
     _addCustomerFocus.dispose();
@@ -1472,14 +1481,43 @@ class _BillingScreenState extends State<BillingScreen> {
             _utilitiesDropdownTab(),
           ],
           const Spacer(),
-          _topBarIconBtn(
-            Icons.assignment_return_outlined,
-            'Return / Exchange',
-            _showReturnDialog,
-          ),
-          const SizedBox(width: 8),
+          // Return/Exchange and the owner lock belong to the till, so they
+          // only appear on the Billing tab (index 1).
+          if (_selectedTab == 1) ...[
+            GestureDetector(
+              onTap: _showReturnDialog,
+              child: Container(
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                decoration: BoxDecoration(
+                  color: AppColors.accentBlue,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.assignment_return_outlined,
+                      color: Colors.white,
+                      size: 15,
+                    ),
+                    const SizedBox(width: 7),
+                    Text(
+                      'Return / Exchange',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
           // Lock icon only shown when staff access control is enabled
-          if (_ownerLockEnabled) ...[
+          if (_selectedTab == 1 && _ownerLockEnabled) ...[
             _topBarIconBtn(
               _isOwnerMode
                   ? Icons.lock_open_outlined
@@ -3046,7 +3084,14 @@ class _BillingScreenState extends State<BillingScreen> {
               final selected = cart.paymentMethod == m.$1;
               return Expanded(
                 child: GestureDetector(
-                  onTap: () => cart.setPaymentMethod(m.$1),
+                  onTap: () {
+                    cart.setPaymentMethod(m.$1);
+                    if (m.$1 == PaymentMethod.hybrid) {
+                      // Empty fields — cashier types one, the other follows.
+                      _hybridCashCtrl.clear();
+                      _hybridUpiCtrl.clear();
+                    }
+                  },
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 150),
                     padding: const EdgeInsets.symmetric(
@@ -3108,8 +3153,162 @@ class _BillingScreenState extends State<BillingScreen> {
               );
             }).toList(),
           ),
+          // Hybrid split: slides open to capture how much is cash vs UPI.
+          AnimatedSize(
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOut,
+            alignment: Alignment.topCenter,
+            child: cart.paymentMethod == PaymentMethod.hybrid
+                ? _buildHybridSplit(cart)
+                : const SizedBox(width: double.infinity),
+          ),
         ],
       ),
+    );
+  }
+
+  Widget _buildHybridSplit(CartProvider cart) {
+    final entered = cart.hybridCash + cart.hybridUpi;
+    final balanced = (entered - cart.total).abs() < 0.01;
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: _hybridField(
+                  'CASH',
+                  _hybridCashCtrl,
+                  (v) => _onHybridEdit(
+                    cart,
+                    v,
+                    thisCtrl: _hybridCashCtrl,
+                    otherCtrl: _hybridUpiCtrl,
+                    setSplit: (thisAmt, otherAmt) =>
+                        cart.setHybridSplit(thisAmt, otherAmt),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _hybridField(
+                  'UPI / QR',
+                  _hybridUpiCtrl,
+                  (v) => _onHybridEdit(
+                    cart,
+                    v,
+                    thisCtrl: _hybridUpiCtrl,
+                    otherCtrl: _hybridCashCtrl,
+                    setSplit: (thisAmt, otherAmt) =>
+                        cart.setHybridSplit(otherAmt, thisAmt),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            balanced
+                ? 'Cash + UPI = $_currencySymbol${cart.total.toStringAsFixed(2)}'
+                : 'Must add up to $_currencySymbol${cart.total.toStringAsFixed(2)}',
+            style: GoogleFonts.inter(
+              fontSize: 10.5,
+              fontWeight: FontWeight.w500,
+              color: balanced ? AppColors.success : AppColors.error,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Handles a keystroke in a hybrid split field: rejects malformed input,
+  /// caps the amount to the total (never negative), reflects a clamped value
+  /// back into the edited field, and fills the other field with the remainder.
+  void _onHybridEdit(
+    CartProvider cart,
+    String v, {
+    required TextEditingController thisCtrl,
+    required TextEditingController otherCtrl,
+    required void Function(double thisAmt, double otherAmt) setSplit,
+  }) {
+    final trimmed = v.trim();
+    final parsed = double.tryParse(trimmed);
+    // A malformed non-empty entry ('1.2.3') is ignored, not treated as 0 —
+    // otherwise the whole total would silently jump to the other field.
+    if (trimmed.isNotEmpty && parsed == null) return;
+    final maxAmt = cart.total > 0 ? cart.total : 0.0;
+    final thisAmt = (parsed ?? 0).clamp(0.0, maxAmt).toDouble();
+    final otherAmt = maxAmt - thisAmt;
+    setSplit(thisAmt, otherAmt);
+    // If the entry was clamped down, rewrite this field so it can never show
+    // more than the total.
+    if (trimmed.isNotEmpty && (parsed ?? 0) > thisAmt) {
+      final t = thisAmt.toStringAsFixed(2);
+      thisCtrl.value = TextEditingValue(
+        text: t,
+        selection: TextSelection.collapsed(offset: t.length),
+      );
+    }
+    otherCtrl.text = trimmed.isEmpty ? '' : otherAmt.toStringAsFixed(2);
+  }
+
+  Widget _hybridField(
+    String label,
+    TextEditingController ctrl,
+    ValueChanged<String> onChanged,
+  ) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: GoogleFonts.inter(
+            fontSize: 9,
+            fontWeight: FontWeight.w600,
+            color: AppColors.textMuted,
+            letterSpacing: 1.0,
+          ),
+        ),
+        const SizedBox(height: 4),
+        TextField(
+          controller: ctrl,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          inputFormatters: [
+            // Digits with at most one decimal point and two decimals.
+            FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+            TextInputFormatter.withFunction(
+              (oldV, newV) =>
+                  RegExp(r'^\d*\.?\d{0,2}$').hasMatch(newV.text) ? newV : oldV,
+            ),
+          ],
+          onChanged: onChanged,
+          style: GoogleFonts.manrope(
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+            color: AppColors.textDark,
+          ),
+          decoration: InputDecoration(
+            prefixText: '$_currencySymbol ',
+            hintText: '0.00',
+            hintStyle: GoogleFonts.manrope(
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              color: AppColors.textMuted,
+            ),
+            isDense: true,
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 10,
+              vertical: 9,
+            ),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -4041,6 +4240,7 @@ class _BillingScreenState extends State<BillingScreen> {
     (icon: Icons.person_outline_rounded, label: 'Account'),
     (icon: Icons.shield_outlined, label: 'Security'),
     (icon: Icons.chat_bubble_outline_rounded, label: 'WhatsApp'),
+    (icon: Icons.storage_outlined, label: 'Data'),
   ];
 
   Widget _buildSettingsPanel() {
@@ -4202,11 +4402,278 @@ class _BillingScreenState extends State<BillingScreen> {
             'Account' => _buildSettingsAccount(),
             'Security' => _buildSettingsSecurity(),
             'WhatsApp' => _buildSettingsWhatsApp(),
+            'Data' => _buildSettingsData(),
             _ => const SizedBox.shrink(),
           },
         ),
       ),
     );
+  }
+
+  // ── Data (reset options) ──
+  Widget _buildSettingsData() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _settingsPageTitle('Data', Icons.storage_outlined),
+        const SizedBox(height: 8),
+        Text(
+          'Permanently delete data from this device and cloud. '
+          'This cannot be undone.',
+          style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
+        ),
+        const SizedBox(height: 24),
+        _settingsSectionHeader('RESET OPTIONS'),
+        const SizedBox(height: 4),
+        _dataResetCard(
+          icon: Icons.people_alt_outlined,
+          title: 'Customer Data',
+          subtitle: 'Delete all customers',
+          onTap: () => _resetData('Customer Data', ['customers']),
+        ),
+        const SizedBox(height: 10),
+        _dataResetCard(
+          icon: Icons.receipt_long_outlined,
+          title: 'Sales',
+          subtitle: 'Delete all transactions and billing history',
+          onTap: () => _resetData('Sales', ['transactions']),
+        ),
+        const SizedBox(height: 10),
+        _dataResetCard(
+          icon: Icons.inventory_2_outlined,
+          title: 'Inventory',
+          subtitle: 'Delete all products and categories',
+          onTap: () => _resetData('Inventory', [
+            'products',
+            'product_variants',
+            'categories',
+          ]),
+        ),
+        const SizedBox(height: 24),
+        _settingsSectionHeader('DANGER ZONE'),
+        const SizedBox(height: 4),
+        _dataResetCard(
+          icon: Icons.warning_amber_rounded,
+          title: 'Reset All Data',
+          subtitle: 'Delete everything — customers, sales, and inventory',
+          danger: true,
+          onTap: () => _resetData('All Data', [
+            'customers',
+            'transactions',
+            'products',
+            'product_variants',
+            'categories',
+          ]),
+        ),
+      ],
+    );
+  }
+
+  Widget _dataResetCard({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+    bool danger = false,
+  }) {
+    final accent = danger ? AppColors.error : AppColors.textDark;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+        decoration: BoxDecoration(
+          color: danger
+              ? AppColors.error.withValues(alpha: 0.04)
+              : Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: danger
+                ? AppColors.error.withValues(alpha: 0.4)
+                : const Color(0xFFE8E8ED),
+            width: danger ? 1 : 0.5,
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: danger
+                    ? AppColors.error.withValues(alpha: 0.10)
+                    : const Color(0xFFF2F2F7),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(
+                icon,
+                size: 20,
+                color: danger ? AppColors.error : AppColors.textMuted,
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: GoogleFonts.manrope(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: accent,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    style: GoogleFonts.inter(
+                      fontSize: 12.5,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 20,
+              color: danger
+                  ? AppColors.error.withValues(alpha: 0.6)
+                  : AppColors.textMuted,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Runs a reset after a type-DELETE confirmation. Soft-deletes locally (so it
+  /// works offline and disappears at once), then lets the ordinary sync push
+  /// remove the rows from the cloud.
+  Future<void> _resetData(String label, List<String> tables) async {
+    final confirmed = await _confirmTypeToDelete(label);
+    if (confirmed != true || !mounted) return;
+    try {
+      await LocalDbService.softDeleteAllInTables(tables);
+    } catch (e) {
+      if (mounted) _showToast('Could not reset $label: $e', isError: true);
+      return;
+    }
+    await ConnectivityService.instance.refreshUnsyncedCount();
+    if (ConnectivityService.instance.isOnline) {
+      ConnectivityService.instance.syncNow();
+    }
+    _loadProducts();
+    _loadDashboardData();
+    if (!mounted) return;
+    final online = ConnectivityService.instance.isOnline;
+    _showToast(
+      online
+          ? '$label deleted from this device and cloud.'
+          : '$label deleted here — cloud clears when back online.',
+    );
+  }
+
+  /// Irreversible-action gate: the Delete button stays disabled until the user
+  /// types DELETE, so a stray tap can never wipe a shop's data.
+  Future<bool?> _confirmTypeToDelete(String label) {
+    final ctrl = TextEditingController();
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          final ready = ctrl.text.trim().toUpperCase() == 'DELETE';
+          return AlertDialog(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            title: Row(
+              children: [
+                const Icon(
+                  Icons.warning_amber_rounded,
+                  color: AppColors.error,
+                  size: 22,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Delete $label?',
+                    style: GoogleFonts.manrope(fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'This permanently removes it from this device and the '
+                  'cloud. It cannot be undone.',
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Type DELETE to confirm',
+                  style: GoogleFonts.inter(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textDark,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: ctrl,
+                  autofocus: true,
+                  onChanged: (_) => setLocal(() {}),
+                  textCapitalization: TextCapitalization.characters,
+                  style: GoogleFonts.inter(fontSize: 14),
+                  decoration: InputDecoration(
+                    hintText: 'DELETE',
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: Text(
+                  'Cancel',
+                  style: GoogleFonts.inter(color: AppColors.textMuted),
+                ),
+              ),
+              ElevatedButton(
+                onPressed: ready ? () => Navigator.pop(ctx, true) : null,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.error,
+                  disabledBackgroundColor: AppColors.error.withValues(
+                    alpha: 0.3,
+                  ),
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+                child: const Text('Delete'),
+              ),
+            ],
+          );
+        },
+      ),
+    ).whenComplete(() => _disposeAfterDialog(ctrl));
   }
 
   // ── Store ──
@@ -8934,7 +9401,7 @@ class _BillingScreenState extends State<BillingScreen> {
           ElevatedButton(
             onPressed: () {
               cart.clearCart();
-              _pendingInvoiceNumber = null;
+              _pendingBillId = null;
               Navigator.pop(context);
             },
             style: ElevatedButton.styleFrom(
@@ -8959,9 +9426,15 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // ── Print helpers ────────────────────────────────────────────────────────────
 
-  TransactionRecord _snapshotCart(CartProvider cart, {String? invoiceNumber}) =>
-      TransactionRecord(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
+  TransactionRecord _snapshotCart(
+    CartProvider cart, {
+    String? billId,
+    double balanceDue = 0,
+  }) => TransactionRecord(
+        // Same id the saved bill will get, so the printed preview's #XXXXXX
+        // invoice number matches the sale that lands in the sales list.
+        id: billId ?? DateTime.now().millisecondsSinceEpoch.toString(),
+        balanceDue: balanceDue,
         customerName: cart.customerName.isEmpty ? null : cart.customerName,
         customerPhone: cart.customerPhone.isEmpty ? null : cart.customerPhone,
         items: cart.items
@@ -8988,14 +9461,13 @@ class _BillingScreenState extends State<BillingScreen> {
         total: cart.total,
         paymentMethod: cart.paymentMethod.name,
         createdAt: DateTime.now(),
-        invoiceNumber: invoiceNumber,
       );
 
-  /// Invoice number for the bill currently being rung up. Generated the
-  /// first time the bill is printed and reused at checkout, so the number on
-  /// the printed receipt always matches the saved sale. Cleared when the
-  /// bill is closed or cleared.
-  String? _pendingInvoiceNumber;
+  /// Id assigned to the bill currently being rung up. Fixed the first time the
+  /// bill is printed and reused at checkout, so the #XXXXXX invoice number
+  /// (derived from this id) on the printed receipt always matches the saved
+  /// sale. Cleared when the bill is closed or cleared.
+  String? _pendingBillId;
 
   // ── Return / exchange ────────────────────────────────────────────────────
   //
@@ -9007,11 +9479,10 @@ class _BillingScreenState extends State<BillingScreen> {
   // exchange — goods back, goods out, and the difference — is settled inside
   // the one dialog, so nothing is ever carried into the ordinary cart.
 
-  /// Invoice reference a reversal points back at.
+  /// Canonical #XXXXXX number of an ORIGINAL bill — derived from its shared
+  /// id so a reversal built on it ('RTN-#XXXXXX') matches everywhere.
   String _reversalBaseRef(TransactionRecord t) =>
-      t.invoiceNumber?.isNotEmpty == true
-      ? t.invoiceNumber!
-      : t.id.substring(0, 6).toUpperCase();
+      '#${TransactionRecord.shortId(t.id)}';
 
   /// Quantity of each line of [original] that earlier returns already took
   /// back, keyed the same way the cart keys lines. Stops the same item being
@@ -9112,22 +9583,12 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  Future<void> _saveReversal(TransactionRecord record) async {
-    await LocalDbService.insertReturn(record);
-    await ConnectivityService.instance.refreshUnsyncedCount();
-    if (ConnectivityService.instance.isOnline) {
-      ConnectivityService.instance.syncNow();
-    }
-    _loadProducts();
-    _loadDashboardData();
-  }
-
   /// Prices the goods handed over in an exchange exactly as the cart would:
   /// each line at its own rate, falling back to the store rate, no discount.
   TransactionRecord _buildExchangeSale(
     List<_ExchangeAdd> adds, {
     required String paymentMethod,
-    String? invoiceNumber,
+    String? id,
     String? customerName,
     String? customerPhone,
   }) {
@@ -9154,8 +9615,9 @@ class _BillingScreenState extends State<BillingScreen> {
       );
     }
     return TransactionRecord(
-      id: const Uuid().v4(),
-      invoiceNumber: invoiceNumber,
+      // Fixed id (shared between the printed preview and the saved sale) so
+      // its derived #XXXXXX number is the same on the receipt and in Sales.
+      id: id ?? const Uuid().v4(),
       customerName: customerName,
       customerPhone: customerPhone,
       items: items,
@@ -9218,13 +9680,20 @@ class _BillingScreenState extends State<BillingScreen> {
     final all = await LocalDbService.getTransactions();
     if (!mounted) return;
     // Only real sales can be returned — never a return itself.
-    final sales = all.where((t) => !t.isReturn).toList();
+    // Show every bill with its status tag; only real sales can be picked to
+    // return (a refund/exchange can't itself be returned).
+    final sales = all;
 
     var query = '';
     TransactionRecord? picked;
+    // Fixed id for the exchange's new-sale row, so its #XXXXXX number is the
+    // same whether the receipt is printed before or after completing.
+    final exchangeSaleId = const Uuid().v4();
     // Line index -> 'return' or 'exchange'. Absent means "keeping it".
     var mode = <int, String>{};
     var cap = <int, int>{};
+    // Line index -> units the cashier chose to return (default: the full cap).
+    var qtySel = <int, int>{};
     final adds = <_ExchangeAdd>[];
     final addCtrl = TextEditingController();
     var addQuery = '';
@@ -9235,10 +9704,16 @@ class _BillingScreenState extends State<BillingScreen> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setLocal) {
+          // Units to return per ticked line: the chosen quantity, defaulting
+          // to the full remaining cap and never exceeding it.
           Map<int, int> selectedQty() => {
             for (final e in mode.entries)
-              if ((cap[e.key] ?? 0) > 0) e.key: cap[e.key]!,
+              if ((cap[e.key] ?? 0) > 0)
+                e.key: (qtySel[e.key] ?? cap[e.key]!).clamp(1, cap[e.key]!),
           };
+
+          // A real exchange only when new goods are actually handed out.
+          bool isExchange() => adds.isNotEmpty;
 
           TransactionRecord? reversalOf(TransactionRecord bill) {
             final q = selectedQty();
@@ -9247,9 +9722,7 @@ class _BillingScreenState extends State<BillingScreen> {
               original: bill,
               qtyByIndex: q,
               paymentMethod: payMethod,
-              // Anything handed back out makes this an exchange.
-              exchange: adds.isNotEmpty ||
-                  mode.values.any((m) => m == 'exchange'),
+              exchange: isExchange(),
             );
           }
 
@@ -9262,21 +9735,45 @@ class _BillingScreenState extends State<BillingScreen> {
           final newTotal = newSale?.total ?? 0.0;
           final difference = newTotal - returningTotal;
           final collecting = difference > 0;
-          final nothingChosen = returningTotal <= 0 && adds.isEmpty;
+          // Gate on goods chosen, not money — a fully-discounted (0-value)
+          // bill must still be returnable to restock its items.
+          final nothingChosen = selectedQty().isEmpty && adds.isEmpty;
 
-          void selectBill(TransactionRecord t) {
-            final done = _alreadyReturned(t, all);
+          // Remaining returnable per product+variant, distributed across the
+          // bill's lines. Reversals are keyed per product, so a bill with the
+          // same product on two lines caps and re-checks correctly.
+          Map<int, int> perLineCaps(
+            TransactionRecord t,
+            Map<String, int> alreadyDone,
+          ) {
+            final budget = <String, int>{};
+            for (final line in t.items) {
+              final key = '${line.productId}::${line.variantId ?? ''}';
+              budget[key] = (budget[key] ?? 0) + line.quantity;
+            }
+            for (final e in alreadyDone.entries) {
+              budget[e.key] = ((budget[e.key] ?? 0) - e.value)
+                  .clamp(0, 1 << 30);
+            }
             final caps = <int, int>{};
             for (var i = 0; i < t.items.length; i++) {
               final line = t.items[i];
               final key = '${line.productId}::${line.variantId ?? ''}';
-              final left = line.quantity - (done[key] ?? 0);
-              caps[i] = left < 0 ? 0 : left;
+              final avail = budget[key] ?? 0;
+              final take = line.quantity < avail ? line.quantity : avail;
+              caps[i] = take;
+              budget[key] = avail - take;
             }
+            return caps;
+          }
+
+          void selectBill(TransactionRecord t) {
+            final caps = perLineCaps(t, _alreadyReturned(t, all));
             setLocal(() {
               picked = t;
               cap = caps;
               mode = {};
+              qtySel = {};
               adds.clear();
               payMethod = const {
                 'cash': 'cash',
@@ -9290,9 +9787,10 @@ class _BillingScreenState extends State<BillingScreen> {
           void addLine(_ExchangeAdd a) {
             final i = adds.indexWhere((e) => e.key == a.key);
             setLocal(() {
+              // Never hand out more than is in stock.
               if (i >= 0) {
-                adds[i].qty++;
-              } else {
+                if (adds[i].qty < adds[i].stock) adds[i].qty++;
+              } else if (a.stock > 0) {
                 adds.add(a);
               }
               addCtrl.clear();
@@ -9300,87 +9798,126 @@ class _BillingScreenState extends State<BillingScreen> {
             });
           }
 
-          /// Builds the receipt for what the customer walks out with: the new
-          /// goods when there are any, otherwise the returned ones.
+          /// Receipt for the whole operation: a pure refund shows the returned
+          /// goods; an exchange shows the returned goods (negative) AND the new
+          /// goods, with the net collect/refund as its total. Display only.
           TransactionRecord? receiptRecord() {
             if (picked == null) return null;
-            if (adds.isNotEmpty) {
-              return _buildExchangeSale(
-                adds,
-                paymentMethod: payMethod,
-                invoiceNumber: LocalDbService.generateInvoiceId(),
-                customerName: picked!.customerName,
-                customerPhone: picked!.customerPhone,
-              );
-            }
-            return reversalOf(picked!);
+            final rev = reversalOf(picked!);
+            final sale = adds.isEmpty
+                ? null
+                : _buildExchangeSale(
+                    adds,
+                    paymentMethod: payMethod,
+                    id: exchangeSaleId,
+                    customerName: picked!.customerName,
+                    customerPhone: picked!.customerPhone,
+                  );
+            if (rev == null && sale == null) return null;
+            if (sale == null) return rev; // pure refund
+            if (rev == null) return sale; // adding only, nothing returned
+            return TransactionRecord(
+              id: exchangeSaleId,
+              invoiceNumber:
+                  '${TransactionRecord.exchangePrefix}${_reversalBaseRef(picked!)}',
+              customerName: picked!.customerName,
+              customerPhone: picked!.customerPhone,
+              items: [...rev.items, ...sale.items],
+              subtotal: rev.subtotal + sale.subtotal,
+              discountAmount: rev.discountAmount,
+              taxAmount: rev.taxAmount + sale.taxAmount,
+              total: rev.total + sale.total,
+              paymentMethod: payMethod,
+              createdAt: DateTime.now(),
+            );
           }
 
           Future<void> complete() async {
             if (busy || picked == null || nothingChosen) return;
             setLocal(() => busy = true);
             try {
-              // Re-check the allowance against live data: another till (or
-              // another dialog) may have returned these lines meanwhile.
+              // Re-check the allowance against LIVE data: another till may have
+              // returned these goods since the dialog opened. Same per-product
+              // budget as the caps, so duplicate-key lines re-check correctly.
               final fresh = await LocalDbService.getTransactions();
-              final done = _alreadyReturned(picked!, fresh);
+              final liveCaps = perLineCaps(
+                picked!,
+                _alreadyReturned(picked!, fresh),
+              );
               final safe = <int, int>{};
-              final counted = <String, int>{};
               for (final e in selectedQty().entries) {
-                final line = picked!.items[e.key];
-                final key = '${line.productId}::${line.variantId ?? ''}';
-                final left =
-                    line.quantity - (done[key] ?? 0) - (counted[key] ?? 0);
-                final take = e.value < left ? e.value : left;
-                if (take <= 0) continue;
-                safe[e.key] = take;
-                counted[key] = (counted[key] ?? 0) + take;
+                final take = e.value < (liveCaps[e.key] ?? 0)
+                    ? e.value
+                    : (liveCaps[e.key] ?? 0);
+                if (take > 0) safe[e.key] = take;
               }
-              if (safe.isNotEmpty) {
-                await _saveReversal(
-                  _buildReversalRecord(
-                    original: picked!,
-                    qtyByIndex: safe,
-                    paymentMethod: payMethod,
-                    exchange: adds.isNotEmpty ||
-                        mode.values.any((m) => m == 'exchange'),
-                  ),
+              final reversal = safe.isEmpty
+                  ? null
+                  : _buildReversalRecord(
+                      original: picked!,
+                      qtyByIndex: safe,
+                      paymentMethod: payMethod,
+                      exchange: isExchange(),
+                    );
+              final sale = adds.isEmpty
+                  ? null
+                  : _buildExchangeSale(
+                      adds,
+                      paymentMethod: payMethod,
+                      id: exchangeSaleId,
+                      customerName: picked!.customerName,
+                      customerPhone: picked!.customerPhone,
+                    );
+
+              // Nothing left to record — the goods were returned elsewhere.
+              // Tell the truth instead of claiming a refund.
+              if (reversal == null && sale == null) {
+                if (ctx.mounted) Navigator.pop(ctx);
+                if (!mounted) return;
+                _showToast(
+                  'These items were already returned on another device.',
+                  isError: true,
                 );
+                return;
               }
-              if (adds.isNotEmpty) {
-                await LocalDbService.insertTransaction(
-                  _buildExchangeSale(
-                    adds,
-                    paymentMethod: payMethod,
-                    invoiceNumber: LocalDbService.generateInvoiceId(),
-                    customerName: picked!.customerName,
-                    customerPhone: picked!.customerPhone,
-                  ),
-                );
-                await ConnectivityService.instance.refreshUnsyncedCount();
-                if (ConnectivityService.instance.isOnline) {
-                  ConnectivityService.instance.syncNow();
-                }
-                _loadProducts();
-                _loadDashboardData();
+
+              // Return + new sale go down as ONE atomic write, so a crash
+              // between them can't leave the exchange half-recorded.
+              if (reversal != null && sale != null) {
+                await LocalDbService.insertExchange(reversal, sale);
+              } else if (reversal != null) {
+                await LocalDbService.insertReturn(reversal);
+              } else {
+                await LocalDbService.insertTransaction(sale!);
               }
+              await ConnectivityService.instance.refreshUnsyncedCount();
+              if (ConnectivityService.instance.isOnline) {
+                ConnectivityService.instance.syncNow();
+              }
+              _loadProducts();
+              _loadDashboardData();
+
+              // Toast from what was ACTUALLY saved, not the pre-check estimate.
+              final refunded = reversal?.total.abs() ?? 0.0;
+              final collected = sale?.total ?? 0.0;
+              final net = collected - refunded;
+              if (ctx.mounted) Navigator.pop(ctx);
+              if (!mounted) return;
+              _showToast(
+                sale == null
+                    ? 'Return complete — $_currencySymbol'
+                          '${refunded.toStringAsFixed(2)} refunded.'
+                    : net >= 0
+                    ? 'Exchange complete — $_currencySymbol'
+                          '${net.toStringAsFixed(2)} collected.'
+                    : 'Exchange complete — $_currencySymbol'
+                          '${(-net).toStringAsFixed(2)} refunded.',
+              );
             } catch (e) {
               if (ctx.mounted) setLocal(() => busy = false);
               if (!mounted) return;
               _showToast('Could not save: $e', isError: true);
-              return;
             }
-            if (ctx.mounted) Navigator.pop(ctx);
-            if (!mounted) return;
-            final amt =
-                '$_currencySymbol${difference.abs().toStringAsFixed(2)}';
-            _showToast(
-              adds.isEmpty
-                  ? 'Return complete — $amt refunded.'
-                  : collecting
-                      ? 'Exchange complete — $amt collected.'
-                      : 'Exchange complete — $amt refunded.',
-            );
           }
 
           final filteredBills = () {
@@ -9388,11 +9925,9 @@ class _BillingScreenState extends State<BillingScreen> {
             final list = q.isEmpty
                 ? sales
                 : sales.where((t) {
-                    return (t.invoiceNumber?.toLowerCase().contains(q) ??
-                            false) ||
+                    return t.displayInvoice.toLowerCase().contains(q) ||
                         (t.customerName?.toLowerCase().contains(q) ?? false) ||
                         (t.customerPhone?.toLowerCase().contains(q) ?? false) ||
-                        t.id.substring(0, 6).toLowerCase().contains(q) ||
                         t.items.any(
                           (i) => i.productName.toLowerCase().contains(q),
                         );
@@ -9506,68 +10041,117 @@ class _BillingScreenState extends State<BillingScreen> {
                               ),
                               itemBuilder: (_, i) {
                                 final t = filteredBills[i];
-                                final n = t.items.fold(
-                                  0,
-                                  (s, e) => s + e.quantity,
-                                );
-                                return InkWell(
-                                  onTap: () => selectBill(t),
-                                  child: Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 11,
-                                    ),
-                                    child: Row(
-                                      children: [
-                                        Expanded(
-                                          flex: 4,
-                                          child: Column(
-                                            crossAxisAlignment:
-                                                CrossAxisAlignment.start,
-                                            children: [
-                                              Text(
-                                                _reversalBaseRef(t),
-                                                style: GoogleFonts.inter(
-                                                  fontSize: 12.5,
-                                                  fontWeight: FontWeight.w600,
-                                                  color: AppColors.primary,
+                                final n = t.items
+                                    .fold(0, (s, e) => s + e.quantity)
+                                    .abs();
+                                final status = _txStatus(t);
+                                final neg = t.total < 0;
+                                // Only a real, positive sale can be returned.
+                                final selectable = !t.isReturn && !neg;
+                                final cust =
+                                    t.customerName?.isNotEmpty == true
+                                    ? '  ·  ${t.customerName}'
+                                    : '';
+                                return Opacity(
+                                  opacity: selectable ? 1 : 0.5,
+                                  child: InkWell(
+                                    onTap: selectable
+                                        ? () => selectBill(t)
+                                        : null,
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 12,
+                                      ),
+                                      child: Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.center,
+                                        children: [
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Row(
+                                                  children: [
+                                                    Flexible(
+                                                      child: Text(
+                                                        t.displayInvoice,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style:
+                                                            GoogleFonts.inter(
+                                                              fontSize: 13,
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w600,
+                                                              color: AppColors
+                                                                  .primary,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 8),
+                                                    Container(
+                                                      padding: const EdgeInsets
+                                                          .symmetric(
+                                                        horizontal: 7,
+                                                        vertical: 2,
+                                                      ),
+                                                      decoration: BoxDecoration(
+                                                        color: status.bg,
+                                                        borderRadius:
+                                                            BorderRadius
+                                                                .circular(20),
+                                                      ),
+                                                      child: Text(
+                                                        status.label,
+                                                        style:
+                                                            GoogleFonts.inter(
+                                                              fontSize: 8.5,
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w700,
+                                                              color:
+                                                                  status.fg,
+                                                              letterSpacing:
+                                                                  0.4,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                  ],
                                                 ),
-                                              ),
-                                              Text(
-                                                '${t.createdAt.day.toString().padLeft(2, '0')}/'
-                                                '${t.createdAt.month.toString().padLeft(2, '0')}/'
-                                                '${t.createdAt.year}  ·  $n item'
-                                                '${n == 1 ? '' : 's'}',
-                                                style: GoogleFonts.inter(
-                                                  fontSize: 11,
-                                                  color: AppColors.textMuted,
+                                                const SizedBox(height: 3),
+                                                Text(
+                                                  '${t.createdAt.day.toString().padLeft(2, '0')}/'
+                                                  '${t.createdAt.month.toString().padLeft(2, '0')}/'
+                                                  '${t.createdAt.year}  ·  $n item'
+                                                  '${n == 1 ? '' : 's'}$cust',
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: GoogleFonts.inter(
+                                                    fontSize: 11,
+                                                    color: AppColors.textMuted,
+                                                  ),
                                                 ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                        Expanded(
-                                          flex: 3,
-                                          child: Text(
-                                            t.customerName?.isNotEmpty == true
-                                                ? t.customerName!
-                                                : '—',
-                                            style: GoogleFonts.inter(
-                                              fontSize: 12.5,
-                                              color: AppColors.textDark,
+                                              ],
                                             ),
-                                            overflow: TextOverflow.ellipsis,
                                           ),
-                                        ),
-                                        Text(
-                                          '$_currencySymbol'
-                                          '${t.total.toStringAsFixed(2)}',
-                                          style: GoogleFonts.inter(
-                                            fontSize: 13,
-                                            fontWeight: FontWeight.w700,
-                                            color: AppColors.textDark,
+                                          const SizedBox(width: 12),
+                                          Text(
+                                            neg
+                                                ? '-$_currencySymbol'
+                                                      '${t.total.abs().toStringAsFixed(2)}'
+                                                : '$_currencySymbol'
+                                                      '${t.total.toStringAsFixed(2)}',
+                                            style: GoogleFonts.inter(
+                                              fontSize: 13.5,
+                                              fontWeight: FontWeight.w700,
+                                              color: neg
+                                                  ? AppColors.error
+                                                  : AppColors.textDark,
+                                            ),
                                           ),
-                                        ),
-                                      ],
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 );
@@ -9670,13 +10254,22 @@ class _BillingScreenState extends State<BillingScreen> {
                                 line: picked!.items[i],
                                 remaining: cap[i] ?? 0,
                                 selected: mode[i],
+                                chosen: (qtySel[i] ?? (cap[i] ?? 0))
+                                    .clamp(0, cap[i] ?? 0),
+                                onQty: busy
+                                    ? null
+                                    : (q) => setLocal(() => qtySel[i] = q),
                                 onPick: busy
                                     ? null
                                     : (m) => setLocal(() {
                                           if (mode[i] == m) {
                                             mode.remove(i);
+                                            qtySel.remove(i);
                                           } else {
                                             mode[i] = m;
+                                            // Default to the full line; the
+                                            // stepper can dial it down.
+                                            qtySel[i] ??= cap[i] ?? 0;
                                           }
                                         }),
                               ),
@@ -9740,7 +10333,8 @@ class _BillingScreenState extends State<BillingScreen> {
                                       ),
                                       _qtyStepBtn(
                                         Icons.add_rounded,
-                                        busy
+                                        // Can't hand out more than is in stock.
+                                        (busy || a.qty >= a.stock)
                                             ? null
                                             : () => setLocal(() => a.qty++),
                                       ),
@@ -9945,7 +10539,15 @@ class _BillingScreenState extends State<BillingScreen> {
         },
       ),
     );
-    addCtrl.dispose();
+    _disposeAfterDialog(addCtrl);
+  }
+
+  /// Disposes a controller made for a dialog, but only after the dialog's
+  /// close animation has finished. showDialog's future resolves while the
+  /// route is still animating out, so disposing immediately makes the exiting
+  /// TextField rebuild against a dead controller ("used after being disposed").
+  void _disposeAfterDialog(ChangeNotifier c) {
+    Future.delayed(const Duration(milliseconds: 400), c.dispose);
   }
 
   Widget _reviewRow(String label, String value, {Color? color}) {
@@ -9979,6 +10581,8 @@ class _BillingScreenState extends State<BillingScreen> {
     required TransactionItem line,
     required int remaining,
     required String? selected,
+    required int chosen,
+    required void Function(int qty)? onQty,
     required void Function(String mode)? onPick,
   }) {
     final exhausted = remaining <= 0;
@@ -10024,6 +10628,32 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
           ),
           if (!exhausted) ...[
+            // Choose how many of a multi-unit line to take back.
+            if (on && remaining > 1) ...[
+              _qtyStepBtn(
+                Icons.remove_rounded,
+                (onQty != null && chosen > 1) ? () => onQty(chosen - 1) : null,
+              ),
+              SizedBox(
+                width: 26,
+                child: Text(
+                  '$chosen',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.textDark,
+                  ),
+                ),
+              ),
+              _qtyStepBtn(
+                Icons.add_rounded,
+                (onQty != null && chosen < remaining)
+                    ? () => onQty(chosen + 1)
+                    : null,
+              ),
+              const SizedBox(width: 10),
+            ],
             _pickChip(
               'RETURN',
               selected == 'return',
@@ -10092,9 +10722,9 @@ class _BillingScreenState extends State<BillingScreen> {
     String docType = 'Invoice',
     bool toPrinter = false,
   }) {
-    _pendingInvoiceNumber ??= LocalDbService.generateInvoiceId();
+    _pendingBillId ??= const Uuid().v4();
     _printRecord(
-      _snapshotCart(cart, invoiceNumber: _pendingInvoiceNumber),
+      _snapshotCart(cart, billId: _pendingBillId),
       docType: docType,
       toPrinter: toPrinter,
     );
@@ -10498,9 +11128,8 @@ class _BillingScreenState extends State<BillingScreen> {
 
       _clearPrintingState();
 
-      final receiptName = tx.invoiceNumber != null
-          ? 'Receipt-${tx.invoiceNumber}'
-          : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
+      // File-safe: drop the '#' from the canonical number.
+      final receiptName = 'Receipt-${tx.displayInvoice.replaceAll('#', '')}';
 
       if (toPrinter) {
         // Send directly to the selected printer silently — no UI opens
@@ -10603,11 +11232,27 @@ class _BillingScreenState extends State<BillingScreen> {
     bool sendWaAfterClose = false;
     final hasPhone = cart.customerPhone.isNotEmpty;
     final hasWa = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
+    final paidCtrl = TextEditingController(text: cart.total.toStringAsFixed(2));
 
     showDialog(
       context: context,
       builder: (_) => StatefulBuilder(
-        builder: (ctx, setLocal) => AlertDialog(
+        builder: (ctx, setLocal) {
+          final total = cart.total;
+          final paid = double.tryParse(paidCtrl.text.trim()) ?? total;
+          final balanceDue = (total - paid) > 0.005 ? total - paid : 0.0;
+          final isCredit = balanceDue > 0.005;
+          final hasCustomer =
+              cart.customerName.trim().isNotEmpty ||
+              cart.customerPhone.trim().isNotEmpty;
+          // A hybrid bill's cash + UPI must actually add up to the total, so a
+          // stale or half-entered split can't be saved.
+          final hybridBalanced =
+              cart.paymentMethod != PaymentMethod.hybrid ||
+              ((cart.hybridCash + cart.hybridUpi) - total).abs() < 0.01;
+          // A credit sale must name who owes the balance.
+          final canConfirm = (!isCredit || hasCustomer) && hybridBalanced;
+          return AlertDialog(
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
           ),
@@ -10629,13 +11274,128 @@ class _BillingScreenState extends State<BillingScreen> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              Row(
+                children: [
+                  Text(
+                    'Total',
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '$_currencySymbol${total.toStringAsFixed(2)}',
+                    style: GoogleFonts.manrope(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
               Text(
-                'Charge $_currencySymbol${cart.total.toStringAsFixed(2)} for ${cart.itemCount} item(s)?',
+                'Amount Paid',
                 style: GoogleFonts.inter(
-                  color: AppColors.textMuted,
-                  fontSize: 14,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.textDark,
                 ),
               ),
+              const SizedBox(height: 6),
+              TextField(
+                controller: paidCtrl,
+                onChanged: (_) => setLocal(() {}),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                inputFormatters: [
+                  FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                ],
+                style: GoogleFonts.manrope(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+                decoration: InputDecoration(
+                  prefixText: '$_currencySymbol ',
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 12,
+                  ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '${cart.itemCount} item(s)',
+                style: GoogleFonts.inter(
+                  fontSize: 12,
+                  color: AppColors.textMuted,
+                ),
+              ),
+              if (isCredit) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFB45309).withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: const Color(0xFFB45309).withValues(alpha: 0.35),
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.account_balance_wallet_outlined,
+                            size: 15,
+                            color: Color(0xFFB45309),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Balance due (credit)',
+                            style: GoogleFonts.inter(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              color: const Color(0xFF92400E),
+                            ),
+                          ),
+                          const Spacer(),
+                          Text(
+                            '$_currencySymbol${balanceDue.toStringAsFixed(2)}',
+                            style: GoogleFonts.manrope(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w800,
+                              color: const Color(0xFF92400E),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (!hasCustomer) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          'Add a customer name or phone to record who owes '
+                          'this balance.',
+                          style: GoogleFonts.inter(
+                            fontSize: 11.5,
+                            color: const Color(0xFF92400E),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
               if (hasPhone && hasWa) ...[
                 const SizedBox(height: 14),
                 InkWell(
@@ -10705,21 +11465,30 @@ class _BillingScreenState extends State<BillingScreen> {
               ),
             ),
             ElevatedButton(
-              onPressed: () async {
-                // Reuse the number already printed on this bill, if any.
-                final invNum =
-                    _pendingInvoiceNumber ?? LocalDbService.generateInvoiceId();
-                _pendingInvoiceNumber = null;
-                final snapshot = _snapshotCart(cart, invoiceNumber: invNum);
+              onPressed: !canConfirm
+                  ? null
+                  : () async {
+                // Reuse the id already printed on this bill, if any, so the
+                // receipt and the saved sale share one #XXXXXX number.
+                final billId = _pendingBillId ?? const Uuid().v4();
+                _pendingBillId = null;
+                final snapshot = _snapshotCart(
+                  cart,
+                  billId: billId,
+                  balanceDue: balanceDue,
+                );
                 final phone = cart.customerPhone;
                 Navigator.pop(ctx);
                 try {
-                  await cart.checkout(invoiceNumber: invNum);
+                  await cart.checkout(
+                    billId: billId,
+                    amountPaid: paid,
+                  );
                 } catch (e) {
                   // The checkout is atomic, so nothing was saved: keep the
-                  // cart and the invoice number intact for a clean retry and
-                  // tell the user, instead of leaving a dead-looking button.
-                  _pendingInvoiceNumber = invNum;
+                  // cart and the id intact for a clean retry and tell the
+                  // user, instead of leaving a dead-looking button.
+                  _pendingBillId = billId;
                   // Guard on the State, not on `context`: that one belongs to
                   // the cart's Consumer, which is unmounted whenever the view
                   // swaps (opening Settings mid-checkout) — and dropping the
@@ -10744,13 +11513,16 @@ class _BillingScreenState extends State<BillingScreen> {
               },
               style: ElevatedButton.styleFrom(
                 backgroundColor: AppColors.success,
+                disabledBackgroundColor: AppColors.success.withValues(
+                  alpha: 0.35,
+                ),
                 elevation: 0,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(10),
                 ),
               ),
               child: Text(
-                'Confirm',
+                isCredit ? 'Confirm (Credit)' : 'Confirm',
                 style: GoogleFonts.inter(
                   color: Colors.white,
                   fontWeight: FontWeight.w600,
@@ -10758,9 +11530,10 @@ class _BillingScreenState extends State<BillingScreen> {
               ),
             ),
           ],
-        ),
+          );
+        },
       ),
-    );
+    ).whenComplete(() => _disposeAfterDialog(paidCtrl));
   }
 
   Future<void> _autoSavePdf(TransactionRecord tx) async {
@@ -10783,9 +11556,8 @@ class _BillingScreenState extends State<BillingScreen> {
         logoPath: _logoPath,
         storeUpiId: _storeUpiId,
       );
-      final receiptName = tx.invoiceNumber != null
-          ? 'Receipt-${tx.invoiceNumber}'
-          : 'Receipt-${tx.id.substring(0, 6).toUpperCase()}';
+      // File-safe: drop the '#' from the canonical number.
+      final receiptName = 'Receipt-${tx.displayInvoice.replaceAll('#', '')}';
       final home = Platform.environment['HOME'] ?? '';
       final safeName = _storeName.trim().isEmpty
           ? 'BillCat'
@@ -10806,7 +11578,8 @@ class _BillingScreenState extends State<BillingScreen> {
       return;
     }
 
-    final invoiceNo = tx.invoiceNumber ?? tx.id.substring(0, 6).toUpperCase();
+    // URL/message-safe: no leading '#'. The message adds its own '#'.
+    final invoiceNo = tx.displayInvoice.replaceAll('#', '');
     final rawUid = Supabase.instance.client.auth.currentUser?.id ?? 'unknown';
     final shortUid = rawUid
         .replaceAll('-', '')
@@ -17912,7 +18685,7 @@ end tell
     final rows = txList.where((t) {
       if (q.isEmpty) return true;
       return (t.customerName ?? '').toLowerCase().contains(q) ||
-          (t.invoiceNumber?.toLowerCase().contains(q) ?? false) ||
+          t.displayInvoice.toLowerCase().contains(q) ||
           t.items.any((i) => i.productName.toLowerCase().contains(q));
     }).toList();
 
@@ -17955,10 +18728,7 @@ end tell
                 (t) => pw.TableRow(
                   children: [
                     _pdfCell(t.createdAt.toString().substring(0, 16), regular),
-                    _pdfCell(
-                      '#${t.invoiceNumber ?? t.id.substring(0, 6).toUpperCase()}',
-                      regular,
-                    ),
+                    _pdfCell(t.displayInvoice, regular),
                     _pdfCell(t.customerName ?? '—', regular),
                     _pdfCell(t.paymentMethod, regular),
                     _pdfCell(
@@ -18316,6 +19086,8 @@ end tell
                 _reportPeriodBtn('This Week'),
                 const SizedBox(width: 6),
                 _reportPeriodBtn('This Month'),
+                const SizedBox(width: 6),
+                _customPeriodBtn(),
               ],
             ],
           ),
@@ -18336,49 +19108,81 @@ end tell
   // ── Sales sub-view ─────────────────────────────────────────────────────────
 
   Widget _buildSalesReport() {
+    final isCustom = _reportSalesPeriod == 'Custom';
     final isToday = _reportSalesPeriod == 'Today';
     final isWeek = _reportSalesPeriod == 'This Week';
 
-    final revenue = isToday
-        ? _dashSales
-        : isWeek
-        ? _dashWeekSales
-        : _dashMonthSales;
-    final txCount = isToday
-        ? _dashTxCount
-        : isWeek
-        ? _dashWeekTxCount
-        : _dashMonthTxCount;
-    final items = isToday
-        ? _dashItemsSold
-        : isWeek
-        ? _dashWeekItems
-        : _dashMonthItems;
-    final profit = isToday
-        ? _dashProfitToday
-        : isWeek
-        ? _dashProfitWeek
-        : _dashProfitMonth;
-    final txList = isToday
+    final txList = isCustom
+        ? _customTxList
+        : isToday
         ? _txListToday
         : isWeek
         ? _txListWeek
         : _txListMonth;
-    final periodLabel = isToday
+
+    final double revenue;
+    final int txCount;
+    final int items;
+    final double profit;
+    if (isCustom) {
+      // Compute the same figures the dashboard precomputes, but for whatever
+      // day/month/year the owner picked.
+      final buying = {for (final p in _products) p.id: p.buyingPrice};
+      revenue = txList.fold(0.0, (s, t) => s + t.total);
+      txCount = txList.length;
+      final rawItems = txList.fold(
+        0,
+        (s, t) => s + t.items.fold(0, (a, i) => a + i.quantity),
+      );
+      items = rawItems < 0 ? 0 : rawItems;
+      profit = txList.fold(0.0, (s, t) {
+        final cogs = t.items.fold(
+          0.0,
+          (a, i) => a + (buying[i.productId] ?? 0) * i.quantity,
+        );
+        return s + (t.total - cogs);
+      });
+    } else {
+      revenue = isToday
+          ? _dashSales
+          : isWeek
+          ? _dashWeekSales
+          : _dashMonthSales;
+      txCount = isToday
+          ? _dashTxCount
+          : isWeek
+          ? _dashWeekTxCount
+          : _dashMonthTxCount;
+      items = isToday
+          ? _dashItemsSold
+          : isWeek
+          ? _dashWeekItems
+          : _dashMonthItems;
+      profit = isToday
+          ? _dashProfitToday
+          : isWeek
+          ? _dashProfitWeek
+          : _dashProfitMonth;
+    }
+    final periodLabel = isCustom
+        ? _customPeriodLabel
+        : isToday
         ? 'today'
         : isWeek
         ? 'this week'
         : 'this month';
 
     String fmtAmt(double v) {
-      final parts = v.toStringAsFixed(2).split('.');
+      final parts = v.abs().toStringAsFixed(2).split('.');
       final intPart = parts[0];
       final buf = StringBuffer();
       for (int i = 0; i < intPart.length; i++) {
         if (i > 0 && (intPart.length - i) % 3 == 0) buf.write(',');
         buf.write(intPart[i]);
       }
-      return '$_currencySymbol$buf.${parts[1]}';
+      // Sign goes before the currency symbol, not inside the grouped digits.
+      final sign = v < 0 ? '-' : '';
+      return '$sign$_currencySymbol$buf.${parts[1]}';
     }
 
     String fmtDate(DateTime dt) {
@@ -18390,6 +19194,37 @@ end tell
         return '$h:$m $ampm';
       }
       return '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')} ${(dt.hour % 12 == 0 ? 12 : dt.hour % 12)}:${dt.minute.toString().padLeft(2, '0')} ${dt.hour < 12 ? 'AM' : 'PM'}';
+    }
+
+    // Money split by where it landed: cash in the drawer vs bank (card + UPI).
+    // Refunds carry their method with a negative total, so they net down the
+    // right bucket. A hybrid bill is split by its recorded cash/UPI amounts;
+    // legacy rows whose method isn't one we recognise (e.g. old 'refund'
+    // rows) go to a separate Other line so they never skew Cash.
+    double cashIn = 0, bankIn = 0, otherIn = 0;
+    for (final t in txList) {
+      switch (t.paymentMethod) {
+        case 'cash':
+          cashIn += t.total;
+          break;
+        case 'card':
+        case 'upi':
+          bankIn += t.total;
+          break;
+        case 'hybrid':
+          // Use the stored split when it accounts for the whole bill;
+          // pre-split hybrid rows have no breakdown, so keep them separate.
+          if (t.total != 0 &&
+              (t.hybridCash + t.hybridUpi - t.total).abs() < 0.01) {
+            cashIn += t.hybridCash;
+            bankIn += t.hybridUpi;
+          } else {
+            otherIn += t.total;
+          }
+          break;
+        default:
+          otherIn += t.total;
+      }
     }
 
     return Column(
@@ -18427,6 +19262,8 @@ end tell
             ),
           ],
         ),
+        const SizedBox(height: 16),
+        _cashBankBox(cashIn, bankIn, otherIn, fmtAmt),
         const SizedBox(height: 24),
         Container(
           padding: const EdgeInsets.all(24),
@@ -18565,32 +19402,27 @@ end tell
                   final filtered = txList.where((t) {
                     if (_salesSearchQuery.isEmpty) return true;
                     final q = _salesSearchQuery.toLowerCase();
-                    final inv = t.id.substring(0, 6).toUpperCase();
                     return (t.customerName?.toLowerCase().contains(q) ??
-                            false) ||
-                        (t.invoiceNumber?.toLowerCase().contains(q) ??
                             false) ||
                         t.items.any(
                           (i) => i.productName.toLowerCase().contains(q),
                         ) ||
                         t.paymentMethod.toLowerCase().contains(q) ||
-                        inv.toLowerCase().contains(q) ||
-                        '#$inv'.toLowerCase().contains(q);
+                        t.displayInvoice.toLowerCase().contains(q);
                   }).toList();
                   return filtered.asMap().entries.map((entry) {
                     final idx = entry.key;
                     final t = entry.value;
                     // Show the real invoice number (as printed on receipts);
-                    // fall back to the short id for older sales without one.
-                    final invoiceNo = t.invoiceNumber?.isNotEmpty == true
-                        ? t.invoiceNumber!
-                        : '#${t.id.substring(0, 6).toUpperCase()}';
+                    // One canonical number derived from the shared bill id.
+                    final invoiceNo = t.displayInvoice;
                     // Returns carry negative quantities so they net off in
                     // totals; the count itself reads as a plain number.
                     final itemCount = t.items
                         .fold(0, (s, i) => s + i.quantity)
                         .abs();
-                    final reversal = t.reversalLabel;
+                    final status = _txStatus(t);
+                    final isNegative = t.total < 0;
                     final customer = (t.customerName?.isNotEmpty == true)
                         ? t.customerName!
                         : '—';
@@ -18626,46 +19458,40 @@ end tell
                                 ),
                                 Expanded(
                                   flex: 3,
-                                  child: Row(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
                                     children: [
-                                      Flexible(
+                                      Text(
+                                        invoiceNo,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: GoogleFonts.inter(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                          color: AppColors.primary,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 8,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: status.bg,
+                                          borderRadius:
+                                              BorderRadius.circular(20),
+                                        ),
                                         child: Text(
-                                          invoiceNo,
-                                          overflow: TextOverflow.ellipsis,
+                                          status.label,
                                           style: GoogleFonts.inter(
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.w600,
-                                            color: reversal != null
-                                                ? AppColors.error
-                                                : AppColors.primary,
+                                            fontSize: 8.5,
+                                            fontWeight: FontWeight.w700,
+                                            color: status.fg,
+                                            letterSpacing: 0.4,
                                           ),
                                         ),
                                       ),
-                                      if (reversal != null) ...[
-                                        const SizedBox(width: 6),
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 6,
-                                            vertical: 2,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: AppColors.error.withValues(
-                                              alpha: 0.09,
-                                            ),
-                                            borderRadius:
-                                                BorderRadius.circular(4),
-                                          ),
-                                          child: Text(
-                                            reversal,
-                                            style: GoogleFonts.inter(
-                                              fontSize: 8.5,
-                                              fontWeight: FontWeight.w700,
-                                              color: AppColors.error,
-                                              letterSpacing: 0.5,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
                                     ],
                                   ),
                                 ),
@@ -18704,14 +19530,14 @@ end tell
                                 Expanded(
                                   flex: 2,
                                   child: Text(
-                                    reversal != null
+                                    isNegative
                                         ? '-$_currencySymbol${t.total.abs().toStringAsFixed(2)}'
                                         : '$_currencySymbol${t.total.toStringAsFixed(2)}',
                                     textAlign: TextAlign.right,
                                     style: GoogleFonts.inter(
                                       fontSize: 13,
                                       fontWeight: FontWeight.w700,
-                                      color: reversal != null
+                                      color: isNegative
                                           ? AppColors.error
                                           : AppColors.textDark,
                                     ),
@@ -18734,6 +19560,50 @@ end tell
     );
   }
 
+  /// Colour-coded status shown as a bubble under the invoice number in the
+  /// sales list. The palette carries all five states the shop cares about;
+  /// today a record resolves to PAID / RETURN / EXCHANGE from its invoice
+  /// prefix. RETURN_AND_EXCHANGE needs a combined reversal record and CREDIT
+  /// needs part-payment tracking — both are wired here for when that data
+  /// lands, so the colours stay consistent.
+  ({String label, Color fg, Color bg}) _txStatus(TransactionRecord t) {
+    final styles = <String, ({String label, Color fg, Color bg})>{
+      'paid': (label: 'PAID', fg: Color(0xFF15803D), bg: Color(0x1A15803D)),
+      'return': (
+        label: 'RETURN',
+        fg: Color(0xFFDC2626),
+        bg: Color(0x1ADC2626),
+      ),
+      'exchange': (
+        label: 'EXCHANGE',
+        fg: Color(0xFF4F46E5),
+        bg: Color(0x1A4F46E5),
+      ),
+      'return_exchange': (
+        label: 'RETURN & EXCHANGE',
+        fg: Color(0xFF7C3AED),
+        bg: Color(0x1A7C3AED),
+      ),
+      'credit': (
+        label: 'CREDIT',
+        fg: Color(0xFFB45309),
+        bg: Color(0x1AB45309),
+      ),
+    };
+    final kind = t.isExchange
+        ? 'exchange'
+        : t.isReturn
+        ? 'return'
+        // A negative total with no reversal prefix is an older refund; show it
+        // as a return rather than a green PAID next to a red minus amount.
+        : t.total < 0
+        ? 'return'
+        : t.isCredit
+        ? 'credit'
+        : 'paid';
+    return styles[kind]!;
+  }
+
   void _showTransactionDetail(TransactionRecord t) {
     final payLabel =
         {
@@ -18749,9 +19619,7 @@ end tell
     final h = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
     final timeStr =
         '$h:${dt.minute.toString().padLeft(2, '0')} ${dt.hour < 12 ? 'AM' : 'PM'}';
-    final invoiceNo = t.invoiceNumber?.isNotEmpty == true
-        ? t.invoiceNumber!
-        : '#${t.id.substring(0, 6).toUpperCase()}';
+    final invoiceNo = t.displayInvoice;
 
     showDialog(
       context: context,
@@ -19700,194 +20568,12 @@ end tell
     ValueNotifier<String> digits,
     BuildContext ctx,
   ) {
-    return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      backgroundColor: Colors.white,
-      // Type the passcode instead of tapping it: the number pad stays for
-      // touch tills, but a keyboard is faster on a counter PC. Safe to grab
-      // the keys — the global scan handler stands down while a dialog is up.
-      child: Focus(
-        autofocus: true,
-        onKeyEvent: (_, event) => _passcodeKey(event, digits),
-        child: SizedBox(
-          width: 320,
-          child: Padding(
-            padding: const EdgeInsets.all(32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-              Container(
-                width: 56,
-                height: 56,
-                decoration: BoxDecoration(
-                  color: AppColors.primary.withValues(alpha: 0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: Icon(
-                  Icons.lock_outline_rounded,
-                  color: AppColors.primary,
-                  size: 28,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                title,
-                style: GoogleFonts.manrope(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.textDark,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                subtitle,
-                style: GoogleFonts.inter(
-                  fontSize: 13,
-                  color: AppColors.textMuted,
-                ),
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 28),
-              // 4 dot indicators
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: List.generate(4, (i) {
-                  final filled = i < digits.value.length;
-                  return Container(
-                    margin: const EdgeInsets.symmetric(horizontal: 8),
-                    width: 14,
-                    height: 14,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: filled ? AppColors.primary : Colors.transparent,
-                      border: Border.all(
-                        color: filled
-                            ? AppColors.primary
-                            : const Color(0xFFCCCCCC),
-                        width: 2,
-                      ),
-                    ),
-                  );
-                }),
-              ),
-              const SizedBox(height: 28),
-              // Number pad
-              ...[
-                ['1', '2', '3'],
-                ['4', '5', '6'],
-                ['7', '8', '9'],
-                ['', '0', '⌫'],
-              ].map(
-                (row) => Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: row.map((key) {
-                      if (key.isEmpty) return const SizedBox(width: 72);
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                        child: GestureDetector(
-                          onTap: () {
-                            if (key == '⌫') {
-                              if (digits.value.isNotEmpty) {
-                                digits.value = digits.value.substring(
-                                  0,
-                                  digits.value.length - 1,
-                                );
-                              }
-                            } else if (digits.value.length < 4) {
-                              digits.value = digits.value + key;
-                            }
-                          },
-                          child: Container(
-                            width: 64,
-                            height: 56,
-                            decoration: BoxDecoration(
-                              color: key == '⌫'
-                                  ? Colors.transparent
-                                  : const Color(0xFFF5F5F7),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            alignment: Alignment.center,
-                            child: key == '⌫'
-                                ? const Icon(
-                                    Icons.backspace_outlined,
-                                    size: 20,
-                                    color: Color(0xFF6E6E73),
-                                  )
-                                : Text(
-                                    key,
-                                    style: GoogleFonts.manrope(
-                                      fontSize: 22,
-                                      fontWeight: FontWeight.w600,
-                                      color: AppColors.textDark,
-                                    ),
-                                  ),
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: Text(
-                  'Cancel',
-                  style: GoogleFonts.inter(
-                    fontSize: 13,
-                    color: AppColors.textMuted,
-                  ),
-                ),
-              ),
-              ],
-            ),
-          ),
-        ),
-      ),
+    return _PasscodeDialog(
+      title: title,
+      subtitle: subtitle,
+      digits: digits,
+      onCancel: () => Navigator.pop(ctx),
     );
-  }
-
-  /// Keyboard entry for the passcode dialogs: digits fill the dots, backspace
-  /// clears the last one. The four-digit check runs off [digits] itself, so
-  /// typing the last digit submits exactly like tapping it does.
-  KeyEventResult _passcodeKey(KeyEvent event, ValueNotifier<String> digits) {
-    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
-      return KeyEventResult.ignored;
-    }
-    if (event.logicalKey == LogicalKeyboardKey.backspace) {
-      if (digits.value.isNotEmpty) {
-        digits.value = digits.value.substring(0, digits.value.length - 1);
-      }
-      return KeyEventResult.handled;
-    }
-    // character covers the number row; the numpad reports its own keys and
-    // can arrive with a null character depending on the layout.
-    var typed = event.character;
-    if (typed == null || typed.isEmpty) {
-      final numpad = <LogicalKeyboardKey, String>{
-        LogicalKeyboardKey.numpad0: '0',
-        LogicalKeyboardKey.numpad1: '1',
-        LogicalKeyboardKey.numpad2: '2',
-        LogicalKeyboardKey.numpad3: '3',
-        LogicalKeyboardKey.numpad4: '4',
-        LogicalKeyboardKey.numpad5: '5',
-        LogicalKeyboardKey.numpad6: '6',
-        LogicalKeyboardKey.numpad7: '7',
-        LogicalKeyboardKey.numpad8: '8',
-        LogicalKeyboardKey.numpad9: '9',
-      };
-      typed = numpad[event.logicalKey];
-    }
-    if (typed == null ||
-        typed.length != 1 ||
-        typed.codeUnitAt(0) < 0x30 ||
-        typed.codeUnitAt(0) > 0x39) {
-      return KeyEventResult.ignored;
-    }
-    if (digits.value.length < 4) digits.value = digits.value + typed;
-    return KeyEventResult.handled;
   }
 
   Widget _txDetailRow(String label, String value, {Color? valueColor}) =>
@@ -21055,6 +21741,235 @@ end tell
             color: active ? Colors.white : AppColors.textMuted,
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _customPeriodBtn() {
+    final active = _reportSalesPeriod == 'Custom';
+    return GestureDetector(
+      onTap: _pickCustomPeriod,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? AppColors.primary : AppColors.surfaceVariant,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: active ? AppColors.primary : AppColors.border,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.event_outlined,
+              size: 14,
+              color: active ? Colors.white : AppColors.textMuted,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              active ? _customPeriodLabel : 'Custom',
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: active ? Colors.white : AppColors.textMuted,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickCustomPeriod() async {
+    final result = await showDialog<({DateTimeRange range, String label})>(
+      context: context,
+      builder: (_) => _CalendarPeriodPicker(
+        initialStart: _customSalesRange?.start,
+        initialEnd: _customSalesRange?.end,
+      ),
+    );
+    if (result == null || !mounted) return;
+    await _applyCustomRange(result.range.start, result.range.end, result.label);
+  }
+
+  Future<void> _applyCustomRange(
+    DateTime start,
+    DateTime endInclusive,
+    String label,
+  ) async {
+    final txns = await LocalDbService.getTransactionsForRange(
+      start,
+      endInclusive,
+    );
+    if (!mounted) return;
+    setState(() {
+      _customSalesRange = DateTimeRange(start: start, end: endInclusive);
+      _customTxList = txns;
+      _customPeriodLabel = label;
+      _reportSalesPeriod = 'Custom';
+    });
+  }
+
+  /// Cash-in-hand vs bank/digital for the period, with a proportion bar.
+  /// [other] holds legacy rows without a recognised method (shown only when
+  /// non-zero) so the two headline figures stay clean.
+  Widget _cashBankBox(
+    double cash,
+    double bank,
+    double other,
+    String Function(double) fmt,
+  ) {
+    Widget half(
+      IconData icon,
+      String label,
+      double amount,
+      String subtitle,
+      Color color,
+    ) => Expanded(
+      child: Row(
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.10),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: color, size: 22),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textMuted,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  fmt(amount),
+                  style: GoogleFonts.manrope(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w800,
+                    color: AppColors.textDark,
+                  ),
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  subtitle,
+                  style: GoogleFonts.inter(
+                    fontSize: 10.5,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+
+    // Proportion bar: how the money-in splits between cash and bank. Negative
+    // (net-refund) buckets clamp to 0 so the bar never inverts.
+    final cashPos = cash > 0 ? cash : 0.0;
+    final bankPos = bank > 0 ? bank : 0.0;
+    final t = cashPos + bankPos;
+    final cashFlex = t > 0 ? (cashPos / t * 1000).round() : 0;
+
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              half(
+                Icons.payments_outlined,
+                'CASH IN HAND',
+                cash,
+                'notes in the drawer',
+                AppColors.success,
+              ),
+              Container(
+                width: 1,
+                height: 52,
+                color: AppColors.border,
+                margin: const EdgeInsets.symmetric(horizontal: 16),
+              ),
+              half(
+                Icons.account_balance_outlined,
+                'BANK / DIGITAL',
+                bank,
+                'card, UPI & digital',
+                AppColors.accentBlue,
+              ),
+            ],
+          ),
+          if (other.abs() > 0.005) ...[
+            const SizedBox(height: 14),
+            const Divider(height: 1, color: AppColors.border),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Icon(
+                  Icons.more_horiz_rounded,
+                  size: 15,
+                  color: AppColors.textMuted,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Other (method not recorded)',
+                  style: GoogleFonts.inter(
+                    fontSize: 12,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  fmt(other),
+                  style: GoogleFonts.manrope(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.textDark,
+                  ),
+                ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 18),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: SizedBox(
+              height: 8,
+              child: t <= 0
+                  ? Container(color: AppColors.border)
+                  : Row(
+                      children: [
+                        Expanded(
+                          flex: cashFlex,
+                          child: Container(color: AppColors.success),
+                        ),
+                        Expanded(
+                          flex: 1000 - cashFlex,
+                          child: Container(color: AppColors.accentBlue),
+                        ),
+                      ],
+                    ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -23093,6 +24008,200 @@ class _BarcodePainter extends CustomPainter {
   bool shouldRepaint(_BarcodePainter old) => old.data != data;
 }
 
+/// Keyboard-only passcode entry: four dots, no on-screen pad. An offstage
+/// autofocus text field owns the platform input connection, which is what
+/// makes typing reliable — it takes focus away from whatever field was
+/// active behind the dialog (the billing search box) instead of the keys
+/// leaking there. It also accepts a barcode-style burst harmlessly, since
+/// only digits count and only the first four are kept.
+class _PasscodeDialog extends StatefulWidget {
+  const _PasscodeDialog({
+    required this.title,
+    required this.subtitle,
+    required this.digits,
+    required this.onCancel,
+  });
+
+  final String title;
+  final String subtitle;
+  final ValueNotifier<String> digits;
+  final VoidCallback onCancel;
+
+  @override
+  State<_PasscodeDialog> createState() => _PasscodeDialogState();
+}
+
+class _PasscodeDialogState extends State<_PasscodeDialog> {
+  final _focus = FocusNode();
+  final _ctrl = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    // Mirror external resets (a wrong passcode clears digits) back into the
+    // hidden field, or its text drifts out of step with the dots.
+    widget.digits.addListener(_syncFromDigits);
+    // Post-frame, so the request lands after the dialog route is settled and
+    // wins focus over the field behind it.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focus.requestFocus();
+    });
+  }
+
+  void _syncFromDigits() {
+    final v = widget.digits.value;
+    if (_ctrl.text != v) {
+      _ctrl.value = TextEditingValue(
+        text: v,
+        selection: TextSelection.collapsed(offset: v.length),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.digits.removeListener(_syncFromDigits);
+    _focus.dispose();
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _onChanged(String raw) {
+    final digitsOnly = raw.replaceAll(RegExp(r'[^0-9]'), '');
+    final next = digitsOnly.length > 4 ? digitsOnly.substring(0, 4) : digitsOnly;
+    // Keep the hidden field and the passcode value in lockstep so backspace
+    // and re-entry behave, and the caller's length==4 check fires once.
+    if (_ctrl.text != next) {
+      _ctrl.value = TextEditingValue(
+        text: next,
+        selection: TextSelection.collapsed(offset: next.length),
+      );
+    }
+    widget.digits.value = next;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      backgroundColor: Colors.white,
+      child: SizedBox(
+        width: 320,
+        child: Stack(
+          children: [
+            // Full-size, invisible capture field UNDER the content. Real size
+            // (not 0x0) so the platform reliably keeps the text connection on
+            // it — that is what pulls the keyboard off the billing search box.
+            Positioned.fill(
+              child: Opacity(
+                opacity: 0,
+                child: TextField(
+                  controller: _ctrl,
+                  focusNode: _focus,
+                  autofocus: true,
+                  keyboardType: TextInputType.number,
+                  obscureText: true,
+                  showCursor: false,
+                  enableSuggestions: false,
+                  autocorrect: false,
+                  maxLength: 4,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  onChanged: _onChanged,
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 56,
+                    height: 56,
+                    decoration: BoxDecoration(
+                      color: AppColors.primary.withValues(alpha: 0.1),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.lock_outline_rounded,
+                      color: AppColors.primary,
+                      size: 28,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    widget.title,
+                    style: GoogleFonts.manrope(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    widget.subtitle,
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      color: AppColors.textMuted,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 28),
+                  ValueListenableBuilder<String>(
+                    valueListenable: widget.digits,
+                    builder: (_, value, _) => Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: List.generate(4, (i) {
+                        final filled = i < value.length;
+                        return Container(
+                          margin: const EdgeInsets.symmetric(horizontal: 8),
+                          width: 16,
+                          height: 16,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: filled
+                                ? AppColors.primary
+                                : Colors.transparent,
+                            border: Border.all(
+                              color: filled
+                                  ? AppColors.primary
+                                  : const Color(0xFFCCCCCC),
+                              width: 2,
+                            ),
+                          ),
+                        );
+                      }),
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  Text(
+                    'Type your passcode',
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextButton(
+                    onPressed: widget.onCancel,
+                    child: Text(
+                      'Cancel',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// A product being handed out in an exchange, before it becomes a sale line.
 /// Mutable quantity so the dialog's steppers can adjust it in place.
 class _ExchangeAdd {
@@ -23111,4 +24220,351 @@ class _ExchangeAdd {
   double get price => variant?.price ?? product.price;
 
   int get stock => variant?.stock ?? product.stock;
+}
+
+/// Calendar picker for the Sales "Custom" period. From one calendar you can
+/// select: a single date, a date range (tap start then end), the whole visible
+/// month, or the whole visible year. Tapping the header title flips to a month
+/// grid to jump to any month/year. Returns (range, label) or null on cancel.
+class _CalendarPeriodPicker extends StatefulWidget {
+  const _CalendarPeriodPicker({this.initialStart, this.initialEnd});
+
+  final DateTime? initialStart;
+  final DateTime? initialEnd;
+
+  @override
+  State<_CalendarPeriodPicker> createState() => _CalendarPeriodPickerState();
+}
+
+class _CalendarPeriodPickerState extends State<_CalendarPeriodPicker> {
+  static const _months = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+  static const _mon = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+  static const _dow = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+
+  late DateTime _visible; // first day of the shown month
+  DateTime? _start;
+  DateTime? _end;
+  bool _jump = false; // header month/year grid
+  late int _jumpYear;
+
+  @override
+  void initState() {
+    super.initState();
+    final base = widget.initialStart ?? DateTime.now();
+    _visible = DateTime(base.year, base.month);
+    _jumpYear = base.year;
+    _start = widget.initialStart == null
+        ? null
+        : DateTime(
+            widget.initialStart!.year,
+            widget.initialStart!.month,
+            widget.initialStart!.day,
+          );
+    if (widget.initialStart != null &&
+        widget.initialEnd != null &&
+        !_sameDay(widget.initialStart!, widget.initialEnd!)) {
+      _end = DateTime(
+        widget.initialEnd!.year,
+        widget.initialEnd!.month,
+        widget.initialEnd!.day,
+      );
+    }
+  }
+
+  bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  String _dayLabel(DateTime d) => '${d.day} ${_mon[d.month - 1]} ${d.year}';
+
+  String _rangeLabel(DateTime s, DateTime e) {
+    if (s.year == e.year && s.month == e.month) {
+      return '${s.day}–${e.day} ${_mon[s.month - 1]} ${s.year}';
+    }
+    if (s.year == e.year) {
+      return '${s.day} ${_mon[s.month - 1]} – ${e.day} ${_mon[e.month - 1]} ${e.year}';
+    }
+    return '${_dayLabel(s)} – ${_dayLabel(e)}';
+  }
+
+  void _tapDay(DateTime d) {
+    setState(() {
+      if (_start == null || _end != null) {
+        _start = d;
+        _end = null;
+      } else if (d.isBefore(_start!)) {
+        _end = _start;
+        _start = d;
+      } else {
+        _end = d;
+      }
+    });
+  }
+
+  void _apply() {
+    if (_start == null) return;
+    final s = _start!;
+    final e = _end ?? _start!;
+    Navigator.pop(context, (
+      range: DateTimeRange(start: s, end: e),
+      label: _end == null ? _dayLabel(s) : _rangeLabel(s, e),
+    ));
+  }
+
+  void _applyMonth() {
+    final s = DateTime(_visible.year, _visible.month, 1);
+    final e = DateTime(_visible.year, _visible.month + 1, 0);
+    Navigator.pop(context, (
+      range: DateTimeRange(start: s, end: e),
+      label: '${_mon[_visible.month - 1]} ${_visible.year}',
+    ));
+  }
+
+  void _applyYear() {
+    final y = _visible.year;
+    Navigator.pop(context, (
+      range: DateTimeRange(start: DateTime(y, 1, 1), end: DateTime(y, 12, 31)),
+      label: 'Year $y',
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const primary = AppColors.primary;
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      child: SizedBox(
+        width: 360,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  IconButton(
+                    onPressed: () => setState(() {
+                      if (_jump) {
+                        _jumpYear--;
+                      } else {
+                        _visible = DateTime(_visible.year, _visible.month - 1);
+                      }
+                    }),
+                    icon: const Icon(Icons.chevron_left_rounded),
+                  ),
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => setState(() {
+                        _jump = !_jump;
+                        _jumpYear = _visible.year;
+                      }),
+                      child: Center(
+                        child: Text(
+                          _jump
+                              ? '$_jumpYear'
+                              : '${_months[_visible.month - 1]} ${_visible.year}',
+                          style: GoogleFonts.manrope(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            color: AppColors.textDark,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => setState(() {
+                      if (_jump) {
+                        _jumpYear++;
+                      } else {
+                        _visible = DateTime(_visible.year, _visible.month + 1);
+                      }
+                    }),
+                    icon: const Icon(Icons.chevron_right_rounded),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              if (_jump)
+                GridView.count(
+                  shrinkWrap: true,
+                  crossAxisCount: 3,
+                  childAspectRatio: 2.1,
+                  mainAxisSpacing: 8,
+                  crossAxisSpacing: 8,
+                  physics: const NeverScrollableScrollPhysics(),
+                  children: [
+                    for (int m = 1; m <= 12; m++)
+                      InkWell(
+                        onTap: () => setState(() {
+                          _visible = DateTime(_jumpYear, m);
+                          _jump = false;
+                        }),
+                        borderRadius: BorderRadius.circular(8),
+                        child: Container(
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color:
+                                _visible.year == _jumpYear && _visible.month == m
+                                ? primary.withValues(alpha: 0.10)
+                                : null,
+                            border: Border.all(color: AppColors.border),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Text(
+                            _mon[m - 1],
+                            style: GoogleFonts.inter(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.textDark,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                )
+              else ...[
+                Row(
+                  children: _dow
+                      .map(
+                        (d) => Expanded(
+                          child: Center(
+                            child: Text(
+                              d,
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.textMuted,
+                              ),
+                            ),
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
+                const SizedBox(height: 4),
+                _dayGrid(primary),
+              ],
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: _applyMonth,
+                      child: Text(
+                        'Whole month',
+                        style: GoogleFonts.inter(fontSize: 12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: _applyYear,
+                      child: Text(
+                        'Whole year',
+                        style: GoogleFonts.inter(fontSize: 12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _start == null
+                          ? 'Tap a day, or a start & end for a range'
+                          : _end == null
+                          ? _dayLabel(_start!)
+                          : _rangeLabel(_start!, _end!),
+                      style: GoogleFonts.inter(
+                        fontSize: 11.5,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: Text(
+                      'Cancel',
+                      style: GoogleFonts.inter(color: AppColors.textMuted),
+                    ),
+                  ),
+                  ElevatedButton(
+                    onPressed: _start == null ? null : _apply,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: primary,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                    ),
+                    child: const Text('Apply'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _dayGrid(Color primary) {
+    final firstDow = DateTime(_visible.year, _visible.month, 1).weekday % 7;
+    final daysInMonth = DateTime(_visible.year, _visible.month + 1, 0).day;
+    final cells = <Widget>[];
+    for (var i = 0; i < firstDow; i++) {
+      cells.add(const SizedBox());
+    }
+    for (var day = 1; day <= daysInMonth; day++) {
+      final d = DateTime(_visible.year, _visible.month, day);
+      final isStart = _start != null && _sameDay(d, _start!);
+      final isEnd = _end != null && _sameDay(d, _end!);
+      final selected = isStart || isEnd;
+      final inRange =
+          _start != null &&
+          _end != null &&
+          d.isAfter(_start!) &&
+          d.isBefore(_end!);
+      cells.add(
+        InkWell(
+          onTap: () => _tapDay(d),
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            margin: const EdgeInsets.all(2),
+            decoration: BoxDecoration(
+              color: selected
+                  ? primary
+                  : inRange
+                  ? primary.withValues(alpha: 0.12)
+                  : null,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              '$day',
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: selected ? Colors.white : AppColors.textDark,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return GridView.count(
+      shrinkWrap: true,
+      crossAxisCount: 7,
+      childAspectRatio: 1.1,
+      physics: const NeverScrollableScrollPhysics(),
+      children: cells,
+    );
+  }
 }

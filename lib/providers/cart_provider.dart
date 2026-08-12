@@ -18,6 +18,17 @@ class CartProvider extends ChangeNotifier {
   PaymentMethod paymentMethod = PaymentMethod.cash;
   double taxRate = 0.0;
 
+  // Hybrid split: how the total is divided between cash and UPI. Only
+  // meaningful when paymentMethod == hybrid.
+  double hybridCash = 0;
+  double hybridUpi = 0;
+
+  void setHybridSplit(double cash, double upi) {
+    hybridCash = cash;
+    hybridUpi = upi;
+    notifyListeners();
+  }
+
   void setTaxRate(double rate) {
     taxRate = rate;
     notifyListeners();
@@ -119,6 +130,11 @@ class CartProvider extends ChangeNotifier {
 
   void setPaymentMethod(PaymentMethod m) {
     paymentMethod = m;
+    // Start the split empty — the cashier fills one side, the other follows.
+    if (m == PaymentMethod.hybrid) {
+      hybridCash = 0;
+      hybridUpi = 0;
+    }
     notifyListeners();
   }
 
@@ -141,10 +157,19 @@ class CartProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> checkout({String? invoiceNumber}) async {
+  Future<void> checkout({String? billId, double? amountPaid}) async {
+    // Default to full payment; anything less is recorded as a balance owed.
+    final paid = amountPaid ?? total;
+    final balanceDue = (total - paid) > 0.005 ? total - paid : 0.0;
+    // Persist the cash/UPI split so receipts and the Cash & Bank report can
+    // break a hybrid bill down. Zero for every other method.
+    final isHybrid = paymentMethod == PaymentMethod.hybrid;
     final record = TransactionRecord(
-      id: const Uuid().v4(),
-      invoiceNumber: invoiceNumber,
+      // Shared with the printed preview so both derive the same #XXXXXX number.
+      id: billId ?? const Uuid().v4(),
+      balanceDue: balanceDue,
+      hybridCash: isHybrid ? hybridCash : 0,
+      hybridUpi: isHybrid ? hybridUpi : 0,
       customerName: customerName.isEmpty ? null : customerName,
       customerPhone: customerPhone.isEmpty ? null : customerPhone,
       items: _items.map((i) => TransactionItem(
@@ -181,6 +206,8 @@ class CartProvider extends ChangeNotifier {
     customerName = '';
     customerPhone = '';
     discountValue = 0;
+    hybridCash = 0;
+    hybridUpi = 0;
     notifyListeners();
   }
 }

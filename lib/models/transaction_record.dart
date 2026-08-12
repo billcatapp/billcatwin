@@ -47,7 +47,9 @@ class TransactionItem {
     productName: m['productName'] as String,
     description: (m['description'] as String?) ?? '',
     price: (m['price'] as num).toDouble(),
-    quantity: m['quantity'] as int,
+    // Defensive like price: tolerate a quantity that arrives as a double from
+    // the cloud (e.g. 1.0), so one odd row can't throw and drop a whole pull.
+    quantity: (m['quantity'] as num).toInt(),
     variantId: m['variantId'] as String?,
     variantLabel: m['variantLabel'] as String?,
     taxPercent: (m['taxPercent'] as num?)?.toDouble() ?? 0,
@@ -68,6 +70,17 @@ class TransactionRecord {
   final DateTime createdAt;
   final bool synced;
 
+  /// Amount of [total] still owed on a credit sale. 0 means fully paid, which
+  /// is every ordinary bill and every bill that predates this field, so old
+  /// data reads correctly with no back-fill.
+  final double balanceDue;
+
+  /// For a hybrid (split) payment: how much of [total] was taken in cash vs
+  /// UPI. Both 0 for every non-hybrid bill and for hybrid bills that predate
+  /// this field.
+  final double hybridCash;
+  final double hybridUpi;
+
   const TransactionRecord({
     required this.id,
     this.invoiceNumber,
@@ -81,7 +94,15 @@ class TransactionRecord {
     required this.paymentMethod,
     required this.createdAt,
     this.synced = false,
+    this.balanceDue = 0,
+    this.hybridCash = 0,
+    this.hybridUpi = 0,
   });
+
+  /// Fractional tolerance keeps rounding noise from flagging a paid bill.
+  bool get isCredit => balanceDue > 0.005;
+
+  double get amountPaid => total - balanceDue;
 
   /// Prefixes that mark a record as reversing an earlier bill. Returns are
   /// stored as their own record with negative amounts and quantities — no
@@ -108,6 +129,24 @@ class TransactionRecord {
   String? get reversalLabel =>
       !isReturn ? null : (isExchange ? 'EXCHANGE' : 'RETURN');
 
+  /// The one invoice number shown EVERYWHERE — list, receipts, dialogs, PDF.
+  /// Derived from the shared bill id ('#' + first 6 chars, upper) so the same
+  /// sale reads identically on every device, Mac included. A return/exchange
+  /// keeps its stored RTN-/EXC- number, which already embeds the original
+  /// bill's derived id. Old bills that stored an 'INV…' number are ignored on
+  /// purpose so everything converges on one format.
+  static String shortId(String id) =>
+      id.length >= 6 ? id.substring(0, 6).toUpperCase() : id.toUpperCase();
+
+  String get displayInvoice {
+    final inv = invoiceNumber;
+    if (inv != null &&
+        (inv.startsWith(returnPrefix) || inv.startsWith(exchangePrefix))) {
+      return inv;
+    }
+    return '#${shortId(id)}';
+  }
+
   Map<String, dynamic> toMap() => {
     'id': id,
     'invoice_number': invoiceNumber,
@@ -121,6 +160,9 @@ class TransactionRecord {
     'payment_method': paymentMethod,
     'created_at': createdAt.toIso8601String(),
     'synced': synced ? 1 : 0,
+    'balance_due': balanceDue,
+    'hybrid_cash': hybridCash,
+    'hybrid_upi': hybridUpi,
   };
 
   factory TransactionRecord.fromMap(Map<String, dynamic> m) {
@@ -138,6 +180,9 @@ class TransactionRecord {
       paymentMethod: m['payment_method'] as String,
       createdAt: DateTime.parse(m['created_at'] as String),
       synced: (m['synced'] as int) == 1,
+      balanceDue: (m['balance_due'] as num?)?.toDouble() ?? 0,
+      hybridCash: (m['hybrid_cash'] as num?)?.toDouble() ?? 0,
+      hybridUpi: (m['hybrid_upi'] as num?)?.toDouble() ?? 0,
     );
   }
 }

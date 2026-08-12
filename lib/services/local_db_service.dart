@@ -71,6 +71,9 @@ class LocalDbService {
       'invoice_number': 'TEXT',
       'deleted': 'INTEGER NOT NULL DEFAULT 0',
       'rev': 'INTEGER NOT NULL DEFAULT 0',
+      'balance_due': 'REAL NOT NULL DEFAULT 0',
+      'hybrid_cash': 'REAL NOT NULL DEFAULT 0',
+      'hybrid_upi': 'REAL NOT NULL DEFAULT 0',
     },
     'customers': {
       'address': 'TEXT',
@@ -115,7 +118,7 @@ class LocalDbService {
   static Future<Database> _openVersioned(String dbPath, String userId) async {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 15,
+      version: 17,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try {
@@ -237,6 +240,27 @@ class LocalDbService {
             } catch (_) {}
           }
         }
+        if (oldVersion < 16) {
+          // Credit sales: amount still owed on a bill. Default 0 keeps every
+          // existing sale correctly fully-paid.
+          try {
+            await db.execute(
+              'ALTER TABLE transactions ADD COLUMN balance_due REAL NOT NULL '
+              'DEFAULT 0',
+            );
+          } catch (_) {}
+        }
+        if (oldVersion < 17) {
+          // Hybrid (split) payment: cash vs UPI portions. Default 0.
+          for (final col in ['hybrid_cash', 'hybrid_upi']) {
+            try {
+              await db.execute(
+                'ALTER TABLE transactions ADD COLUMN $col REAL NOT NULL '
+                'DEFAULT 0',
+              );
+            } catch (_) {}
+          }
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -294,7 +318,10 @@ class LocalDbService {
         created_at TEXT NOT NULL,
         synced INTEGER NOT NULL DEFAULT 0,
         deleted INTEGER NOT NULL DEFAULT 0,
-        rev INTEGER NOT NULL DEFAULT 0
+        rev INTEGER NOT NULL DEFAULT 0,
+        balance_due REAL NOT NULL DEFAULT 0,
+        hybrid_cash REAL NOT NULL DEFAULT 0,
+        hybrid_upi REAL NOT NULL DEFAULT 0
       )
     ''');
     await db.execute('''
@@ -580,6 +607,35 @@ class LocalDbService {
     await database.delete('transactions');
     await database.delete('customers');
     await database.delete('categories');
+  }
+
+  /// Tables the Data-reset screen is allowed to wipe. A fixed allow-list so a
+  /// caller can never interpolate an arbitrary table name into the SQL below.
+  static const Set<String> resettableTables = {
+    'customers',
+    'transactions',
+    'products',
+    'product_variants',
+    'categories',
+  };
+
+  /// Bulk soft-delete for the Settings → Data reset options. Every live row in
+  /// each table is marked deleted + unsynced, so it disappears locally at once
+  /// and the ordinary sync push (getPendingDelete*/confirmed cloud delete +
+  /// purge) turns each into a real cloud deletion. Works offline: the
+  /// tombstones simply wait for reconnect. Reuses the exact per-row mechanism
+  /// as single deletes — no direct cloud calls and no change to the sync engine.
+  static Future<void> softDeleteAllInTables(List<String> tables) async {
+    final database = await db;
+    await database.transaction((txn) async {
+      for (final t in tables) {
+        if (!resettableTables.contains(t)) continue;
+        await txn.rawUpdate(
+          'UPDATE $t SET deleted = 1, synced = 0, rev = rev + 1 '
+          'WHERE deleted = 0',
+        );
+      }
+    });
   }
 
   // ── Products ──────────────────────────────────────────────────────────────
@@ -1048,6 +1104,30 @@ class LocalDbService {
     final database = await db;
     await database.transaction((txn) async {
       await _writeTransactionRow(txn, t);
+    });
+  }
+
+  /// Records an exchange as ONE atomic unit: the [reversal] (goods coming
+  /// back) and the new [sale] (goods going out), each with its stock movement,
+  /// commit together or not at all. Without this, a crash between the two
+  /// writes could leave the return saved but the new sale lost — a
+  /// half-recorded exchange. The customer is auto-saved from the sale, exactly
+  /// as [insertTransaction] does.
+  static Future<void> insertExchange(
+    TransactionRecord reversal,
+    TransactionRecord sale,
+  ) async {
+    final database = await db;
+    await database.transaction((txn) async {
+      await _writeTransactionRow(txn, reversal);
+      await _writeTransactionRow(txn, sale);
+      if (sale.customerName != null && sale.customerName!.isNotEmpty) {
+        await _upsertCustomerByPhone(
+          txn,
+          name: sale.customerName!,
+          phone: sale.customerPhone,
+        );
+      }
     });
   }
 

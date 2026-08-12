@@ -160,9 +160,7 @@ class ThermalPrinter {
       '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year} '
       '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}:${d.second.toString().padLeft(2, '0')}',
     );
-    if (tx.invoiceNumber != null && tx.invoiceNumber!.isNotEmpty) {
-      _line(b, 'INVOICE ID: ${tx.invoiceNumber}');
-    }
+    _line(b, 'INVOICE ID: ${tx.displayInvoice}');
 
     b.addAll([_esc, 0x61, 0x00]); // back to left justification
     _sep(b);
@@ -260,6 +258,18 @@ class ThermalPrinter {
 
     // ── Payment ──────────────────────────────────────────────────────────
     _line(b, _row('Payment Method', tx.paymentMethod));
+    // Hybrid split: show how much was cash vs UPI.
+    if (tx.hybridCash > 0.005 || tx.hybridUpi > 0.005) {
+      _line(b, _row('  Cash', money(tx.hybridCash)));
+      _line(b, _row('  UPI', money(tx.hybridUpi)));
+    }
+    // Credit sale: show what was paid and what is still owed.
+    if (tx.balanceDue > 0.005) {
+      _line(b, _row('Paid', money(tx.amountPaid)));
+      b.addAll([_esc, 0x21, 0x08]); // bold
+      _line(b, _row('BALANCE DUE', money(tx.balanceDue)));
+      b.addAll([_esc, 0x21, 0x00]);
+    }
 
     // ── UPI QR (when the store has a UPI id configured) ──────────────────
     if (storeUpiId.isNotEmpty) {
@@ -267,7 +277,7 @@ class ThermalPrinter {
           'upi://pay?pa=${Uri.encodeComponent(storeUpiId)}'
           '&pn=${Uri.encodeComponent(storeName)}'
           '&am=${tx.total.toStringAsFixed(2)}&cu=INR'
-          '${tx.invoiceNumber != null && tx.invoiceNumber!.isNotEmpty ? '&tn=${Uri.encodeComponent(tx.invoiceNumber!)}' : ''}';
+          '&tn=${Uri.encodeComponent(tx.displayInvoice)}';
       b.addAll([_esc, 0x61, 0x01]); // center
       b.add(_lf);
       b.addAll(_qr(upiUrl));

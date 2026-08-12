@@ -60,7 +60,7 @@ class ReceiptPrinter {
     await Future.delayed(const Duration(milliseconds: 80));
     await Printing.layoutPdf(
       onLayout: (_) async => pdfBytes,
-      name: 'Receipt-${tx.id.substring(0, 6).toUpperCase()}',
+      name: 'Receipt-${tx.displayInvoice.replaceAll('#', '')}',
     );
   }
 
@@ -100,7 +100,7 @@ class ReceiptPrinter {
     );
     await Printing.sharePdf(
       bytes: pdfBytes,
-      filename: 'Receipt-${tx.id.substring(0, 6).toUpperCase()}.pdf',
+      filename: 'Receipt-${tx.displayInvoice.replaceAll('#', '')}.pdf',
     );
   }
 
@@ -223,7 +223,7 @@ class ReceiptPrinter {
 
             // ── Bill metadata ─────────────────────────────────────────────
             pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-              pw.Text('Bill #${tx.id.substring(0, 6).toUpperCase()}',
+              pw.Text('Bill ${tx.displayInvoice}',
                   style: pw.TextStyle(font: regular, fontSize: fs - 1, color: PdfColors.grey600)),
               pw.Text(_fmt(tx.createdAt),
                   style: pw.TextStyle(font: regular, fontSize: fs - 1, color: PdfColors.grey600)),
@@ -398,7 +398,7 @@ class ReceiptPrinter {
             pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.end, children: [
               pw.Text('INVOICE', style: pw.TextStyle(font: b, fontSize: 16, color: PdfColors.grey300, letterSpacing: 2)),
               pw.SizedBox(height: 4),
-              pw.Text('#${tx.id.substring(0, 6).toUpperCase()}', style: pw.TextStyle(font: b, fontSize: fs, color: PdfColors.white)),
+              pw.Text(tx.displayInvoice, style: pw.TextStyle(font: b, fontSize: fs, color: PdfColors.white)),
               pw.Text(_fmt(tx.createdAt), style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey300)),
               if (tx.customerName?.isNotEmpty == true) pw.Text(tx.customerName!, style: pw.TextStyle(font: b, fontSize: fs - 0.5, color: PdfColors.white)),
             ]),
@@ -472,7 +472,7 @@ class ReceiptPrinter {
               if (storeGstin.isNotEmpty) ...[pw.SizedBox(height: 2), pw.Text('GSTIN: $storeGstin', style: pw.TextStyle(font: b, fontSize: fs - 1))],
             ])),
             pw.Padding(padding: const pw.EdgeInsets.all(10), child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-              _tiTotalRow('Invoice No.', tx.id.substring(0, 6).toUpperCase(), r, fs - 1),
+              _tiTotalRow('Invoice No.', tx.displayInvoice, r, fs - 1),
               _tiTotalRow('Date', _fmtDate(tx.createdAt), r, fs - 1),
               _tiTotalRow('Time', _fmtTime(tx.createdAt), r, fs - 1),
               if (tx.customerName?.isNotEmpty == true) _tiTotalRow('Bill To', tx.customerName!, b, fs - 1),
@@ -538,7 +538,7 @@ class ReceiptPrinter {
         pw.SizedBox(height: 6),
         pw.Divider(color: PdfColors.grey400, thickness: 0.5),
         pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-          pw.Text('Bill: ${tx.id.substring(0, 6).toUpperCase()}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
+          pw.Text('Bill: ${tx.displayInvoice}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
           pw.Text(_fmt(tx.createdAt), style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
         ]),
         if (tx.customerName?.isNotEmpty == true) pw.Text('Customer: ${tx.customerName}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
@@ -616,7 +616,7 @@ class ReceiptPrinter {
         if (storePhone.isNotEmpty) pw.Center(child: pw.Text('Tel: $storePhone', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600))),
         pw.SizedBox(height: 6), pw.Divider(color: PdfColors.grey400, thickness: 0.5), pw.SizedBox(height: 5),
         pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-          pw.Text('Bill #${tx.id.substring(0, 6).toUpperCase()}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
+          pw.Text('Bill ${tx.displayInvoice}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
           pw.Text(_fmt(tx.createdAt), style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
         ]),
         if (tx.customerName?.isNotEmpty == true) pw.Text('Customer: ${tx.customerName}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
@@ -664,7 +664,7 @@ class ReceiptPrinter {
         if (storeAddress.isNotEmpty) pw.Center(child: pw.Text(storeAddress, style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600))),
         pw.SizedBox(height: 4),
         pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-          pw.Text('Bill #${tx.id.substring(0, 6).toUpperCase()}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
+          pw.Text('Bill ${tx.displayInvoice}', style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
           pw.Text(_fmt(tx.createdAt), style: pw.TextStyle(font: r, fontSize: fs - 1, color: PdfColors.grey600)),
         ]),
         pw.SizedBox(height: 12),
@@ -728,7 +728,7 @@ class ReceiptPrinter {
     final r = _regular!; final b = _bold!;
     const fs = 9.0;
     const grey4 = pw.BorderSide(color: PdfColors.grey400, width: 0.5);
-    final invoiceNo = 'INV-${tx.id.substring(0, 6).toUpperCase()}';
+    final invoiceNo = tx.displayInvoice;
     final doc = pw.Document();
     doc.addPage(pw.Page(pageFormat: PdfPageFormat.a4, margin: const pw.EdgeInsets.all(28), build: (_) {
       return pw.Container(
@@ -861,7 +861,7 @@ class ReceiptPrinter {
     final cgst       = tx.taxAmount / 2;
     final sgst       = tx.taxAmount / 2;
     final totalQty   = tx.items.fold<int>(0, (s, i) => s + i.quantity);
-    final invoiceNo  = 'Inv. ${tx.id.substring(0, 6).toUpperCase()}';
+    final invoiceNo = tx.displayInvoice;
 
     const grey4 = pw.BorderSide(color: PdfColors.grey400, width: 0.5);
     const grey6 = pw.BorderSide(color: PdfColors.grey600, width: 0.8);
@@ -1322,7 +1322,7 @@ class ReceiptPrinter {
     final sgst = tx.taxAmount / 2;
     final halfRate = (double.tryParse(taxRate) ?? 18.0) / 2;
     final totalQty = tx.items.fold<int>(0, (s, i) => s + i.quantity);
-    final invoiceNo = 'INV-${tx.id.substring(0, 6).toUpperCase()}';
+    final invoiceNo = tx.displayInvoice;
 
     final doc = pw.Document();
     doc.addPage(
@@ -1820,7 +1820,7 @@ class ReceiptPrinter {
     final cgst       = tx.taxAmount / 2;
     final sgst       = tx.taxAmount / 2;
     final totalQty   = tx.items.fold<int>(0, (s, i) => s + i.quantity);
-    final invoiceNo  = tx.id.length >= 6 ? tx.id.substring(0, 6).toUpperCase() : tx.id.toUpperCase();
+    final invoiceNo = tx.displayInvoice;
 
     const border4   = pw.BorderSide(color: PdfColors.grey400, width: 0.5);
     const border6   = pw.BorderSide(color: PdfColors.grey600, width: 0.8);
@@ -2302,7 +2302,7 @@ class ReceiptPrinter {
 
     const fs = 8.5;
     final totalQty  = tx.items.fold<int>(0, (s, i) => s + i.quantity);
-    final invoiceNo = tx.id.length >= 6 ? tx.id.substring(0, 6).toUpperCase() : tx.id.toUpperCase();
+    final invoiceNo = tx.displayInvoice;
     final dateStr   = () {
       final d = tx.createdAt;
       return '${d.day.toString().padLeft(2,'0')}-${d.month.toString().padLeft(2,'0')}-${d.year}';
@@ -2572,7 +2572,7 @@ class ReceiptPrinter {
     }
 
     const double fs = 8.5;
-    final invoiceNo = 'Inv. ${tx.id.substring(0, 6).toUpperCase()}';
+    final invoiceNo = tx.displayInvoice;
     final totalQty  = tx.items.fold<int>(0, (s, i) => s + i.quantity);
     final dateStr   = '${tx.createdAt.day.toString().padLeft(2, '0')}/${tx.createdAt.month.toString().padLeft(2, '0')}/${tx.createdAt.year}';
 
@@ -2897,7 +2897,7 @@ class ReceiptPrinter {
     }
 
     const double fs = 8.5;
-    final invoiceNo = tx.id.substring(0, 6).toUpperCase();
+    final invoiceNo = tx.displayInvoice;
     final totalQty  = tx.items.fold<int>(0, (s, i) => s + i.quantity);
     final dateStr   = '${tx.createdAt.day.toString().padLeft(2, '0')}-${tx.createdAt.month.toString().padLeft(2, '0')}-${tx.createdAt.year}';
 
@@ -3207,7 +3207,7 @@ class ReceiptPrinter {
     }
 
     const double fs = 8.5;
-    final invoiceNo = tx.id.substring(0, 6).toUpperCase();
+    final invoiceNo = tx.displayInvoice;
     final dateStr   = '${tx.createdAt.day.toString().padLeft(2, '0')}/${tx.createdAt.month.toString().padLeft(2, '0')}/${tx.createdAt.year}';
 
     // Long date: DD MMMM YYYY
