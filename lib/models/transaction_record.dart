@@ -130,21 +130,17 @@ class TransactionRecord {
       !isReturn ? null : (isExchange ? 'EXCHANGE' : 'RETURN');
 
   /// The one invoice number shown EVERYWHERE — list, receipts, dialogs, PDF.
-  /// Derived from the shared bill id ('#' + first 6 chars, upper) so the same
-  /// sale reads identically on every device, Mac included. A return/exchange
-  /// keeps its stored RTN-/EXC- number, which already embeds the original
-  /// bill's derived id. Old bills that stored an 'INV…' number are ignored on
-  /// purpose so everything converges on one format.
+  /// It is the stored number the bill was issued (the Mac-format 8-char code
+  /// for new sales, or an RTN-/EXC- number for a reversal), so the same sale
+  /// reads identically on every device. A handful of very old bills carry no
+  /// stored number and fall back to a short id.
   static String shortId(String id) =>
       id.length >= 6 ? id.substring(0, 6).toUpperCase() : id.toUpperCase();
 
   String get displayInvoice {
     final inv = invoiceNumber;
-    if (inv != null &&
-        (inv.startsWith(returnPrefix) || inv.startsWith(exchangePrefix))) {
-      return inv;
-    }
-    return '#${shortId(id)}';
+    if (inv != null && inv.isNotEmpty) return inv;
+    return shortId(id);
   }
 
   Map<String, dynamic> toMap() => {

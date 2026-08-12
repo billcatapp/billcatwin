@@ -1,4 +1,4 @@
-// Verifies the unified #XXXXXX invoice number logic.
+// Verifies the invoice-number logic after reconciling to the Mac 8-char code.
 //   dart run tool/chkinvoice.dart
 import 'package:billcat/models/transaction_record.dart';
 
@@ -21,37 +21,38 @@ void main() {
     ok ? pass++ : fail++;
   }
 
-  // 1. Normal sale: # + first 6 of id, upper. Stored INV… is ignored.
-  final s = sale('0cd045ab-1234', invoiceNumber: 'INV2608810707');
-  check('normal sale derives #0CD045 (ignores stored INV…)',
-      s.displayInvoice == '#0CD045');
+  // 1. A new sale shows the stored 8-char Mac-format code verbatim.
+  final s = sale('some-uuid-1234', invoiceNumber: 'A7K2M9QZ');
+  check('sale shows its stored 8-char code', s.displayInvoice == 'A7K2M9QZ');
 
-  // 2. Print preview and saved bill share the id => same number.
-  final preview = sale('abcdef12-9999'); // snapshot
-  final saved = sale('abcdef12-9999'); // checkout, same id
-  check('preview == saved when id shared',
+  // 2. Print preview and saved bill share the SAME stored number (they are
+  //    passed the one invNum), so both read identically regardless of id.
+  final preview = sale('preview-id-aaaa', invoiceNumber: 'B8N4P0RS');
+  final saved = sale('saved-id-bbbb', invoiceNumber: 'B8N4P0RS');
+  check('preview == saved when number shared',
       preview.displayInvoice == saved.displayInvoice &&
-          saved.displayInvoice == '#ABCDEF');
+          saved.displayInvoice == 'B8N4P0RS');
 
-  // 3. Return keeps its stored RTN-#… and points back at the original.
-  final orig = sale('0cd045ab-1234');
-  final base = '#${TransactionRecord.shortId(orig.id)}'; // #0CD045
-  final ret = sale('ffff0000-5555',
-      invoiceNumber: '${TransactionRecord.returnPrefix}$base'); // RTN-#0CD045
-  check('return shows its RTN-# number', ret.displayInvoice == 'RTN-#0CD045');
-  check('return points back at #0CD045', ret.returnOfInvoice == '#0CD045');
+  // 3. A return keeps its RTN-<code> and points back at the original.
+  final ret = sale('ret-uuid', invoiceNumber: 'RTN-A7K2M9QZ');
+  check('return shows RTN-<code>', ret.displayInvoice == 'RTN-A7K2M9QZ');
+  check('return points back at the code', ret.returnOfInvoice == 'A7K2M9QZ');
   check('return isReturn', ret.isReturn && !ret.isExchange);
 
   // 4. Exchange reversal.
-  final exc = sale('1111aaaa-7777',
-      invoiceNumber: '${TransactionRecord.exchangePrefix}$base'); // EXC-#0CD045
-  check('exchange shows EXC-# number', exc.displayInvoice == 'EXC-#0CD045');
+  final exc = sale('exc-uuid', invoiceNumber: 'EXC-A7K2M9QZ');
+  check('exchange shows EXC-<code>', exc.displayInvoice == 'EXC-A7K2M9QZ');
   check('exchange isExchange', exc.isExchange);
 
-  // 5. Old Mac bill (no invoice number) — still consistent from id.
-  final mac = sale('842095ff-0000');
-  check('mac bill (no invoice) derives #842095',
-      mac.displayInvoice == '#842095');
+  // 5. A very old bill with no stored number falls back to a short id.
+  final old = sale('842095ff-0000');
+  check('numberless bill falls back to short id',
+      old.displayInvoice == '842095');
+
+  // 6. Old INV… bills keep their issued number (not normalised away).
+  final legacy = sale('legacy-uuid', invoiceNumber: 'INV2608810707');
+  check('legacy INV bill keeps its number',
+      legacy.displayInvoice == 'INV2608810707');
 
   print('\n$pass passed, $fail failed');
 }

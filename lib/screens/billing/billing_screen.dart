@@ -9401,7 +9401,7 @@ class _BillingScreenState extends State<BillingScreen> {
           ElevatedButton(
             onPressed: () {
               cart.clearCart();
-              _pendingBillId = null;
+              _pendingInvoiceNumber = null;
               Navigator.pop(context);
             },
             style: ElevatedButton.styleFrom(
@@ -9428,12 +9428,13 @@ class _BillingScreenState extends State<BillingScreen> {
 
   TransactionRecord _snapshotCart(
     CartProvider cart, {
-    String? billId,
+    String? invoiceNumber,
     double balanceDue = 0,
   }) => TransactionRecord(
-        // Same id the saved bill will get, so the printed preview's #XXXXXX
-        // invoice number matches the sale that lands in the sales list.
-        id: billId ?? DateTime.now().millisecondsSinceEpoch.toString(),
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        // Same number the saved bill will carry, so the printed preview and
+        // the sale that lands in the list show one invoice number.
+        invoiceNumber: invoiceNumber,
         balanceDue: balanceDue,
         customerName: cart.customerName.isEmpty ? null : cart.customerName,
         customerPhone: cart.customerPhone.isEmpty ? null : cart.customerPhone,
@@ -9463,11 +9464,10 @@ class _BillingScreenState extends State<BillingScreen> {
         createdAt: DateTime.now(),
       );
 
-  /// Id assigned to the bill currently being rung up. Fixed the first time the
-  /// bill is printed and reused at checkout, so the #XXXXXX invoice number
-  /// (derived from this id) on the printed receipt always matches the saved
-  /// sale. Cleared when the bill is closed or cleared.
-  String? _pendingBillId;
+  /// Invoice number for the bill currently being rung up. Fixed the first time
+  /// the bill is printed and reused at checkout, so the number on the printed
+  /// receipt always matches the saved sale. Cleared when closed or cleared.
+  String? _pendingInvoiceNumber;
 
   // ── Return / exchange ────────────────────────────────────────────────────
   //
@@ -9479,10 +9479,9 @@ class _BillingScreenState extends State<BillingScreen> {
   // exchange — goods back, goods out, and the difference — is settled inside
   // the one dialog, so nothing is ever carried into the ordinary cart.
 
-  /// Canonical #XXXXXX number of an ORIGINAL bill — derived from its shared
-  /// id so a reversal built on it ('RTN-#XXXXXX') matches everywhere.
-  String _reversalBaseRef(TransactionRecord t) =>
-      '#${TransactionRecord.shortId(t.id)}';
+  /// The ORIGINAL bill's invoice number, so a reversal built on it
+  /// ('RTN-<number>') points back at exactly the bill it reverses.
+  String _reversalBaseRef(TransactionRecord t) => t.displayInvoice;
 
   /// Quantity of each line of [original] that earlier returns already took
   /// back, keyed the same way the cart keys lines. Stops the same item being
@@ -9588,7 +9587,7 @@ class _BillingScreenState extends State<BillingScreen> {
   TransactionRecord _buildExchangeSale(
     List<_ExchangeAdd> adds, {
     required String paymentMethod,
-    String? id,
+    String? invoiceNumber,
     String? customerName,
     String? customerPhone,
   }) {
@@ -9615,9 +9614,10 @@ class _BillingScreenState extends State<BillingScreen> {
       );
     }
     return TransactionRecord(
-      // Fixed id (shared between the printed preview and the saved sale) so
-      // its derived #XXXXXX number is the same on the receipt and in Sales.
-      id: id ?? const Uuid().v4(),
+      id: const Uuid().v4(),
+      // Fixed number (shared between the printed preview and the saved sale)
+      // so the receipt and the Sales row show one invoice number.
+      invoiceNumber: invoiceNumber,
       customerName: customerName,
       customerPhone: customerPhone,
       items: items,
@@ -9688,7 +9688,7 @@ class _BillingScreenState extends State<BillingScreen> {
     TransactionRecord? picked;
     // Fixed id for the exchange's new-sale row, so its #XXXXXX number is the
     // same whether the receipt is printed before or after completing.
-    final exchangeSaleId = const Uuid().v4();
+    final exchangeSaleInvoice = LocalDbService.generateInvoiceId();
     // Line index -> 'return' or 'exchange'. Absent means "keeping it".
     var mode = <int, String>{};
     var cap = <int, int>{};
@@ -9809,7 +9809,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 : _buildExchangeSale(
                     adds,
                     paymentMethod: payMethod,
-                    id: exchangeSaleId,
+                    invoiceNumber: exchangeSaleInvoice,
                     customerName: picked!.customerName,
                     customerPhone: picked!.customerPhone,
                   );
@@ -9817,7 +9817,7 @@ class _BillingScreenState extends State<BillingScreen> {
             if (sale == null) return rev; // pure refund
             if (rev == null) return sale; // adding only, nothing returned
             return TransactionRecord(
-              id: exchangeSaleId,
+              id: const Uuid().v4(),
               invoiceNumber:
                   '${TransactionRecord.exchangePrefix}${_reversalBaseRef(picked!)}',
               customerName: picked!.customerName,
@@ -9864,7 +9864,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   : _buildExchangeSale(
                       adds,
                       paymentMethod: payMethod,
-                      id: exchangeSaleId,
+                      invoiceNumber: exchangeSaleInvoice,
                       customerName: picked!.customerName,
                       customerPhone: picked!.customerPhone,
                     );
@@ -10722,9 +10722,9 @@ class _BillingScreenState extends State<BillingScreen> {
     String docType = 'Invoice',
     bool toPrinter = false,
   }) {
-    _pendingBillId ??= const Uuid().v4();
+    _pendingInvoiceNumber ??= LocalDbService.generateInvoiceId();
     _printRecord(
-      _snapshotCart(cart, billId: _pendingBillId),
+      _snapshotCart(cart, invoiceNumber: _pendingInvoiceNumber),
       docType: docType,
       toPrinter: toPrinter,
     );
@@ -11468,27 +11468,29 @@ class _BillingScreenState extends State<BillingScreen> {
               onPressed: !canConfirm
                   ? null
                   : () async {
-                // Reuse the id already printed on this bill, if any, so the
-                // receipt and the saved sale share one #XXXXXX number.
-                final billId = _pendingBillId ?? const Uuid().v4();
-                _pendingBillId = null;
+                // Reuse the number already printed on this bill, if any, so
+                // the receipt and the saved sale share one invoice number.
+                final invNum =
+                    _pendingInvoiceNumber ??
+                    LocalDbService.generateInvoiceId();
+                _pendingInvoiceNumber = null;
                 final snapshot = _snapshotCart(
                   cart,
-                  billId: billId,
+                  invoiceNumber: invNum,
                   balanceDue: balanceDue,
                 );
                 final phone = cart.customerPhone;
                 Navigator.pop(ctx);
                 try {
                   await cart.checkout(
-                    billId: billId,
+                    invoiceNumber: invNum,
                     amountPaid: paid,
                   );
                 } catch (e) {
                   // The checkout is atomic, so nothing was saved: keep the
-                  // cart and the id intact for a clean retry and tell the
+                  // cart and the number intact for a clean retry and tell the
                   // user, instead of leaving a dead-looking button.
-                  _pendingBillId = billId;
+                  _pendingInvoiceNumber = invNum;
                   // Guard on the State, not on `context`: that one belongs to
                   // the cart's Consumer, which is unmounted whenever the view
                   // swaps (opening Settings mid-checkout) — and dropping the

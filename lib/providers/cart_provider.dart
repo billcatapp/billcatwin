@@ -157,7 +157,7 @@ class CartProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> checkout({String? billId, double? amountPaid}) async {
+  Future<void> checkout({String? invoiceNumber, double? amountPaid}) async {
     // Default to full payment; anything less is recorded as a balance owed.
     final paid = amountPaid ?? total;
     final balanceDue = (total - paid) > 0.005 ? total - paid : 0.0;
@@ -165,8 +165,9 @@ class CartProvider extends ChangeNotifier {
     // break a hybrid bill down. Zero for every other method.
     final isHybrid = paymentMethod == PaymentMethod.hybrid;
     final record = TransactionRecord(
-      // Shared with the printed preview so both derive the same #XXXXXX number.
-      id: billId ?? const Uuid().v4(),
+      id: const Uuid().v4(),
+      // The Mac-format code, shared with the printed preview.
+      invoiceNumber: invoiceNumber,
       balanceDue: balanceDue,
       hybridCash: isHybrid ? hybridCash : 0,
       hybridUpi: isHybrid ? hybridUpi : 0,
