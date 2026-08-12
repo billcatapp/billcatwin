@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' show Random;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
@@ -253,12 +254,12 @@ class LocalDbService {
 
   // ── Invoice ID ───────────────────────────────────────────────────────────
 
+  // Same 8-character format the Mac app issues, so a bill's number looks
+  // identical no matter which device rang it up.
   static String generateInvoiceId() {
-    final now = DateTime.now();
-    final prefix =
-        'INV${now.year % 100}${now.month.toString().padLeft(2, '0')}';
-    final suffix = now.millisecondsSinceEpoch.toString().substring(7);
-    return '$prefix$suffix';
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    final rng = Random.secure();
+    return List.generate(8, (_) => chars[rng.nextInt(chars.length)]).join();
   }
 
   // ── Settings ──────────────────────────────────────────────────────────────
