@@ -14942,79 +14942,69 @@ end tell
     required String? selectedId,
     required ValueChanged<String?> onSelect,
     required VoidCallback onAdd,
+    required VoidCallback onRename,
   }) {
+    final selected = variants.isEmpty
+        ? null
+        : variants.firstWhere(
+            (v) => v.id == (selectedId ?? variants.first.id),
+            orElse: () => variants.first,
+          );
     return Container(
       height: 44,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      alignment: Alignment.centerLeft,
       decoration: BoxDecoration(
         color: AppColors.surfaceVariant,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: AppColors.border),
       ),
-      child: DropdownButtonHideUnderline(
-        child: Builder(
-          builder: (context) {
-            // Once a product has variants, the plain "Base product" is no
-            // longer a sellable option — only the variants are shown.
-            final showBase = variants.isEmpty;
-            final effectiveValue = showBase
-                ? (selectedId ?? '__base__')
-                : (selectedId ?? variants.first.id);
-            return DropdownButton<String>(
-              value: effectiveValue,
-              isExpanded: true,
-              isDense: true,
-              style: GoogleFonts.inter(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: AppColors.textDark,
+      child: Row(
+        children: [
+          GestureDetector(
+            onTap: onAdd,
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 10),
+              child: Icon(Icons.add_rounded, size: 16, color: AppColors.primary),
+            ),
+          ),
+          Container(width: 1, height: 24, color: AppColors.border),
+          Expanded(
+            child: GestureDetector(
+              onTap: selected != null ? onRename : null,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Text(
+                  selected?.label ?? 'Add variant',
+                  style: GoogleFonts.inter(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: selected != null ? AppColors.textDark : AppColors.primary,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
-              items: [
-                DropdownMenuItem(
-                  value: '__add__',
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(
-                        Icons.add_rounded,
-                        size: 14,
-                        color: AppColors.primary,
-                      ),
-                      const SizedBox(width: 4),
-                      Text(
-                        'Add variant',
-                        style: GoogleFonts.inter(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.primary,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (showBase)
-                  const DropdownMenuItem(
-                    value: '__base__',
-                    child: Text('Base product'),
-                  ),
-                ...variants.map(
-                  (v) => DropdownMenuItem(
-                    value: v.id,
-                    child: Text(v.label, overflow: TextOverflow.ellipsis),
-                  ),
-                ),
-              ],
-              onChanged: (val) {
-                if (val == '__add__') {
-                  onAdd();
-                  return;
-                }
-                onSelect(val == '__base__' ? null : val);
-              },
-            );
-          },
-        ),
+            ),
+          ),
+          if (variants.length > 1)
+            DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: selected?.id,
+                isDense: true,
+                icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 18),
+                items: variants
+                    .map((v) => DropdownMenuItem(
+                          value: v.id,
+                          child: Text(v.label),
+                        ))
+                    .toList(),
+                onChanged: (val) => onSelect(val),
+              ),
+            )
+          else
+            const Padding(
+              padding: EdgeInsets.only(right: 8),
+              child: Icon(Icons.keyboard_arrow_down_rounded, size: 18, color: AppColors.border),
+            ),
+        ],
       ),
     );
   }
@@ -15845,6 +15835,19 @@ end tell
                                                               variantNameMode =
                                                                   'new';
                                                             }),
+                                                        onRename: () =>
+                                                            setLocal(() {
+                                                              final v = variants
+                                                                  .firstWhere(
+                                                                    (x) =>
+                                                                        x.id ==
+                                                                        selectedVariantId,
+                                                                  );
+                                                              variantNameCtrl
+                                                                  .text = v.label;
+                                                              variantNameMode =
+                                                                  v.id;
+                                                            }),
                                                       ),
                                               ),
                                             ],
@@ -15863,29 +15866,6 @@ end tell
                                                     ),
                                                   ),
                                                 ),
-                                                GestureDetector(
-                                                  onTap: () => setLocal(() {
-                                                    final v = variants
-                                                        .firstWhere(
-                                                          (x) =>
-                                                              x.id ==
-                                                              selectedVariantId,
-                                                        );
-                                                    variantNameCtrl.text =
-                                                        v.label;
-                                                    variantNameMode = v.id;
-                                                  }),
-                                                  child: Text(
-                                                    'Rename',
-                                                    style: GoogleFonts.inter(
-                                                      fontSize: 10,
-                                                      fontWeight:
-                                                          FontWeight.w600,
-                                                      color: AppColors.primary,
-                                                    ),
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 10),
                                                 GestureDetector(
                                                   onTap: () => setLocal(() {
                                                     variants.removeWhere(
@@ -16927,6 +16907,19 @@ end tell
                                                               variantNameMode =
                                                                   'new';
                                                             }),
+                                                        onRename: () =>
+                                                            setLocal(() {
+                                                              final v = variants
+                                                                  .firstWhere(
+                                                                    (x) =>
+                                                                        x.id ==
+                                                                        selectedVariantId,
+                                                                  );
+                                                              variantNameCtrl
+                                                                  .text = v.label;
+                                                              variantNameMode =
+                                                                  v.id;
+                                                            }),
                                                       ),
                                               ),
                                             ],
@@ -16945,29 +16938,6 @@ end tell
                                                     ),
                                                   ),
                                                 ),
-                                                GestureDetector(
-                                                  onTap: () => setLocal(() {
-                                                    final v = variants
-                                                        .firstWhere(
-                                                          (x) =>
-                                                              x.id ==
-                                                              selectedVariantId,
-                                                        );
-                                                    variantNameCtrl.text =
-                                                        v.label;
-                                                    variantNameMode = v.id;
-                                                  }),
-                                                  child: Text(
-                                                    'Rename',
-                                                    style: GoogleFonts.inter(
-                                                      fontSize: 10,
-                                                      fontWeight:
-                                                          FontWeight.w600,
-                                                      color: AppColors.primary,
-                                                    ),
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 10),
                                                 GestureDetector(
                                                   onTap: () => setLocal(() {
                                                     variants.removeWhere(

@@ -217,6 +217,10 @@ class LabelPrinter {
       'gainscha',
       'gprinter',
       'rongta',
+      'tvs',
+      'snbc',
+      'lp46',
+      'lp 46',
     ];
     const nonTsplHints = [
       'zebra',
