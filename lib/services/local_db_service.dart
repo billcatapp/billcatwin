@@ -5,6 +5,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:uuid/uuid.dart';
 import '../models/customer.dart';
+import '../models/dealer.dart';
 import '../models/product.dart';
 import '../models/product_variant.dart';
 import '../models/transaction_record.dart';
@@ -90,6 +91,10 @@ class LocalDbService {
     // Idempotent: only ever creates what is absent, never rewrites data.
     try {
       await db.execute(_productVariantsTableSql);
+    } catch (_) {}
+    try {
+      await db.execute(_dealersTableSql);
+      await _seedDealersFromProducts(db);
     } catch (_) {}
     for (final table in _expectedColumns.entries) {
       final Set<String> present;
@@ -265,6 +270,20 @@ class LocalDbService {
       onCreate: (db, _) => _createTables(db),
     );
   }
+
+  // Local-only dealer directory. Deliberately NOT part of cloud sync: the
+  // sync system is finalized, and products already carry dealer_name (which
+  // does sync), so dealer attribution survives across devices either way.
+  static const String _dealersTableSql = '''
+    CREATE TABLE IF NOT EXISTS dealers (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT '',
+      deleted INTEGER NOT NULL DEFAULT 0
+    )
+  ''';
 
   static const String _productVariantsTableSql = '''
     CREATE TABLE IF NOT EXISTS product_variants (
@@ -650,12 +669,61 @@ class LocalDbService {
     return rows.map(Product.fromMap).toList();
   }
 
-  static Future<List<String>> getDealerNames() async {
-    final database = await db;
-    final rows = await database.rawQuery(
-      "SELECT DISTINCT dealer_name FROM products WHERE dealer_name != '' AND deleted = 0 ORDER BY dealer_name ASC",
+  // ── Dealers (local-only directory) ────────────────────────────────────────
+
+  /// One-time-per-name import: any dealer name already typed on a product
+  /// becomes a directory entry, so the dropdown starts pre-filled after the
+  /// update. Safe to run on every open — existing names are skipped
+  /// case-insensitively.
+  static Future<void> _seedDealersFromProducts(Database db) async {
+    final existing = {
+      for (final r in await db.query('dealers', columns: ['name']))
+        (r['name'] as String).toLowerCase(),
+    };
+    final rows = await db.rawQuery(
+      "SELECT DISTINCT dealer_name FROM products WHERE dealer_name != '' AND deleted = 0",
     );
-    return rows.map((r) => r['dealer_name'] as String).toList();
+    for (final r in rows) {
+      final name = (r['dealer_name'] as String).trim();
+      if (name.isEmpty || existing.contains(name.toLowerCase())) continue;
+      await db.insert('dealers', {
+        'id': const Uuid().v4(),
+        'name': name,
+        'phone': '',
+        'notes': '',
+        'created_at': DateTime.now().toIso8601String(),
+        'deleted': 0,
+      });
+      existing.add(name.toLowerCase());
+    }
+  }
+
+  static Future<List<Dealer>> getDealers() async {
+    final database = await db;
+    final rows = await database.query(
+      'dealers',
+      where: 'deleted = 0',
+      orderBy: 'name COLLATE NOCASE ASC',
+    );
+    return rows.map(Dealer.fromMap).toList();
+  }
+
+  static Future<void> insertDealer(Dealer dealer) async {
+    final database = await db;
+    await database.insert('dealers', {
+      ...dealer.toMap(),
+      'deleted': 0,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  static Future<void> deleteDealer(String id) async {
+    final database = await db;
+    await database.update(
+      'dealers',
+      {'deleted': 1},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   static Future<void> insertProduct(Product product) async {

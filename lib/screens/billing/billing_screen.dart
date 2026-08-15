@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:io';
 import 'dart:math' show max;
 import 'dart:typed_data';
@@ -12,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../constants/app_colors.dart';
 import 'package:uuid/uuid.dart';
 import '../../models/customer.dart';
+import '../../models/dealer.dart';
 import '../../models/product.dart';
 import '../../models/product_variant.dart';
 import '../../models/transaction_record.dart';
@@ -33,6 +34,26 @@ import '../../services/whatsapp_service.dart' as _wa;
 import '../auth/login_screen.dart';
 
 const _defaultProducts = <Product>[];
+
+// ── Money formatting ─────────────────────────────────────────────────────────
+
+/// Groups integer digits with thousands separators: '12345' -> '12,345'.
+String _groupDigits(String intStr) {
+  final neg = intStr.startsWith('-');
+  final s = neg ? intStr.substring(1) : intStr;
+  final buf = StringBuffer();
+  for (var i = 0; i < s.length; i++) {
+    if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
+    buf.write(s[i]);
+  }
+  return '${neg ? '-' : ''}$buf';
+}
+
+/// Formats [v] as money with comma-grouped digits, e.g. ₹1,234.50.
+String _moneyFmt(String symbol, double v) {
+  final parts = v.toStringAsFixed(2).split('.');
+  return '$symbol${_groupDigits(parts[0])}.${parts[1]}';
+}
 
 // ── Currency data ────────────────────────────────────────────────────────────
 
@@ -168,6 +189,9 @@ class _BillingScreenState extends State<BillingScreen> {
   // Reports state
   String _reportView = 'Sales';
   String _utilitiesView = 'Delivery';
+  // Dealers page data, reloaded when the page opens or a dealer changes.
+  Future<(List<Dealer>, List<Product>, Map<String, List<ProductVariant>>)>?
+  _dealersPageFuture;
   String _salesSearchQuery = '';
   String _customerSearchQuery = '';
   List<Customer> _reportCustomers = [];
@@ -180,6 +204,9 @@ class _BillingScreenState extends State<BillingScreen> {
   // Hybrid split fields (Cash / UPI), shown when Hybrid is the payment method.
   final _hybridCashCtrl = TextEditingController();
   final _hybridUpiCtrl = TextEditingController();
+  // Which side of the split the cashier last typed; the other side is derived
+  // and re-follows the total when it changes.
+  bool _hybridKeepCash = true;
   final _customerNameFocus = FocusNode();
   final _customerPhoneFocus = FocusNode();
   final _addCustomerFocus = FocusNode();
@@ -259,6 +286,8 @@ class _BillingScreenState extends State<BillingScreen> {
   String _taxRateDisplay = '0';
   String _currencySymbol = '₹';
   String _currencyCode = 'INR';
+
+  String _fmt(double v) => _moneyFmt(_currencySymbol, v);
   String _dialCode = '+91'; // default India
   String _invoiceLayout = 'Classic';
   String _printOrientation = 'Portrait';
@@ -312,6 +341,11 @@ class _BillingScreenState extends State<BillingScreen> {
   bool _addingCustomProduct = false;
   final _customNameCtrl = TextEditingController();
   final _customPriceCtrl = TextEditingController();
+  final _customQtyCtrl = TextEditingController(text: '1');
+  final _customPriceFocus = FocusNode();
+  // Picking a suggestion fills the fields; mute the list until the name is
+  // typed in again, or the picked product would immediately re-list itself.
+  bool _customSuggestionsMuted = false;
   String _settingsPage = 'General';
   String _editStoreName = 'BillCat Store';
   String _editStoreAddress = '';
@@ -632,8 +666,17 @@ class _BillingScreenState extends State<BillingScreen> {
       return false;
     }
 
-    // Billing shortcuts: Ctrl+P = Print Bill, Ctrl+C = Paid/Close Bill.
+    // Billing shortcuts: Ctrl+P = Print Bill, Ctrl+C = Paid/Close Bill,
+    // Alt+X = print (per saved Print Bill toggles) + close bill in one go.
     final key = event.logicalKey;
+    if (HardwareKeyboard.instance.isAltPressed) {
+      if (key == LogicalKeyboardKey.keyX) {
+        final cart = context.read<CartProvider>();
+        if (cart.items.isNotEmpty && !_isPrinting) _printAndCloseBill(cart);
+        return true;
+      }
+      return false;
+    }
     if (HardwareKeyboard.instance.isControlPressed) {
       if (key == LogicalKeyboardKey.keyP) {
         final cart = context.read<CartProvider>();
@@ -887,7 +930,7 @@ class _BillingScreenState extends State<BillingScreen> {
                             Text(
                               outOfStock
                                   ? 'Out of stock'
-                                  : '$_currencySymbol${v.price.toStringAsFixed(2)}',
+                                  : '${_fmt(v.price)}',
                               style: GoogleFonts.inter(
                                 fontSize: 12,
                                 fontWeight: FontWeight.w600,
@@ -1167,6 +1210,8 @@ class _BillingScreenState extends State<BillingScreen> {
     _addCustomerFocus.dispose();
     _customNameCtrl.dispose();
     _customPriceCtrl.dispose();
+    _customQtyCtrl.dispose();
+    _customPriceFocus.dispose();
     super.dispose();
   }
 
@@ -1670,9 +1715,11 @@ class _BillingScreenState extends State<BillingScreen> {
         setState(() {
           _selectedTab = 4;
           _utilitiesView = value;
+          // Refresh so newly added products/dealers show up on open.
+          if (value == 'Dealers') _dealersPageFuture = _loadDealersPage();
         });
       },
-      itemBuilder: (_) => ['Delivery']
+      itemBuilder: (_) => ['Delivery', 'Dealers']
           .map(
             (v) => PopupMenuItem<String>(
               value: v,
@@ -1682,6 +1729,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   Icon(
                     switch (v) {
                       'Delivery' => Icons.local_shipping_outlined,
+                      'Dealers' => Icons.storefront_outlined,
                       _ => Icons.build_outlined,
                     },
                     size: 16,
@@ -2604,10 +2652,12 @@ class _BillingScreenState extends State<BillingScreen> {
     void confirm() {
       final name = _customNameCtrl.text.trim();
       final price = double.tryParse(_customPriceCtrl.text) ?? 0;
+      final qty = int.tryParse(_customQtyCtrl.text.trim()) ?? 1;
       if (name.isNotEmpty && price > 0) {
+        final id = DateTime.now().millisecondsSinceEpoch.toString();
         cart.addProduct(
           Product(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
+            id: id,
             name: name,
             price: price,
             category: 'Custom',
@@ -2616,101 +2666,279 @@ class _BillingScreenState extends State<BillingScreen> {
             stock: 99,
           ),
         );
+        if (qty > 1) cart.setQuantity(id, qty, stock: 99);
+        _customNameCtrl.clear();
+        _customPriceCtrl.clear();
+        _customQtyCtrl.text = '1';
         setState(() => _addingCustomProduct = false);
       }
     }
 
+    // Live matches from the saved product list. Picking one fills the name
+    // and price fields (price stays editable), and Enter saves the line.
+    // Variant products list one row per variant, the sellable unit.
+    final q = _customNameCtrl.text.trim().toLowerCase();
+    final suggestions = <(Product, ProductVariant?)>[];
+    if (q.isNotEmpty && !_customSuggestionsMuted) {
+      for (final p in _products) {
+        if (suggestions.length >= 6) break;
+        if (!p.name.toLowerCase().contains(q) &&
+            !p.sku.toLowerCase().contains(q)) {
+          continue;
+        }
+        final vs = _variantsByProduct[p.id] ?? const <ProductVariant>[];
+        if (vs.isEmpty) {
+          suggestions.add((p, null));
+        } else {
+          for (final v in vs) {
+            if (suggestions.length >= 6) break;
+            suggestions.add((p, v));
+          }
+        }
+      }
+    }
+
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: const Color(0xFFF8F8FF),
-        border: Border.all(color: AppColors.primary.withOpacity(0.3)),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          const Text('📦', style: TextStyle(fontSize: 18)),
-          const SizedBox(width: 10),
-          Expanded(
-            flex: 5,
-            child: TextField(
-              controller: _customNameCtrl,
-              autofocus: true,
-              style: GoogleFonts.inter(
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-              ),
-              decoration: InputDecoration.collapsed(
-                hintText: 'Item name',
-                hintStyle: GoogleFonts.inter(
-                  fontSize: 13,
-                  color: AppColors.textMuted,
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextField(
+                      controller: _customNameCtrl,
+                      autofocus: true,
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.primary,
+                      ),
+                      decoration: InputDecoration.collapsed(
+                        hintText: 'Item name',
+                        hintStyle: GoogleFonts.inter(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                      // Rebuild so the saved-product suggestions track the
+                      // query.
+                      onChanged: (_) =>
+                          setState(() => _customSuggestionsMuted = false),
+                      // Enter moves on to the price; Enter there saves.
+                      onSubmitted: (_) {
+                        _customPriceFocus.requestFocus();
+                        _customPriceCtrl.selection = TextSelection(
+                          baseOffset: 0,
+                          extentOffset: _customPriceCtrl.text.length,
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'CUSTOM ITEM',
+                      style: GoogleFonts.inter(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w300,
+                        color: AppColors.textMuted.withValues(alpha: 0.6),
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              onSubmitted: (_) => confirm(),
-            ),
-          ),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 80,
-            child: TextField(
-              controller: _customPriceCtrl,
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
-              ),
-              inputFormatters: [
-                FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
-              ],
-              style: GoogleFonts.inter(
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-              ),
-              decoration: InputDecoration.collapsed(
-                hintText: 'Price',
-                hintStyle: GoogleFonts.inter(
-                  fontSize: 13,
-                  color: AppColors.textMuted,
+              const SizedBox(width: 8),
+              Container(
+                width: 90,
+                padding: const EdgeInsets.all(3),
+                decoration: BoxDecoration(
+                  color: AppColors.surfaceVariant,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppColors.border),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    GestureDetector(
+                      onTap: () {
+                        final q =
+                            (int.tryParse(_customQtyCtrl.text) ?? 1) - 1;
+                        setState(
+                          () => _customQtyCtrl.text = '${q < 1 ? 1 : q}',
+                        );
+                      },
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 4),
+                        child: Icon(
+                          Icons.remove,
+                          size: 14,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 32,
+                      child: TextField(
+                        controller: _customQtyCtrl,
+                        keyboardType: TextInputType.number,
+                        textAlign: TextAlign.center,
+                        inputFormatters: [
+                          FilteringTextInputFormatter.digitsOnly,
+                        ],
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.primary,
+                        ),
+                        decoration: const InputDecoration(
+                          border: InputBorder.none,
+                          isDense: true,
+                          contentPadding: EdgeInsets.zero,
+                        ),
+                        onSubmitted: (_) => confirm(),
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: () {
+                        final q =
+                            (int.tryParse(_customQtyCtrl.text) ?? 1) + 1;
+                        setState(() => _customQtyCtrl.text = '$q');
+                      },
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 4),
+                        child: Icon(
+                          Icons.add,
+                          size: 14,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              textAlign: TextAlign.right,
-              onSubmitted: (_) => confirm(),
-            ),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 96,
+                child: TextField(
+                  controller: _customPriceCtrl,
+                  focusNode: _customPriceFocus,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                  ],
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.primary,
+                  ),
+                  decoration: InputDecoration.collapsed(
+                    hintText: 'Price',
+                    hintStyle: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                  textAlign: TextAlign.right,
+                  onSubmitted: (_) => confirm(),
+                ),
+              ),
+              SizedBox(
+                width: 28,
+                child: Center(
+                  child: GestureDetector(
+                    onTap: () =>
+                        setState(() => _addingCustomProduct = false),
+                    child: Icon(
+                      Icons.close_rounded,
+                      size: 18,
+                      color: AppColors.textMuted.withValues(alpha: 0.5),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 8),
-          GestureDetector(
-            onTap: confirm,
-            child: Container(
-              width: 28,
-              height: 28,
-              decoration: BoxDecoration(
-                color: AppColors.primary,
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: const Icon(
-                Icons.check_rounded,
-                size: 16,
-                color: Colors.white,
+          if (suggestions.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            const Divider(height: 1, color: AppColors.border),
+            const SizedBox(height: 4),
+            ...suggestions.map(
+              (s) => InkWell(
+                onTap: () {
+                  final (p, v) = s;
+                  final name = v == null ? p.name : '${p.name} (${v.label})';
+                  final price = v?.price ?? p.price;
+                  setState(() {
+                    _customSuggestionsMuted = true;
+                    _customNameCtrl.text = name;
+                    _customPriceCtrl.text = price > 0
+                        ? price.toStringAsFixed(2)
+                        : '';
+                  });
+                  // Land on the price with it selected, so typing overwrites
+                  // and Enter saves as-is.
+                  _customPriceFocus.requestFocus();
+                  _customPriceCtrl.selection = TextSelection(
+                    baseOffset: 0,
+                    extentOffset: _customPriceCtrl.text.length,
+                  );
+                },
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 5),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              s.$2 == null
+                                  ? s.$1.name
+                                  : '${s.$1.name} (${s.$2!.label})',
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.inter(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.textDark,
+                              ),
+                            ),
+                            Text(
+                              'SKU: ${(s.$2?.sku.isNotEmpty ?? false) ? s.$2!.sku : s.$1.sku}'
+                                  .toUpperCase(),
+                              style: GoogleFonts.inter(
+                                fontSize: 9,
+                                fontWeight: FontWeight.w300,
+                                color: AppColors.textMuted.withValues(
+                                  alpha: 0.7,
+                                ),
+                                letterSpacing: 0.8,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _fmt(s.$2?.price ?? s.$1.price),
+                        style: GoogleFonts.inter(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.primary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
-          ),
-          const SizedBox(width: 6),
-          GestureDetector(
-            onTap: () => setState(() => _addingCustomProduct = false),
-            child: Container(
-              width: 28,
-              height: 28,
-              decoration: BoxDecoration(
-                color: AppColors.border,
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: const Icon(
-                Icons.close_rounded,
-                size: 16,
-                color: AppColors.textMuted,
-              ),
-            ),
-          ),
+          ],
         ],
       ),
     );
@@ -2750,7 +2978,7 @@ class _BillingScreenState extends State<BillingScreen> {
               _DiscountToggle(cart: cart, currencySymbol: _currencySymbol),
               const Spacer(),
               Text(
-                '-$_currencySymbol${cart.discountAmount.toStringAsFixed(2)}',
+                '-${_fmt(cart.discountAmount)}',
                 style: GoogleFonts.inter(
                   fontSize: 13,
                   color: AppColors.success,
@@ -2806,7 +3034,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    '$_currencySymbol${cart.total.toStringAsFixed(2)}',
+                    '${_fmt(cart.total)}',
                     style: GoogleFonts.manrope(
                       fontSize: 28,
                       fontWeight: FontWeight.w900,
@@ -2885,7 +3113,7 @@ class _BillingScreenState extends State<BillingScreen> {
               ),
               const Spacer(),
               Text(
-                '$_currencySymbol${base.toStringAsFixed(2)}',
+                '${_fmt(base)}',
                 style: GoogleFonts.inter(
                   fontSize: 12.5,
                   fontWeight: FontWeight.w600,
@@ -2927,7 +3155,7 @@ class _BillingScreenState extends State<BillingScreen> {
               ],
               const Spacer(),
               Text(
-                '+ $_currencySymbol${taxAmount.toStringAsFixed(2)}',
+                '+ ${_fmt(taxAmount)}',
                 style: GoogleFonts.inter(
                   fontSize: 12.5,
                   fontWeight: FontWeight.w600,
@@ -2969,7 +3197,7 @@ class _BillingScreenState extends State<BillingScreen> {
               ),
               const Spacer(),
               Text(
-                '$_currencySymbol${finalPrice.toStringAsFixed(2)}',
+                '${_fmt(finalPrice)}',
                 style: GoogleFonts.manrope(
                   fontSize: 24,
                   fontWeight: FontWeight.w800,
@@ -3042,7 +3270,7 @@ class _BillingScreenState extends State<BillingScreen> {
         ),
         const Spacer(),
         Text(
-          '$_currencySymbol${amount.toStringAsFixed(2)}',
+          '${_fmt(amount)}',
           style: GoogleFonts.inter(
             fontSize: 13,
             fontWeight: FontWeight.w700,
@@ -3170,6 +3398,18 @@ class _BillingScreenState extends State<BillingScreen> {
   Widget _buildHybridSplit(CartProvider cart) {
     final entered = cart.hybridCash + cart.hybridUpi;
     final balanced = (entered - cart.total).abs() < 0.01;
+    // The total moved after the split was typed (an item was added or
+    // removed — the inline custom product row is the usual cause). Keep the
+    // side the cashier actually typed and re-derive the other, instead of
+    // going stale and blocking the close.
+    if (!balanced &&
+        (_hybridCashCtrl.text.trim().isNotEmpty ||
+            _hybridUpiCtrl.text.trim().isNotEmpty)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || cart.paymentMethod != PaymentMethod.hybrid) return;
+        _rebalanceHybridSplit(cart);
+      });
+    }
     return Padding(
       padding: const EdgeInsets.only(top: 12),
       child: Column(
@@ -3211,8 +3451,8 @@ class _BillingScreenState extends State<BillingScreen> {
           const SizedBox(height: 6),
           Text(
             balanced
-                ? 'Cash + UPI = $_currencySymbol${cart.total.toStringAsFixed(2)}'
-                : 'Must add up to $_currencySymbol${cart.total.toStringAsFixed(2)}',
+                ? 'Cash + UPI = ${_fmt(cart.total)}'
+                : 'Must add up to ${_fmt(cart.total)}',
             style: GoogleFonts.inter(
               fontSize: 10.5,
               fontWeight: FontWeight.w500,
@@ -3222,6 +3462,25 @@ class _BillingScreenState extends State<BillingScreen> {
         ],
       ),
     );
+  }
+
+  /// Re-derives the hybrid split against the current total, keeping whichever
+  /// side the cashier last typed ([_hybridKeepCash]) and clamping it to the
+  /// total when the total shrank below it.
+  void _rebalanceHybridSplit(CartProvider cart) {
+    final total = cart.total > 0 ? cart.total : 0.0;
+    final keptCtrl = _hybridKeepCash ? _hybridCashCtrl : _hybridUpiCtrl;
+    final otherCtrl = _hybridKeepCash ? _hybridUpiCtrl : _hybridCashCtrl;
+    final typed = double.tryParse(keptCtrl.text.trim()) ?? 0;
+    final kept = typed.clamp(0.0, total).toDouble();
+    final other = total - kept;
+    if (typed > kept) keptCtrl.text = kept.toStringAsFixed(2);
+    otherCtrl.text = other.toStringAsFixed(2);
+    if (_hybridKeepCash) {
+      cart.setHybridSplit(kept, other);
+    } else {
+      cart.setHybridSplit(other, kept);
+    }
   }
 
   /// Handles a keystroke in a hybrid split field: rejects malformed input,
@@ -3234,6 +3493,7 @@ class _BillingScreenState extends State<BillingScreen> {
     required TextEditingController otherCtrl,
     required void Function(double thisAmt, double otherAmt) setSplit,
   }) {
+    _hybridKeepCash = thisCtrl == _hybridCashCtrl;
     final trimmed = v.trim();
     final parsed = double.tryParse(trimmed);
     // A malformed non-empty entry ('1.2.3') is ignored, not treated as 0 —
@@ -3323,7 +3583,10 @@ class _BillingScreenState extends State<BillingScreen> {
                 child: OutlinedButton.icon(
                   onPressed: cart.items.isEmpty
                       ? null
-                      : () => _confirmClear(context, cart),
+                      : () {
+                          cart.clearCart();
+                          _pendingInvoiceNumber = null;
+                        },
                   icon: const Icon(Icons.delete_sweep_outlined, size: 16),
                   label: Text(
                     'CLEAR BILL',
@@ -9377,53 +9640,6 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  void _confirmClear(BuildContext context, CartProvider cart) {
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Text(
-          'Clear Bill',
-          style: GoogleFonts.manrope(fontWeight: FontWeight.w700),
-        ),
-        content: Text(
-          'Remove all items from the current bill?',
-          style: GoogleFonts.inter(color: AppColors.textMuted, fontSize: 14),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              'Cancel',
-              style: GoogleFonts.inter(color: AppColors.textMuted),
-            ),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              cart.clearCart();
-              _pendingInvoiceNumber = null;
-              Navigator.pop(context);
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.error,
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10),
-              ),
-            ),
-            child: Text(
-              'Clear',
-              style: GoogleFonts.inter(
-                color: Colors.white,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   // ── Print helpers ────────────────────────────────────────────────────────────
 
   TransactionRecord _snapshotCart(
@@ -9905,13 +10121,10 @@ class _BillingScreenState extends State<BillingScreen> {
               if (!mounted) return;
               _showToast(
                 sale == null
-                    ? 'Return complete — $_currencySymbol'
-                          '${refunded.toStringAsFixed(2)} refunded.'
+                    ? 'Return complete — ${_fmt(refunded)} refunded.'
                     : net >= 0
-                    ? 'Exchange complete — $_currencySymbol'
-                          '${net.toStringAsFixed(2)} collected.'
-                    : 'Exchange complete — $_currencySymbol'
-                          '${(-net).toStringAsFixed(2)} refunded.',
+                    ? 'Exchange complete — ${_fmt(net)} collected.'
+                    : 'Exchange complete — ${_fmt(-net)} refunded.',
               );
             } catch (e) {
               if (ctx.mounted) setLocal(() => busy = false);
@@ -10138,10 +10351,8 @@ class _BillingScreenState extends State<BillingScreen> {
                                           const SizedBox(width: 12),
                                           Text(
                                             neg
-                                                ? '-$_currencySymbol'
-                                                      '${t.total.abs().toStringAsFixed(2)}'
-                                                : '$_currencySymbol'
-                                                      '${t.total.toStringAsFixed(2)}',
+                                                ? '-${_fmt(t.total.abs())}'
+                                                : '${_fmt(t.total)}',
                                             style: GoogleFonts.inter(
                                               fontSize: 13.5,
                                               fontWeight: FontWeight.w700,
@@ -10219,8 +10430,7 @@ class _BillingScreenState extends State<BillingScreen> {
                                                 ),
                                               ),
                                               Text(
-                                                '$_currencySymbol'
-                                                '${m.price.toStringAsFixed(2)}',
+                                                '${_fmt(m.price)}',
                                                 style: GoogleFonts.inter(
                                                   fontSize: 12.5,
                                                   fontWeight: FontWeight.w600,
@@ -10296,8 +10506,7 @@ class _BillingScreenState extends State<BillingScreen> {
                                               ),
                                             ),
                                             Text(
-                                              '$_currencySymbol'
-                                              '${a.price.toStringAsFixed(2)}'
+                                              '${_fmt(a.price)}'
                                               '  ·  in stock ${a.stock}',
                                               style: GoogleFonts.inter(
                                                 fontSize: 11,
@@ -10373,21 +10582,18 @@ class _BillingScreenState extends State<BillingScreen> {
                         children: [
                           _reviewRow(
                             'OLD BILL AMOUNT',
-                            '$_currencySymbol'
-                                '${picked!.total.toStringAsFixed(2)}',
+                            '${_fmt(picked!.total)}',
                           ),
                           const SizedBox(height: 6),
                           _reviewRow(
                             'RETURNING',
-                            '-$_currencySymbol'
-                                '${returningTotal.toStringAsFixed(2)}',
+                            '-${_fmt(returningTotal)}',
                             color: AppColors.success,
                           ),
                           const SizedBox(height: 6),
                           _reviewRow(
                             'NEW ITEMS',
-                            '$_currencySymbol'
-                                '${newTotal.toStringAsFixed(2)}',
+                            '${_fmt(newTotal)}',
                           ),
                           const SizedBox(height: 10),
                           const Divider(height: 1, color: AppColors.border),
@@ -10407,8 +10613,7 @@ class _BillingScreenState extends State<BillingScreen> {
                               ),
                               const Spacer(),
                               Text(
-                                '$_currencySymbol'
-                                '${difference.abs().toStringAsFixed(2)}',
+                                '${_fmt(difference.abs())}',
                                 style: GoogleFonts.manrope(
                                   fontSize: 24,
                                   fontWeight: FontWeight.w900,
@@ -10617,7 +10822,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 Text(
                   exhausted
                       ? 'already returned'
-                      : '$_currencySymbol${line.price.toStringAsFixed(2)}'
+                      : '${_fmt(line.price)}'
                           '  ·  ${remaining < line.quantity ? '$remaining of ${line.quantity} left' : 'qty ${line.quantity}'}',
                   style: GoogleFonts.inter(
                     fontSize: 11,
@@ -11285,7 +11490,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                   const Spacer(),
                   Text(
-                    '$_currencySymbol${total.toStringAsFixed(2)}',
+                    '${_fmt(total)}',
                     style: GoogleFonts.manrope(
                       fontSize: 15,
                       fontWeight: FontWeight.w700,
@@ -11372,7 +11577,7 @@ class _BillingScreenState extends State<BillingScreen> {
                           ),
                           const Spacer(),
                           Text(
-                            '$_currencySymbol${balanceDue.toStringAsFixed(2)}',
+                            '${_fmt(balanceDue)}',
                             style: GoogleFonts.manrope(
                               fontSize: 15,
                               fontWeight: FontWeight.w800,
@@ -11501,6 +11706,10 @@ class _BillingScreenState extends State<BillingScreen> {
                 }
                 _customerNameCtrl.clear();
                 _customerPhoneCtrl.clear();
+                // Next bill starts back on Cash with a fresh split.
+                cart.setPaymentMethod(PaymentMethod.cash);
+                _hybridCashCtrl.clear();
+                _hybridUpiCtrl.clear();
                 _loadProducts();
                 _loadDashboardData();
                 if (!context.mounted) return;
@@ -11536,6 +11745,49 @@ class _BillingScreenState extends State<BillingScreen> {
         },
       ),
     ).whenComplete(() => _disposeAfterDialog(paidCtrl));
+  }
+
+  /// Alt+X fast path: saves the bill as fully paid and, in the same action,
+  /// sends it out per the Print Bill toggles (printer / WhatsApp) — no
+  /// dialogs. A hybrid bill whose cash+UPI split doesn't add up still needs
+  /// the normal confirm dialog, so that case falls back to it.
+  Future<void> _printAndCloseBill(CartProvider cart) async {
+    final total = cart.total;
+    final hybridBalanced =
+        cart.paymentMethod != PaymentMethod.hybrid ||
+        ((cart.hybridCash + cart.hybridUpi) - total).abs() < 0.01;
+    if (!hybridBalanced) {
+      _closeBill(context, cart);
+      return;
+    }
+    // Same invoice-number reuse and failure recovery as the confirm dialog.
+    final invNum = _pendingInvoiceNumber ?? LocalDbService.generateInvoiceId();
+    _pendingInvoiceNumber = null;
+    final snapshot = _snapshotCart(cart, invoiceNumber: invNum);
+    final phone = cart.customerPhone;
+    try {
+      await cart.checkout(invoiceNumber: invNum, amountPaid: total);
+    } catch (e) {
+      _pendingInvoiceNumber = invNum;
+      if (!mounted) return;
+      _showToast('Could not save the bill: $e', isError: true);
+      return;
+    }
+    _customerNameCtrl.clear();
+    _customerPhoneCtrl.clear();
+    // Next bill starts back on Cash with a fresh split.
+    cart.setPaymentMethod(PaymentMethod.cash);
+    _hybridCashCtrl.clear();
+    _hybridUpiCtrl.clear();
+    _loadProducts();
+    _loadDashboardData();
+    if (!mounted) return;
+    _showToast('Payment successful!');
+    // Only what the Print Bill toggles say — printing after the save so a
+    // failed checkout can never print a bill that was not recorded.
+    if (_sendToPrinterPref) await _printRecord(snapshot, toPrinter: true);
+    if (_sendWhatsAppPref) _sendInvoiceViaWhatsApp(snapshot, phone);
+    _autoSavePdf(snapshot);
   }
 
   Future<void> _autoSavePdf(TransactionRecord tx) async {
@@ -11623,7 +11875,7 @@ class _BillingScreenState extends State<BillingScreen> {
           invoiceNo: invoiceNo,
           storeName: _storeName,
           customerName: tx.customerName ?? '',
-          amount: '$_currencySymbol${tx.total.toStringAsFixed(2)}',
+          amount: '${_fmt(tx.total)}',
           date:
               '${tx.createdAt.day}/${tx.createdAt.month}/${tx.createdAt.year}',
           docType: docType,
@@ -11658,7 +11910,7 @@ class _BillingScreenState extends State<BillingScreen> {
         'Hello $customerName,\n\n'
         'Thank you for choosing $_storeName.\n'
         'Your e-bill for $docType #$invoiceNo has been generated successfully.\n\n'
-        'Amount: $_currencySymbol${tx.total.toStringAsFixed(2)}\n'
+        'Amount: ${_fmt(tx.total)}\n'
         'Date: $dateStr\n'
         'Payment Status: Paid\n\n'
         'For any queries, feel free to contact us.\n'
@@ -12817,7 +13069,7 @@ end tell
             ),
             ..._labelNameWidgets(p.name, bold),
             pw.Text(
-              '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
+              '${_fmt(_finalPriceOf(p))}',
               style: pw.TextStyle(font: bold, fontSize: 4.5),
               textAlign: pw.TextAlign.center,
             ),
@@ -13447,9 +13699,9 @@ end tell
   String _variantPriceRangeLabel(List<ProductVariant> variants) {
     final prices = variants.map((v) => v.price).toList()..sort();
     if (prices.first == prices.last) {
-      return '$_currencySymbol${prices.first.toStringAsFixed(2)}';
+      return '${_fmt(prices.first)}';
     }
-    return '$_currencySymbol${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
+    return '$_currencySymbol${_groupDigits(prices.first.toStringAsFixed(0))}–${_groupDigits(prices.last.toStringAsFixed(0))}';
   }
 
   Widget _inventoryCard(Product p) {
@@ -13757,7 +14009,7 @@ end tell
               Text(
                 hasVariants
                     ? _variantPriceRangeLabel(variants)
-                    : '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                    : '${_fmt(p.price)}',
                 style: GoogleFonts.manrope(
                   fontSize: 14,
                   fontWeight: FontWeight.w800,
@@ -14082,7 +14334,7 @@ end tell
                               ),
                             ),
                             Text(
-                              '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
+                              '${_fmt(_finalPriceOf(p))}',
                               style: GoogleFonts.inter(
                                 fontSize: 10,
                                 fontWeight: FontWeight.w700,
@@ -14440,7 +14692,7 @@ end tell
           // line, tax-inclusive final price.
           ..._labelNameWidgets(p.name, bold),
           pw.Text(
-            '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
+            '${_fmt(_finalPriceOf(p))}',
             style: pw.TextStyle(font: bold, fontSize: 4.5),
             textAlign: pw.TextAlign.center,
           ),
@@ -14764,7 +15016,7 @@ end tell
                 textAlign: pw.TextAlign.center,
               ),
               pw.Text(
-                '$_currencySymbol${_finalPriceOf(p).toStringAsFixed(2)}',
+                '${_fmt(_finalPriceOf(p))}',
                 style: pw.TextStyle(font: bold, fontSize: 7),
                 textAlign: pw.TextAlign.center,
               ),
@@ -15414,6 +15666,10 @@ end tell
     );
     final stockCtrl = TextEditingController(text: '${p.stock}');
     final dealerCtrl = TextEditingController(text: p.dealerName);
+    // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
+    // is needed when it resolves.
+    final List<Dealer> dealerOptions = [];
+    LocalDbService.getDealers().then(dealerOptions.addAll);
     DateTime? purchaseDate = _parseDate(p.purchaseDate);
     // Enter advances through the fields top-to-bottom, last one saves.
     final nameFocus = FocusNode();
@@ -15422,13 +15678,11 @@ end tell
     final stockFocus = FocusNode();
     final buyingFocus = FocusNode();
     final taxFocus = FocusNode();
-    final dealerFocus = FocusNode();
     final dateFocus = FocusNode();
     // Arrow keys move between fields (Up/Down always; Left/Right at caret edges).
     _wireArrowNav([
       (nameFocus, nameCtrl),
       (skuFocus, skuCtrl),
-      (dealerFocus, dealerCtrl),
       (dateFocus, null),
       (priceFocus, priceCtrl),
       (stockFocus, stockCtrl),
@@ -15511,16 +15765,27 @@ end tell
             if (pendingTag.isNotEmpty && !tags.contains(pendingTag)) {
               tags.add(pendingTag);
             }
+            // With variants, the product has no base of its own: price and
+            // stock derive from the variants. Without variants, the product
+            // itself is the base.
             final updated = Product(
               id: p.id,
               name: nameCtrl.text.trim(),
-              price: double.tryParse(basePriceText) ?? p.price,
-              buyingPrice: double.tryParse(baseBuyingText) ?? 0.0,
+              price: variants.isEmpty
+                  ? double.tryParse(basePriceText) ?? p.price
+                  : variants
+                        .map((v) => v.price)
+                        .reduce((a, b) => a < b ? a : b),
+              buyingPrice: variants.isEmpty
+                  ? double.tryParse(baseBuyingText) ?? 0.0
+                  : variants.first.buyingPrice,
               taxPercent: double.tryParse(taxPercentCtrl.text) ?? 0.0,
               category: category,
               emoji: emoji,
               sku: skuCtrl.text.trim().isEmpty ? p.sku : skuCtrl.text.trim(),
-              stock: int.tryParse(baseStockText) ?? p.stock,
+              stock: variants.isEmpty
+                  ? int.tryParse(baseStockText) ?? p.stock
+                  : variants.fold(0, (s, v) => s + v.stock),
               description: tags.join(', '),
               dealerName: dealerCtrl.text.trim(),
               purchaseDate: purchaseDate != null ? _isoDate(purchaseDate!) : '',
@@ -15875,7 +16140,14 @@ end tell
                                                           x.id ==
                                                           selectedVariantId,
                                                     );
-                                                    selectedVariantId = null;
+                                                    // Fall back to the next
+                                                    // variant; only an empty
+                                                    // list returns to base-
+                                                    // product mode.
+                                                    selectedVariantId =
+                                                        variants.isNotEmpty
+                                                        ? variants.first.id
+                                                        : null;
                                                     loadFields();
                                                   }),
                                                   child: Text(
@@ -15912,7 +16184,7 @@ end tell
                                             textInputAction:
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
-                                                dealerFocus.requestFocus(),
+                                                dateFocus.requestFocus(),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
@@ -16020,18 +16292,10 @@ end tell
                                 const SizedBox(height: 16),
                                 _dlgLabel('DEALER / SUPPLIER'),
                                 const SizedBox(height: 6),
-                                TextField(
-                                  controller: dealerCtrl,
-                                  focusNode: dealerFocus,
-                                  textInputAction: TextInputAction.next,
-                                  onSubmitted: (_) => priceFocus.requestFocus(),
-                                  style: GoogleFonts.inter(
-                                    fontSize: 13,
-                                    color: AppColors.textDark,
-                                  ),
-                                  decoration: _dlgInputDecor(
-                                    'e.g. Metro Wholesale',
-                                  ),
+                                _dealerDropdownField(
+                                  ctrl: dealerCtrl,
+                                  dealers: dealerOptions,
+                                  setLocal: setLocal,
                                 ),
                                 const SizedBox(height: 16),
                                 _dlgLabel('PURCHASE DATE'),
@@ -16478,7 +16742,10 @@ end tell
     );
     final stockCtrl = TextEditingController();
     final dealerCtrl = TextEditingController();
-    final dealersFuture = LocalDbService.getDealerNames();
+    // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
+    // is needed when it resolves.
+    final List<Dealer> dealerOptions = [];
+    LocalDbService.getDealers().then(dealerOptions.addAll);
     DateTime? purchaseDate = DateTime.now();
     // Enter advances through the fields top-to-bottom, last one saves.
     final nameFocus = FocusNode();
@@ -16487,13 +16754,11 @@ end tell
     final stockFocus = FocusNode();
     final buyingFocus = FocusNode();
     final taxFocus = FocusNode();
-    final dealerFocus = FocusNode();
     final dateFocus = FocusNode();
     // Arrow keys move between fields (Up/Down always; Left/Right at caret edges).
     _wireArrowNav([
       (nameFocus, nameCtrl),
       (skuFocus, skuCtrl),
-      (dealerFocus, dealerCtrl),
       (dateFocus, null),
       (priceFocus, priceCtrl),
       (stockFocus, stockCtrl),
@@ -16509,6 +16774,12 @@ end tell
     bool skuAutoMode = true;
     final pendingProductId = const Uuid().v4();
     List<ProductVariant> variants = [];
+    // Shared selling price: the first price typed applies to every variant.
+    // Re-pricing while a different variant is selected overrides only that
+    // variant; the rest keep following the shared price.
+    String sharedPriceText = '';
+    String? sharedPricedBy;
+    final customPriced = <String>{};
 
     // Which variant the price/stock fields currently edit (null = base product).
     String? selectedVariantId;
@@ -16547,7 +16818,9 @@ end tell
         buyingPriceCtrl.text = v.buyingPrice > 0
             ? v.buyingPrice.toStringAsFixed(2)
             : '';
-        stockCtrl.text = '${v.stock}';
+        // Blank instead of a literal 0, so typing a quantity never needs the
+        // 0 deleted first (matches the price fields above).
+        stockCtrl.text = v.stock > 0 ? '${v.stock}' : '';
       }
     }
 
@@ -16578,18 +16851,32 @@ end tell
               return;
             }
             commitFields();
-            final basePrice = double.tryParse(basePriceText);
-            final baseStock = int.tryParse(baseStockText);
-            if (basePrice == null || baseStock == null) {
-              _showToast(
-                'Enter a price and stock for the base product',
-                isError: true,
-              );
-              setLocal(() {
-                selectedVariantId = null;
-                loadFields();
-              });
-              return;
+            // With variants, the product has no base of its own: price and
+            // stock derive from the variants. Without variants, the product
+            // itself is the base.
+            final double productPrice;
+            final double productBuying;
+            final int productStock;
+            if (variants.isEmpty) {
+              final basePrice = double.tryParse(basePriceText);
+              final baseStock = int.tryParse(baseStockText);
+              if (basePrice == null || baseStock == null) {
+                _showToast('Enter a price and stock', isError: true);
+                setLocal(() {
+                  selectedVariantId = null;
+                  loadFields();
+                });
+                return;
+              }
+              productPrice = basePrice;
+              productBuying = double.tryParse(baseBuyingText) ?? 0.0;
+              productStock = baseStock;
+            } else {
+              productPrice = variants
+                  .map((v) => v.price)
+                  .reduce((a, b) => a < b ? a : b);
+              productBuying = variants.first.buyingPrice;
+              productStock = variants.fold(0, (s, v) => s + v.stock);
             }
             final pendingTag = tagInputCtrl.text.trim();
             if (pendingTag.isNotEmpty && !tags.contains(pendingTag)) {
@@ -16598,13 +16885,13 @@ end tell
             final newProduct = Product(
               id: pendingProductId,
               name: nameCtrl.text.trim(),
-              price: basePrice,
-              buyingPrice: double.tryParse(baseBuyingText) ?? 0.0,
+              price: productPrice,
+              buyingPrice: productBuying,
               taxPercent: double.tryParse(taxPercentCtrl.text) ?? 0.0,
               category: category,
               emoji: emoji,
               sku: sku,
-              stock: baseStock,
+              stock: productStock,
               description: tags.join(', '),
               dealerName: dealerCtrl.text.trim(),
               purchaseDate: purchaseDate != null ? _isoDate(purchaseDate!) : '',
@@ -16852,6 +17139,18 @@ end tell
                                                           if (variantNameMode ==
                                                               'new') {
                                                             commitFields();
+                                                            // The first
+                                                            // variant takes
+                                                            // over the base
+                                                            // fields wholesale
+                                                            // and becomes the
+                                                            // shared-price
+                                                            // holder; later
+                                                            // ones inherit the
+                                                            // shared price.
+                                                            final isFirst =
+                                                                variants
+                                                                    .isEmpty;
                                                             final v = ProductVariant(
                                                               id: const Uuid()
                                                                   .v4(),
@@ -16860,13 +17159,38 @@ end tell
                                                               label: name,
                                                               price:
                                                                   double.tryParse(
-                                                                    priceCtrl
-                                                                        .text,
+                                                                    isFirst ||
+                                                                            sharedPriceText
+                                                                                .isEmpty
+                                                                        ? priceCtrl
+                                                                              .text
+                                                                        : sharedPriceText,
                                                                   ) ??
                                                                   0.0,
-                                                              stock: 0,
+                                                              buyingPrice:
+                                                                  isFirst
+                                                                  ? double.tryParse(
+                                                                          buyingPriceCtrl
+                                                                              .text,
+                                                                        ) ??
+                                                                        0.0
+                                                                  : 0.0,
+                                                              stock: isFirst
+                                                                  ? int.tryParse(
+                                                                          stockCtrl
+                                                                              .text,
+                                                                        ) ??
+                                                                        0
+                                                                  : 0,
                                                             );
                                                             variants.add(v);
+                                                            if (isFirst) {
+                                                              sharedPriceText =
+                                                                  priceCtrl
+                                                                      .text;
+                                                              sharedPricedBy =
+                                                                  v.id;
+                                                            }
                                                             selectedVariantId =
                                                                 v.id;
                                                             loadFields();
@@ -16948,7 +17272,14 @@ end tell
                                                           x.id ==
                                                           selectedVariantId,
                                                     );
-                                                    selectedVariantId = null;
+                                                    // Fall back to the next
+                                                    // variant; only an empty
+                                                    // list returns to base-
+                                                    // product mode.
+                                                    selectedVariantId =
+                                                        variants.isNotEmpty
+                                                        ? variants.first.id
+                                                        : null;
                                                     loadFields();
                                                   }),
                                                   child: Text(
@@ -16986,7 +17317,7 @@ end tell
                                             textInputAction:
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
-                                                dealerFocus.requestFocus(),
+                                                dateFocus.requestFocus(),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
@@ -17095,59 +17426,10 @@ end tell
                                 const SizedBox(height: 16),
                                 _dlgLabel('DEALER / SUPPLIER'),
                                 const SizedBox(height: 6),
-                                FutureBuilder<List<String>>(
-                                  future: dealersFuture,
-                                  builder: (_, snap) {
-                                    final options = snap.data ?? [];
-                                    return Row(
-                                      children: [
-                                        Expanded(
-                                          child: TextField(
-                                            controller: dealerCtrl,
-                                            focusNode: dealerFocus,
-                                            textInputAction:
-                                                TextInputAction.next,
-                                            onSubmitted: (_) =>
-                                                priceFocus.requestFocus(),
-                                            style: GoogleFonts.inter(
-                                              fontSize: 13,
-                                              color: AppColors.textDark,
-                                            ),
-                                            decoration: _dlgInputDecor(
-                                              'e.g. Metro Wholesale',
-                                            ),
-                                          ),
-                                        ),
-                                        if (options.isNotEmpty)
-                                          PopupMenuButton<String>(
-                                            padding: EdgeInsets.zero,
-                                            tooltip: 'Select dealer',
-                                            icon: const Icon(
-                                              Icons.arrow_drop_down_rounded,
-                                              color: AppColors.textMuted,
-                                              size: 20,
-                                            ),
-                                            onSelected: (val) {
-                                              dealerCtrl.text = val;
-                                              dealerFocus.requestFocus();
-                                            },
-                                            itemBuilder: (_) => options
-                                                .map(
-                                                  (d) => PopupMenuItem(
-                                                    value: d,
-                                                    child: Text(
-                                                      d,
-                                                      style: GoogleFonts.inter(
-                                                        fontSize: 13,
-                                                      ),
-                                                    ),
-                                                  ),
-                                                )
-                                                .toList(),
-                                          ),
-                                      ],
-                                    );
-                                  },
+                                _dealerDropdownField(
+                                  ctrl: dealerCtrl,
+                                  dealers: dealerOptions,
+                                  setLocal: setLocal,
                                 ),
                                 const SizedBox(height: 16),
                                 _dlgLabel('PURCHASE DATE'),
@@ -17179,6 +17461,42 @@ end tell
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
                                                 stockFocus.requestFocus(),
+                                            // First price typed becomes the
+                                            // shared price for every variant;
+                                            // typing on a different variant
+                                            // afterwards overrides just it.
+                                            onChanged: (v) {
+                                              if (selectedVariantId == null) {
+                                                return;
+                                              }
+                                              if (sharedPricedBy == null ||
+                                                  sharedPricedBy ==
+                                                      selectedVariantId) {
+                                                sharedPricedBy =
+                                                    selectedVariantId;
+                                                sharedPriceText = v;
+                                                final p = double.tryParse(v);
+                                                if (p != null) {
+                                                  for (
+                                                    var i = 0;
+                                                    i < variants.length;
+                                                    i++
+                                                  ) {
+                                                    if (customPriced.contains(
+                                                      variants[i].id,
+                                                    )) {
+                                                      continue;
+                                                    }
+                                                    variants[i] = variants[i]
+                                                        .copyWith(price: p);
+                                                  }
+                                                }
+                                              } else {
+                                                customPriced.add(
+                                                  selectedVariantId!,
+                                                );
+                                              }
+                                            },
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -17753,6 +18071,256 @@ end tell
     ),
   );
 
+  /// Selection-only dealer picker. The dropdown lists saved dealers and ends
+  /// with an "Add dealer" action; choosing a name writes it into [ctrl] so
+  /// the existing save paths keep reading dealerCtrl.text unchanged.
+  Widget _dealerDropdownField({
+    required TextEditingController ctrl,
+    required List<Dealer> dealers,
+    required StateSetter setLocal,
+  }) {
+    final selectedName = ctrl.text.trim();
+    return PopupMenuButton<String>(
+      tooltip: '',
+      offset: const Offset(0, 48),
+      constraints: const BoxConstraints(minWidth: 280, maxHeight: 340),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      color: Colors.white,
+      elevation: 4,
+      onSelected: (value) async {
+        if (value == '__add_dealer__') {
+          final added = await _showAddDealerDialog();
+          if (added == null) return;
+          dealers.add(added);
+          dealers.sort(
+            (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+          );
+          setLocal(() => ctrl.text = added.name);
+          return;
+        }
+        setLocal(() => ctrl.text = value == '__no_dealer__' ? '' : value);
+      },
+      itemBuilder: (_) => [
+        if (selectedName.isNotEmpty)
+          PopupMenuItem<String>(
+            value: '__no_dealer__',
+            height: 38,
+            child: Text(
+              'No dealer',
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                color: AppColors.textMuted,
+              ),
+            ),
+          ),
+        ...dealers.map(
+          (d) => PopupMenuItem<String>(
+            value: d.name,
+            height: 38,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    d.name,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: d.name == selectedName
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                      color: d.name == selectedName
+                          ? AppColors.primary
+                          : AppColors.textDark,
+                    ),
+                  ),
+                ),
+                if (d.name == selectedName)
+                  const Icon(
+                    Icons.check_rounded,
+                    size: 16,
+                    color: AppColors.primary,
+                  ),
+              ],
+            ),
+          ),
+        ),
+        if (dealers.isNotEmpty || selectedName.isNotEmpty)
+          const PopupMenuDivider(height: 8),
+        PopupMenuItem<String>(
+          value: '__add_dealer__',
+          height: 38,
+          child: Row(
+            children: [
+              const Icon(
+                Icons.add_rounded,
+                size: 16,
+                color: AppColors.primary,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Add dealer',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.primary,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+      child: Container(
+        height: 44,
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        decoration: BoxDecoration(
+          color: AppColors.surfaceVariant,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                selectedName.isEmpty ? 'Select dealer' : selectedName,
+                overflow: TextOverflow.ellipsis,
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  color: selectedName.isEmpty
+                      ? AppColors.textMuted
+                      : AppColors.textDark,
+                ),
+              ),
+            ),
+            const Icon(
+              Icons.keyboard_arrow_down_rounded,
+              size: 18,
+              color: AppColors.textMuted,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Small form to save a new dealer to the local directory. Returns the
+  /// saved dealer, or null when cancelled.
+  Future<Dealer?> _showAddDealerDialog() async {
+    final nameCtrl = TextEditingController();
+    final phoneCtrl = TextEditingController();
+    String? error;
+    return showDialog<Dealer>(
+      context: context,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx, setD) => AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          title: Text(
+            'Add Dealer',
+            style: GoogleFonts.manrope(
+              fontSize: 16,
+              fontWeight: FontWeight.w800,
+              color: AppColors.textDark,
+            ),
+          ),
+          content: SizedBox(
+            width: 320,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _dlgLabel('DEALER NAME'),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: nameCtrl,
+                  autofocus: true,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textDark,
+                  ),
+                  decoration: _dlgInputDecor('Dealer name'),
+                ),
+                const SizedBox(height: 16),
+                _dlgLabel('PHONE (OPTIONAL)'),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: phoneCtrl,
+                  keyboardType: TextInputType.phone,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textDark,
+                  ),
+                  decoration: _dlgInputDecor('Phone number'),
+                ),
+                if (error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    error!,
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      color: AppColors.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dctx),
+              child: Text(
+                'Cancel',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  color: AppColors.textMuted,
+                ),
+              ),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              onPressed: () async {
+                final name = nameCtrl.text.trim();
+                if (name.isEmpty) {
+                  setD(() => error = 'Enter a dealer name.');
+                  return;
+                }
+                final existing = await LocalDbService.getDealers();
+                if (existing.any(
+                  (d) => d.name.toLowerCase() == name.toLowerCase(),
+                )) {
+                  setD(() => error = 'A dealer with this name already exists.');
+                  return;
+                }
+                final dealer = Dealer(
+                  id: const Uuid().v4(),
+                  name: name,
+                  phone: phoneCtrl.text.trim(),
+                  createdAt: DateTime.now().toIso8601String(),
+                );
+                await LocalDbService.insertDealer(dealer);
+                if (dctx.mounted) Navigator.pop(dctx, dealer);
+              },
+              child: Text(
+                'Save',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// Parses an ISO `yyyy-MM-dd` purchase-date string; null when empty/invalid.
   static DateTime? _parseDate(String iso) =>
       iso.trim().isEmpty ? null : DateTime.tryParse(iso.trim());
@@ -18067,7 +18635,7 @@ end tell
             children: [
               _metricCard(
                 'Total Sales',
-                '$_currencySymbol${pSales.toStringAsFixed(2)}',
+                '${_fmt(pSales)}',
                 Icons.attach_money_rounded,
                 AppColors.accent,
                 pVsLabel,
@@ -18092,7 +18660,7 @@ end tell
               const SizedBox(width: 16),
               _metricCard(
                 'Avg Order',
-                '$_currencySymbol${pAvg.toStringAsFixed(2)}',
+                '${_fmt(pAvg)}',
                 Icons.trending_up_rounded,
                 const Color(0xFF8B5CF6),
                 '$_dashPeriod',
@@ -18135,7 +18703,7 @@ end tell
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  '$_currencySymbol${pSales.toStringAsFixed(2)} total  •  $pTx transactions',
+                  '${_fmt(pSales)} total  •  $pTx transactions',
                   style: GoogleFonts.inter(
                     fontSize: 12,
                     fontWeight: FontWeight.w300,
@@ -18342,7 +18910,7 @@ end tell
                                     ),
                                     const Spacer(),
                                     Text(
-                                      '$_currencySymbol${c.$2.toStringAsFixed(2)}',
+                                      '${_fmt(c.$2)}',
                                       style: GoogleFonts.inter(
                                         fontSize: 12,
                                         fontWeight: FontWeight.w700,
@@ -18549,7 +19117,7 @@ end tell
                                     Expanded(
                                       flex: 2,
                                       child: Text(
-                                        '$_currencySymbol${tx.total.toStringAsFixed(2)}',
+                                        '${_fmt(tx.total)}',
                                         textAlign: TextAlign.right,
                                         style: GoogleFonts.inter(
                                           fontSize: 13,
@@ -18748,7 +19316,7 @@ end tell
                     _pdfCell(t.customerName ?? '—', regular),
                     _pdfCell(t.paymentMethod, regular),
                     _pdfCell(
-                      '$_currencySymbol${t.total.toStringAsFixed(2)}',
+                      '${_fmt(t.total)}',
                       bold,
                     ),
                   ],
@@ -18905,12 +19473,12 @@ end tell
                     _pdfCell(p.category, regular),
                     _pdfCell(p.sku, regular),
                     _pdfCell(
-                      '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                      '${_fmt(p.price)}',
                       regular,
                     ),
                     _pdfCell('${p.stock}', regular),
                     _pdfCell(
-                      '$_currencySymbol${(p.price * p.stock).toStringAsFixed(2)}',
+                      '${_fmt((p.price * p.stock))}',
                       bold,
                     ),
                   ],
@@ -19012,9 +19580,395 @@ end tell
           ),
           const SizedBox(height: 24),
           if (_utilitiesView == 'Delivery') _buildDeliveryView(),
+          if (_utilitiesView == 'Dealers') _buildDealersView(),
         ],
       ),
     );
+  }
+
+  Future<(List<Dealer>, List<Product>, Map<String, List<ProductVariant>>)>
+  _loadDealersPage() async {
+    final dealers = await LocalDbService.getDealers();
+    final products = await LocalDbService.getProducts();
+    final variants = await LocalDbService.getVariantsGroupedByProduct();
+    return (dealers, products, variants);
+  }
+
+  Widget _buildDealersView() {
+    _dealersPageFuture ??= _loadDealersPage();
+    return Expanded(
+      child:
+          FutureBuilder<
+            (List<Dealer>, List<Product>, Map<String, List<ProductVariant>>)
+          >(
+            future: _dealersPageFuture,
+            builder: (_, snap) {
+              if (!snap.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final (dealers, products, variantsByProduct) = snap.data!;
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        '${dealers.length} dealer${dealers.length == 1 ? '' : 's'}',
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                      const Spacer(),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primary,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                        ),
+                        onPressed: () async {
+                          final added = await _showAddDealerDialog();
+                          if (added != null && mounted) {
+                            setState(
+                              () => _dealersPageFuture = _loadDealersPage(),
+                            );
+                          }
+                        },
+                        icon: const Icon(Icons.add_rounded, size: 18),
+                        label: Text(
+                          'Add Dealer',
+                          style: GoogleFonts.inter(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  if (dealers.isEmpty)
+                    Expanded(
+                      child: Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                color: AppColors.accentBlue.withValues(
+                                  alpha: 0.08,
+                                ),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: const Icon(
+                                Icons.storefront_outlined,
+                                size: 36,
+                                color: AppColors.accentBlue,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            Text(
+                              'No dealers yet',
+                              style: GoogleFonts.manrope(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textDark,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              'Add a dealer to track products purchased and stock value.',
+                              style: GoogleFonts.inter(
+                                fontSize: 13,
+                                color: AppColors.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    )
+                  else
+                    Expanded(
+                      child: ListView.separated(
+                        itemCount: dealers.length,
+                        separatorBuilder: (_, __) =>
+                            const SizedBox(height: 10),
+                        itemBuilder: (_, i) => _dealerCard(
+                          dealers[i],
+                          products,
+                          variantsByProduct,
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+    );
+  }
+
+  Widget _dealerCard(
+    Dealer d,
+    List<Product> products,
+    Map<String, List<ProductVariant>> variantsByProduct,
+  ) {
+    final dealerKey = d.name.trim().toLowerCase();
+    final dProducts = products
+        .where((p) => p.dealerName.trim().toLowerCase() == dealerKey)
+        .toList();
+
+    // Per-product units and stock value at buying price; variants hold their
+    // own stock and buying price when present.
+    (int, double) statsFor(Product p) {
+      final vs = variantsByProduct[p.id] ?? const <ProductVariant>[];
+      if (vs.isEmpty) return (p.stock, p.buyingPrice * p.stock);
+      var units = 0;
+      var value = 0.0;
+      for (final v in vs) {
+        units += v.stock;
+        value += v.buyingPrice * v.stock;
+      }
+      return (units, value);
+    }
+
+    var totalUnits = 0;
+    var totalValue = 0.0;
+    for (final p in dProducts) {
+      final (u, v) = statsFor(p);
+      totalUnits += u;
+      totalValue += v;
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Theme(
+        data: Theme.of(
+          context,
+        ).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          tilePadding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 4,
+          ),
+          childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+          iconColor: AppColors.textMuted,
+          collapsedIconColor: AppColors.textMuted,
+          title: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      d.name,
+                      style: GoogleFonts.manrope(
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.textDark,
+                      ),
+                    ),
+                    if (d.phone.isNotEmpty)
+                      Text(
+                        d.phone,
+                        style: GoogleFonts.inter(
+                          fontSize: 11.5,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    _fmt(totalValue),
+                    style: GoogleFonts.manrope(
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w800,
+                      color: AppColors.primary,
+                    ),
+                  ),
+                  Text(
+                    '${dProducts.length} product${dProducts.length == 1 ? '' : 's'} · $totalUnits pcs',
+                    style: GoogleFonts.inter(
+                      fontSize: 11.5,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          children: [
+            if (dProducts.isEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'No products purchased from this dealer yet.',
+                    style: GoogleFonts.inter(
+                      fontSize: 12.5,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                ),
+              )
+            else ...[
+              const Divider(height: 1, color: AppColors.border),
+              const SizedBox(height: 10),
+              ...dProducts.map((p) {
+                final (units, value) = statsFor(p);
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          p.name,
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.inter(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textDark,
+                          ),
+                        ),
+                      ),
+                      SizedBox(
+                        width: 80,
+                        child: Text(
+                          '$units pcs',
+                          textAlign: TextAlign.right,
+                          style: GoogleFonts.inter(
+                            fontSize: 12.5,
+                            color: AppColors.textMuted,
+                          ),
+                        ),
+                      ),
+                      SizedBox(
+                        width: 110,
+                        child: Text(
+                          _fmt(value),
+                          textAlign: TextAlign.right,
+                          style: GoogleFonts.inter(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textDark,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+              const SizedBox(height: 8),
+              const Divider(height: 1, color: AppColors.border),
+              const SizedBox(height: 8),
+            ],
+            Row(
+              children: [
+                TextButton.icon(
+                  onPressed: () => _confirmRemoveDealer(d),
+                  icon: const Icon(
+                    Icons.delete_outline_rounded,
+                    size: 16,
+                    color: AppColors.error,
+                  ),
+                  label: Text(
+                    'Remove dealer',
+                    style: GoogleFonts.inter(
+                      fontSize: 12.5,
+                      color: AppColors.error,
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                if (dProducts.isNotEmpty)
+                  Text(
+                    'TOTAL STOCK VALUE  ${_fmt(totalValue)}',
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textDark,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmRemoveDealer(Dealer d) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+        ),
+        title: Text(
+          'Remove dealer?',
+          style: GoogleFonts.manrope(
+            fontSize: 16,
+            fontWeight: FontWeight.w800,
+            color: AppColors.textDark,
+          ),
+        ),
+        content: Text(
+          '"${d.name}" will be removed from your dealer list. Products keep '
+          'their dealer name, so records here reappear if you re-add the '
+          'dealer with the same name.',
+          style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, false),
+            child: Text(
+              'Cancel',
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                color: AppColors.textMuted,
+              ),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.error,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            onPressed: () => Navigator.pop(dctx, true),
+            child: Text(
+              'Remove',
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await LocalDbService.deleteDealer(d.id);
+    if (mounted) setState(() => _dealersPageFuture = _loadDealersPage());
   }
 
   Widget _buildDeliveryView() {
@@ -19547,8 +20501,8 @@ end tell
                                   flex: 2,
                                   child: Text(
                                     isNegative
-                                        ? '-$_currencySymbol${t.total.abs().toStringAsFixed(2)}'
-                                        : '$_currencySymbol${t.total.toStringAsFixed(2)}',
+                                        ? '-${_fmt(t.total.abs())}'
+                                        : '${_fmt(t.total)}',
                                     textAlign: TextAlign.right,
                                     style: GoogleFonts.inter(
                                       fontSize: 13,
@@ -19837,7 +20791,7 @@ end tell
                               SizedBox(
                                 width: 80,
                                 child: Text(
-                                  '$_currencySymbol${item.price.toStringAsFixed(2)}',
+                                  '${_fmt(item.price)}',
                                   textAlign: TextAlign.right,
                                   style: GoogleFonts.inter(
                                     fontSize: 12,
@@ -19848,7 +20802,7 @@ end tell
                               SizedBox(
                                 width: 80,
                                 child: Text(
-                                  '$_currencySymbol${item.total.toStringAsFixed(2)}',
+                                  '${_fmt(item.total)}',
                                   textAlign: TextAlign.right,
                                   style: GoogleFonts.inter(
                                     fontSize: 13,
@@ -19876,18 +20830,18 @@ end tell
                   children: [
                     _txDetailRow(
                       'Subtotal',
-                      '$_currencySymbol${t.subtotal.toStringAsFixed(2)}',
+                      '${_fmt(t.subtotal)}',
                     ),
                     if (t.discountAmount > 0)
                       _txDetailRow(
                         'Discount',
-                        '-$_currencySymbol${t.discountAmount.toStringAsFixed(2)}',
+                        '-${_fmt(t.discountAmount)}',
                         valueColor: Colors.green,
                       ),
                     if (t.taxAmount > 0)
                       _txDetailRow(
                         'Tax ($_taxLabel)',
-                        '$_currencySymbol${t.taxAmount.toStringAsFixed(2)}',
+                        '${_fmt(t.taxAmount)}',
                       ),
                     const SizedBox(height: 6),
                     Row(
@@ -19903,7 +20857,7 @@ end tell
                           ),
                         ),
                         Text(
-                          '$_currencySymbol${t.total.toStringAsFixed(2)}',
+                          '${_fmt(t.total)}',
                           style: GoogleFonts.manrope(
                             fontSize: 16,
                             fontWeight: FontWeight.w800,
@@ -20139,7 +21093,7 @@ end tell
                       crossAxisAlignment: CrossAxisAlignment.end,
                       children: [
                         Text(
-                          '$_currencySymbol${totalSpent.toStringAsFixed(2)}',
+                          '${_fmt(totalSpent)}',
                           style: GoogleFonts.manrope(
                             fontSize: 16,
                             fontWeight: FontWeight.w800,
@@ -20267,7 +21221,7 @@ end tell
                                           CrossAxisAlignment.end,
                                       children: [
                                         Text(
-                                          '$_currencySymbol${t.total.toStringAsFixed(2)}',
+                                          '${_fmt(t.total)}',
                                           style: GoogleFonts.manrope(
                                             fontSize: 13,
                                             fontWeight: FontWeight.w700,
@@ -20946,7 +21900,7 @@ end tell
             const SizedBox(width: 16),
             _reportSummaryCard(
               'Stock Value',
-              '$_currencySymbol${totalSourcedValue.toStringAsFixed(2)}',
+              '${_fmt(totalSourcedValue)}',
               Icons.attach_money_rounded,
               const Color(0xFF059669),
               currencyIcon: _currencySymbol,
@@ -21120,7 +22074,7 @@ end tell
                                   mainAxisAlignment: MainAxisAlignment.end,
                                   children: [
                                     Text(
-                                      '$_currencySymbol${value.toStringAsFixed(2)}',
+                                      '${_fmt(value)}',
                                       style: GoogleFonts.inter(
                                         fontSize: 13,
                                         fontWeight: FontWeight.w600,
@@ -21294,11 +22248,11 @@ end tell
                         stat('TOTAL STOCK', '$totalStock units'),
                         stat(
                           'STOCK VALUE',
-                          '$_currencySymbol${stockValue.toStringAsFixed(2)}',
+                          '${_fmt(stockValue)}',
                         ),
                         stat(
                           'PURCHASE COST',
-                          '$_currencySymbol${purchaseCost.toStringAsFixed(2)}',
+                          '${_fmt(purchaseCost)}',
                         ),
                       ],
                     ),
@@ -21416,7 +22370,7 @@ end tell
                                       flex: 3,
                                       child: Text(
                                         p.buyingPrice > 0
-                                            ? '$_currencySymbol${p.buyingPrice.toStringAsFixed(2)}'
+                                            ? '${_fmt(p.buyingPrice)}'
                                             : '—',
                                         style: GoogleFonts.inter(
                                           fontSize: 13,
@@ -21427,7 +22381,7 @@ end tell
                                     Expanded(
                                       flex: 3,
                                       child: Text(
-                                        '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                                        '${_fmt(p.price)}',
                                         style: GoogleFonts.inter(
                                           fontSize: 13,
                                           color: AppColors.textDark,
@@ -21437,7 +22391,7 @@ end tell
                                     Expanded(
                                       flex: 3,
                                       child: Text(
-                                        '$_currencySymbol${(p.price * p.stock).toStringAsFixed(2)}',
+                                        '${_fmt((p.price * p.stock))}',
                                         textAlign: TextAlign.right,
                                         style: GoogleFonts.inter(
                                           fontSize: 13,
@@ -21494,7 +22448,7 @@ end tell
             const SizedBox(width: 16),
             _reportSummaryCard(
               'Stock Value',
-              '$_currencySymbol${totalValue.toStringAsFixed(2)}',
+              '${_fmt(totalValue)}',
               Icons.attach_money_rounded,
               const Color(0xFF059669),
               currencyIcon: _currencySymbol,
@@ -21678,7 +22632,7 @@ end tell
                             Expanded(
                               flex: 2,
                               child: Text(
-                                '$_currencySymbol${p.price.toStringAsFixed(2)}',
+                                '${_fmt(p.price)}',
                                 style: GoogleFonts.inter(
                                   fontSize: 12,
                                   fontWeight: FontWeight.w500,
@@ -21711,7 +22665,7 @@ end tell
                             Expanded(
                               flex: 2,
                               child: Text(
-                                '$_currencySymbol${(p.price * p.stock).toStringAsFixed(2)}',
+                                '${_fmt((p.price * p.stock))}',
                                 textAlign: TextAlign.right,
                                 style: GoogleFonts.inter(
                                   fontSize: 12,
@@ -22662,62 +23616,16 @@ class _ProductCardState extends State<_ProductCard> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Builder(
-                      builder: (_) {
-                        final tags = widget.product.description.isNotEmpty
-                            ? widget.product.description
-                                  .split(RegExp(r'[,\n]'))
-                                  .map((t) => t.trim())
-                                  .where((t) => t.isNotEmpty)
-                                  .toList()
-                            : <String>[];
-                        return Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Expanded(
-                              child: Text(
-                                widget.product.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: GoogleFonts.manrope(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w700,
-                                  color: AppColors.primary,
-                                  letterSpacing: 0.1,
-                                ),
-                              ),
-                            ),
-                            if (tags.isNotEmpty) ...[
-                              const SizedBox(width: 6),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 7,
-                                  vertical: 3,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: const Color(
-                                    0xFF6366F1,
-                                  ).withValues(alpha: 0.12),
-                                  borderRadius: BorderRadius.circular(20),
-                                  border: Border.all(
-                                    color: const Color(
-                                      0xFF6366F1,
-                                    ).withValues(alpha: 0.4),
-                                  ),
-                                ),
-                                child: Text(
-                                  tags.first,
-                                  style: GoogleFonts.inter(
-                                    fontSize: 9,
-                                    fontWeight: FontWeight.w600,
-                                    color: const Color(0xFF6366F1),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ],
-                        );
-                      },
+                    Text(
+                      widget.product.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.manrope(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.primary,
+                        letterSpacing: 0.1,
+                      ),
                     ),
                     const SizedBox(height: 2),
                     Text(
@@ -22734,14 +23642,17 @@ class _ProductCardState extends State<_ProductCard> {
                     Text(
                       () {
                         if (widget.variants.isEmpty) {
-                          return '${widget.currencySymbol}${widget.product.price.toStringAsFixed(2)}';
+                          return _moneyFmt(
+                            widget.currencySymbol,
+                            widget.product.price,
+                          );
                         }
                         final prices =
                             widget.variants.map((v) => v.price).toList()
                               ..sort();
                         return prices.first == prices.last
-                            ? '${widget.currencySymbol}${prices.first.toStringAsFixed(2)}'
-                            : '${widget.currencySymbol}${prices.first.toStringAsFixed(0)}–${prices.last.toStringAsFixed(0)}';
+                            ? _moneyFmt(widget.currencySymbol, prices.first)
+                            : '${widget.currencySymbol}${_groupDigits(prices.first.toStringAsFixed(0))}–${_groupDigits(prices.last.toStringAsFixed(0))}';
                       }(),
                       style: GoogleFonts.manrope(
                         fontSize: 16,
@@ -23032,7 +23943,7 @@ class _VariantCardState extends State<_VariantCard> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        '${widget.currencySymbol}${widget.variant.price.toStringAsFixed(2)}',
+                        _moneyFmt(widget.currencySymbol, widget.variant.price),
                         style: GoogleFonts.manrope(
                           fontSize: 16,
                           fontWeight: FontWeight.w900,
@@ -23224,7 +24135,7 @@ class _CartRowState extends State<_CartRow> {
               children: [
                 // Line total (pre-tax); tax is shown once in the summary below.
                 Text(
-                  '${widget.currencySymbol}${widget.item.total.toStringAsFixed(2)}',
+                  _moneyFmt(widget.currencySymbol, widget.item.total),
                   style: GoogleFonts.inter(
                     fontSize: 13,
                     fontWeight: FontWeight.w700,
@@ -23233,7 +24144,7 @@ class _CartRowState extends State<_CartRow> {
                 ),
                 const SizedBox(height: 1),
                 Text(
-                  '${widget.currencySymbol}${widget.item.unitPrice.toStringAsFixed(2)}/unit',
+                  '${_moneyFmt(widget.currencySymbol, widget.item.unitPrice)}/unit',
                   style: GoogleFonts.inter(
                     fontSize: 9,
                     color: AppColors.textMuted.withValues(alpha: 0.6),
@@ -23498,7 +24409,7 @@ class _TaxSummaryRowState extends State<_TaxSummaryRow> {
           ),
         ),
         Text(
-          '${widget.currencySymbol}${widget.amount.toStringAsFixed(2)}',
+          _moneyFmt(widget.currencySymbol, widget.amount),
           style: GoogleFonts.inter(
             fontSize: 13,
             fontWeight: FontWeight.w700,
@@ -24062,6 +24973,20 @@ class _PasscodeDialogState extends State<_PasscodeDialog> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _focus.requestFocus();
     });
+  }
+
+  @override
+  void didUpdateWidget(covariant _PasscodeDialog oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // The set-passcode flow swaps in a fresh notifier for the confirm step.
+    // Re-wire the listener and resync the capture field, or it stays full of
+    // the first entry (maxLength 4) and swallows every further keystroke.
+    if (oldWidget.digits != widget.digits) {
+      oldWidget.digits.removeListener(_syncFromDigits);
+      widget.digits.addListener(_syncFromDigits);
+      _syncFromDigits();
+      _focus.requestFocus();
+    }
   }
 
   void _syncFromDigits() {

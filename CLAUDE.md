@@ -6,6 +6,8 @@
 - Distribution: Flutter Windows release build, packaged as MSIX and code-signed. Do not touch build or packaging config unless that is the task.
 
 ## Scope control — most important rules
+- NEVER modify any code, feature, or logic without my explicit consent. Work ONLY on exactly what I asked for in the current request — nothing extra, nothing "while you're at it."
+- If completing my request seems to require changing any code or behavior I did not mention, STOP and ask me first. My approval in one request does not carry over to the next.
 - Only modify files explicitly named in my request.
 - If other files must change for the code to compile or work, STOP, list those files, and ask before editing them.
 - Make the smallest change that completes the task. Prefer minimal diffs.
