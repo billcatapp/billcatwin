@@ -14990,6 +14990,8 @@ end tell
                 value: selected?.id,
                 isDense: true,
                 icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 18),
+                selectedItemBuilder: (context) =>
+                    variants.map((_) => const SizedBox.shrink()).toList(),
                 items: variants
                     .map((v) => DropdownMenuItem(
                           value: v.id,
@@ -16476,6 +16478,7 @@ end tell
     );
     final stockCtrl = TextEditingController();
     final dealerCtrl = TextEditingController();
+    final dealersFuture = LocalDbService.getDealerNames();
     DateTime? purchaseDate = DateTime.now();
     // Enter advances through the fields top-to-bottom, last one saves.
     final nameFocus = FocusNode();
@@ -17092,18 +17095,59 @@ end tell
                                 const SizedBox(height: 16),
                                 _dlgLabel('DEALER / SUPPLIER'),
                                 const SizedBox(height: 6),
-                                TextField(
-                                  controller: dealerCtrl,
-                                  focusNode: dealerFocus,
-                                  textInputAction: TextInputAction.next,
-                                  onSubmitted: (_) => priceFocus.requestFocus(),
-                                  style: GoogleFonts.inter(
-                                    fontSize: 13,
-                                    color: AppColors.textDark,
-                                  ),
-                                  decoration: _dlgInputDecor(
-                                    'e.g. Metro Wholesale',
-                                  ),
+                                FutureBuilder<List<String>>(
+                                  future: dealersFuture,
+                                  builder: (_, snap) {
+                                    final options = snap.data ?? [];
+                                    return Row(
+                                      children: [
+                                        Expanded(
+                                          child: TextField(
+                                            controller: dealerCtrl,
+                                            focusNode: dealerFocus,
+                                            textInputAction:
+                                                TextInputAction.next,
+                                            onSubmitted: (_) =>
+                                                priceFocus.requestFocus(),
+                                            style: GoogleFonts.inter(
+                                              fontSize: 13,
+                                              color: AppColors.textDark,
+                                            ),
+                                            decoration: _dlgInputDecor(
+                                              'e.g. Metro Wholesale',
+                                            ),
+                                          ),
+                                        ),
+                                        if (options.isNotEmpty)
+                                          PopupMenuButton<String>(
+                                            padding: EdgeInsets.zero,
+                                            tooltip: 'Select dealer',
+                                            icon: const Icon(
+                                              Icons.arrow_drop_down_rounded,
+                                              color: AppColors.textMuted,
+                                              size: 20,
+                                            ),
+                                            onSelected: (val) {
+                                              dealerCtrl.text = val;
+                                              dealerFocus.requestFocus();
+                                            },
+                                            itemBuilder: (_) => options
+                                                .map(
+                                                  (d) => PopupMenuItem(
+                                                    value: d,
+                                                    child: Text(
+                                                      d,
+                                                      style: GoogleFonts.inter(
+                                                        fontSize: 13,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                )
+                                                .toList(),
+                                          ),
+                                      ],
+                                    );
+                                  },
                                 ),
                                 const SizedBox(height: 16),
                                 _dlgLabel('PURCHASE DATE'),

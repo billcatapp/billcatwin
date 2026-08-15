@@ -650,6 +650,14 @@ class LocalDbService {
     return rows.map(Product.fromMap).toList();
   }
 
+  static Future<List<String>> getDealerNames() async {
+    final database = await db;
+    final rows = await database.rawQuery(
+      "SELECT DISTINCT dealer_name FROM products WHERE dealer_name != '' AND deleted = 0 ORDER BY dealer_name ASC",
+    );
+    return rows.map((r) => r['dealer_name'] as String).toList();
+  }
+
   static Future<void> insertProduct(Product product) async {
     final database = await db;
     await database.insert(
