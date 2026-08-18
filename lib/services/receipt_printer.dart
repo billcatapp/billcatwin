@@ -1732,6 +1732,11 @@ class ReceiptPrinter {
   /// rate, otherwise one row per rate.
   static List<pw.Widget> _taxRows(TransactionRecord tx, String taxLabel,
       String taxRate, String currencySymbol, pw.Font font, double fs) {
+    // A store with no tax rate and an untaxed bill gets no tax line at all
+    // (mirrors the billing-screen summary).
+    if ((double.tryParse(taxRate) ?? 0) <= 0 && tx.taxAmount <= 0) {
+      return [];
+    }
     final breakdown = _taxByRate(tx, double.tryParse(taxRate) ?? 0);
     if (breakdown.length <= 1) {
       final label = breakdown.isEmpty

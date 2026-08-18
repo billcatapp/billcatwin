@@ -693,6 +693,22 @@ class _BillingScreenState extends State<BillingScreen> {
       return false;
     }
 
+    // "+" opens the custom product row — but never while the cursor is in a
+    // text field, so typing + in search/price/name fields stays normal.
+    if (event.character == '+') {
+      final focusCtx = FocusManager.instance.primaryFocus?.context;
+      final typing =
+          focusCtx != null &&
+          (focusCtx.widget is EditableText ||
+              focusCtx.findAncestorWidgetOfExactType<EditableText>() != null);
+      if (!typing) {
+        if (!_addingCustomProduct) {
+          setState(() => _addingCustomProduct = true);
+        }
+        return true;
+      }
+    }
+
     final now = DateTime.now();
     final gapMs = now.difference(_lastScanKeyTime).inMilliseconds;
     _lastScanKeyTime = now;
@@ -2993,6 +3009,11 @@ class _BillingScreenState extends State<BillingScreen> {
           ...() {
             final breakdown = cart.taxBreakdown;
             if (breakdown.isEmpty) {
+              // Store doesn't use tax at all — drop the row from the bill
+              // entirely instead of showing a dead 0% line.
+              if ((double.tryParse(_taxRateDisplay) ?? 0) <= 0) {
+                return <Widget>[];
+              }
               // Nothing taxable yet — keep the store rate visible and editable.
               return [
                 _TaxSummaryRow(
@@ -3015,6 +3036,33 @@ class _BillingScreenState extends State<BillingScreen> {
               ],
             ];
           }(),
+          // Nearest-rupee adjustment between the exact figure and what the
+          // customer actually pays; hidden when the total is already whole.
+          if (cart.roundOff.abs() >= 0.005) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Text(
+                  'ROUND OFF',
+                  style: GoogleFonts.inter(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w500,
+                    color: AppColors.textMuted,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  '${cart.roundOff >= 0 ? '+' : '-'}${_fmt(cart.roundOff.abs())}',
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textDark,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ],
           const SizedBox(height: 12),
           const Divider(height: 1, color: AppColors.border),
           const SizedBox(height: 14),
@@ -15237,20 +15285,55 @@ end tell
             ),
           ),
           if (variants.length > 1)
-            DropdownButtonHideUnderline(
-              child: DropdownButton<String>(
-                value: selected?.id,
-                isDense: true,
-                icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 18),
-                selectedItemBuilder: (context) =>
-                    variants.map((_) => const SizedBox.shrink()).toList(),
-                items: variants
-                    .map((v) => DropdownMenuItem(
-                          value: v.id,
-                          child: Text(v.label),
-                        ))
-                    .toList(),
-                onChanged: (val) => onSelect(val),
+            PopupMenuButton<String>(
+              tooltip: '',
+              offset: const Offset(0, 44),
+              constraints: const BoxConstraints(minWidth: 220, maxHeight: 320),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+              color: Colors.white,
+              elevation: 4,
+              onSelected: (id) => onSelect(id),
+              itemBuilder: (_) => [
+                for (final v in variants)
+                  PopupMenuItem<String>(
+                    value: v.id,
+                    height: 40,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            v.label,
+                            overflow: TextOverflow.ellipsis,
+                            style: GoogleFonts.inter(
+                              fontSize: 13,
+                              fontWeight: v.id == selected?.id
+                                  ? FontWeight.w700
+                                  : FontWeight.w500,
+                              color: v.id == selected?.id
+                                  ? AppColors.primary
+                                  : AppColors.textDark,
+                            ),
+                          ),
+                        ),
+                        if (v.id == selected?.id)
+                          const Icon(
+                            Icons.check_rounded,
+                            size: 16,
+                            color: AppColors.primary,
+                          ),
+                      ],
+                    ),
+                  ),
+              ],
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 8),
+                child: Icon(
+                  Icons.keyboard_arrow_down_rounded,
+                  size: 18,
+                  color: AppColors.textMuted,
+                ),
               ),
             )
           else
@@ -15268,15 +15351,26 @@ end tell
   /// stock actually lives.
   Future<void> _showUpdateStockDialog(Product p) async {
     final variants = await LocalDbService.getVariantsForProduct(p.id);
+    final dealerOptions = await LocalDbService.getDealers();
     if (!mounted) return;
     bool addMode = true; // true = add to stock, false = set exact
     final dealerCtrl = TextEditingController(text: p.dealerName);
+    // New variants added from this dialog: (name, price, qty) controllers.
+    final newVariants =
+        <(TextEditingController, TextEditingController, TextEditingController)>[];
     // Restocking is a fresh purchase: default to today, but keep an existing
     // date if the product already has one so a dealer-only edit doesn't move it.
     DateTime? purchaseDate = _parseDate(p.purchaseDate) ?? DateTime.now();
     final ctrls = <String, TextEditingController>{
       if (variants.isEmpty) p.id: TextEditingController(),
       for (final v in variants) v.id: TextEditingController(),
+    };
+    // Editable prices per row: purchases often come with a revised rate.
+    final priceCtrls = <String, TextEditingController>{
+      if (variants.isEmpty)
+        p.id: TextEditingController(text: p.price.toStringAsFixed(2)),
+      for (final v in variants)
+        v.id: TextEditingController(text: v.price.toStringAsFixed(2)),
     };
 
     int resultFor(int current, String raw) {
@@ -15294,7 +15388,7 @@ end tell
             borderRadius: BorderRadius.circular(16),
           ),
           child: SizedBox(
-            width: 420,
+            width: 470,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -15359,92 +15453,260 @@ end tell
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _dlgLabel('DEALER / SUPPLIER'),
-                      const SizedBox(height: 6),
-                      TextField(
-                        controller: dealerCtrl,
-                        style: GoogleFonts.inter(
-                          fontSize: 13,
-                          color: AppColors.textDark,
-                        ),
-                        decoration: _dlgInputDecor('e.g. Metro Wholesale'),
-                      ),
-                      const SizedBox(height: 14),
-                      _dlgLabel('PURCHASE DATE'),
-                      const SizedBox(height: 6),
-                      _dlgDateField(
-                        ctx: ctx,
-                        value: purchaseDate,
-                        onChanged: (d) => setLocal(() => purchaseDate = d),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _dlgLabel('DEALER / SUPPLIER'),
+                                const SizedBox(height: 6),
+                                _dealerDropdownField(
+                                  ctrl: dealerCtrl,
+                                  dealers: dealerOptions,
+                                  setLocal: setLocal,
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _dlgLabel('PURCHASE DATE'),
+                                const SizedBox(height: 6),
+                                _dlgDateField(
+                                  ctx: ctx,
+                                  value: purchaseDate,
+                                  onChanged: (d) =>
+                                      setLocal(() => purchaseDate = d),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
                 ),
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 10, 24, 8),
-                  child: Row(
-                    children: [
-                      for (final mode in [true, false])
-                        Padding(
-                          padding: const EdgeInsets.only(right: 8),
-                          child: GestureDetector(
-                            onTap: () => setLocal(() => addMode = mode),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 7,
-                              ),
-                              decoration: BoxDecoration(
-                                color: addMode == mode
-                                    ? AppColors.primary
-                                    : AppColors.surfaceVariant,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: AppColors.border),
-                              ),
-                              child: Text(
-                                mode ? 'Add to stock' : 'Set exact',
-                                style: GoogleFonts.inter(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
+                  padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+                  child: Container(
+                    padding: const EdgeInsets.all(3),
+                    decoration: BoxDecoration(
+                      color: AppColors.surfaceVariant,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Row(
+                      children: [
+                        for (final mode in [true, false])
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: () => setLocal(() => addMode = mode),
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 150),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 8,
+                                ),
+                                decoration: BoxDecoration(
                                   color: addMode == mode
                                       ? Colors.white
-                                      : AppColors.textMuted,
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(8),
+                                  boxShadow: addMode == mode
+                                      ? const [
+                                          BoxShadow(
+                                            color: Color(0x14000000),
+                                            blurRadius: 4,
+                                            offset: Offset(0, 1),
+                                          ),
+                                        ]
+                                      : null,
+                                ),
+                                child: Text(
+                                  mode ? 'Add to stock' : 'Set exact',
+                                  textAlign: TextAlign.center,
+                                  style: GoogleFonts.inter(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: addMode == mode
+                                        ? AppColors.textDark
+                                        : AppColors.textMuted,
+                                  ),
                                 ),
                               ),
                             ),
                           ),
+                      ],
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 16, 24, 6),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: _dlgLabel(
+                          variants.isEmpty ? 'PRODUCT' : 'VARIANTS',
                         ),
+                      ),
+                      SizedBox(width: 104, child: _dlgLabel('PRICE')),
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 72,
+                        child: _dlgLabel(addMode ? 'ADD QTY' : 'SET QTY'),
+                      ),
                     ],
                   ),
                 ),
                 Flexible(
                   child: SingleChildScrollView(
-                    padding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
+                    padding: const EdgeInsets.fromLTRB(24, 0, 24, 4),
                     child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        if (variants.isEmpty)
-                          _stockRow(
-                            label: p.name,
-                            current: p.stock,
-                            ctrl: ctrls[p.id]!,
-                            addMode: addMode,
-                            onChanged: () => setLocal(() {}),
-                            resultFor: resultFor,
-                          )
-                        else
-                          ...variants.map(
-                            (v) => Padding(
-                              padding: const EdgeInsets.only(bottom: 10),
-                              child: _stockRow(
-                                label: v.label,
-                                current: v.stock,
-                                ctrl: ctrls[v.id]!,
-                                addMode: addMode,
-                                onChanged: () => setLocal(() {}),
-                                resultFor: resultFor,
-                              ),
+                        Container(
+                          decoration: BoxDecoration(
+                            color: AppColors.surfaceVariant.withValues(
+                              alpha: 0.5,
+                            ),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: AppColors.border),
+                          ),
+                          child: Column(
+                            children: [
+                              if (variants.isEmpty)
+                                _restockRow(
+                                  label: p.name,
+                                  current: p.stock,
+                                  priceCtrl: priceCtrls[p.id]!,
+                                  qtyCtrl: ctrls[p.id]!,
+                                  addMode: addMode,
+                                  resultFor: resultFor,
+                                  onChanged: () => setLocal(() {}),
+                                )
+                              else
+                                for (
+                                  var i = 0;
+                                  i < variants.length;
+                                  i++
+                                ) ...[
+                                  if (i > 0)
+                                    const Divider(
+                                      height: 1,
+                                      color: AppColors.border,
+                                    ),
+                                  _restockRow(
+                                    label: variants[i].label,
+                                    current: variants[i].stock,
+                                    priceCtrl: priceCtrls[variants[i].id]!,
+                                    qtyCtrl: ctrls[variants[i].id]!,
+                                    addMode: addMode,
+                                    resultFor: resultFor,
+                                    onChanged: () => setLocal(() {}),
+                                  ),
+                                ],
+                            ],
+                          ),
+                        ),
+                        // New variants arriving with this purchase; for a
+                        // product without variants, the first one converts it
+                        // (the base becomes variant #1 on Update).
+                        ...List.generate(newVariants.length, (i) {
+                          final (nameC, priceC, qtyC) = newVariants[i];
+                          return Container(
+                            margin: const EdgeInsets.only(top: 8),
+                            padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+                            decoration: BoxDecoration(
+                              color: AppColors.surfaceVariant,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: AppColors.border),
+                            ),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: _miniInput(
+                                    nameC,
+                                    'New variant name',
+                                    autofocus: true,
+                                    align: TextAlign.left,
+                                    onChanged: (_) => setLocal(() {}),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                SizedBox(
+                                  width: 104,
+                                  child: _miniInput(
+                                    priceC,
+                                    '0.00',
+                                    decimal: true,
+                                    prefix: _currencySymbol,
+                                    align: TextAlign.right,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                SizedBox(
+                                  width: 72,
+                                  child: _miniInput(
+                                    qtyC,
+                                    'Qty',
+                                    digits: true,
+                                    onChanged: (_) => setLocal(() {}),
+                                  ),
+                                ),
+                                SizedBox(
+                                  width: 26,
+                                  child: Center(
+                                    child: GestureDetector(
+                                      onTap: () => setLocal(
+                                        () => newVariants.removeAt(i),
+                                      ),
+                                      child: Icon(
+                                        Icons.close_rounded,
+                                        size: 16,
+                                        color: AppColors.textMuted.withValues(
+                                          alpha: 0.6,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }),
+                        TextButton.icon(
+                          onPressed: () => setLocal(
+                            () => newVariants.add((
+                              TextEditingController(),
+                              TextEditingController(),
+                              TextEditingController(),
+                            )),
+                          ),
+                          style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 6,
+                            ),
+                            minimumSize: Size.zero,
+                          ),
+                          icon: const Icon(
+                            Icons.add_rounded,
+                            size: 16,
+                            color: AppColors.primary,
+                          ),
+                          label: Text(
+                            'Add variant',
+                            style: GoogleFonts.inter(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.primary,
                             ),
                           ),
+                        ),
                       ],
                     ),
                   ),
@@ -15455,8 +15717,47 @@ end tell
                     border: Border(top: BorderSide(color: AppColors.border)),
                   ),
                   child: Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
                     children: [
+                      // Live recap of what this Update will do.
+                      Expanded(
+                        child: Builder(
+                          builder: (_) {
+                            var delta = 0;
+                            if (variants.isEmpty) {
+                              delta +=
+                                  resultFor(p.stock, ctrls[p.id]!.text) -
+                                  p.stock;
+                            } else {
+                              for (final v in variants) {
+                                delta +=
+                                    resultFor(v.stock, ctrls[v.id]!.text) -
+                                    v.stock;
+                              }
+                            }
+                            var newCount = 0;
+                            for (final (nameC, _, qtyC) in newVariants) {
+                              if (nameC.text.trim().isEmpty) continue;
+                              newCount++;
+                              delta += int.tryParse(qtyC.text.trim()) ?? 0;
+                            }
+                            final parts = <String>[
+                              if (delta != 0)
+                                '${delta > 0 ? '+' : ''}$delta pcs',
+                              if (newCount > 0)
+                                '$newCount new variant${newCount == 1 ? '' : 's'}',
+                            ];
+                            return Text(
+                              parts.join('  ·  '),
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.inter(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.success,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
                       TextButton(
                         onPressed: () => Navigator.pop(ctx),
                         child: Text(
@@ -15475,19 +15776,103 @@ end tell
                           final pd = purchaseDate != null
                               ? _isoDate(purchaseDate!)
                               : '';
-                          if (variants.isEmpty) {
+                          final typedNew = newVariants
+                              .where((nv) => nv.$1.text.trim().isNotEmpty)
+                              .toList();
+                          if (variants.isEmpty && typedNew.isNotEmpty) {
+                            // First variants for a base-only product: the base
+                            // itself becomes variant #1, keeping its price and
+                            // (restocked) stock — same model as Add Product.
+                            final baseNext = resultFor(
+                              p.stock,
+                              ctrls[p.id]!.text,
+                            );
+                            final basePrice =
+                                double.tryParse(
+                                  priceCtrls[p.id]!.text.trim(),
+                                ) ??
+                                p.price;
+                            var total = baseNext;
+                            var minPrice = basePrice;
+                            await LocalDbService.insertVariant(
+                              ProductVariant(
+                                id: const Uuid().v4(),
+                                productId: p.id,
+                                label: 'Standard',
+                                price: basePrice,
+                                buyingPrice: p.buyingPrice,
+                                stock: baseNext,
+                              ),
+                            );
+                            for (final (nameC, priceC, qtyC) in typedNew) {
+                              final qty = int.tryParse(qtyC.text.trim()) ?? 0;
+                              final price =
+                                  double.tryParse(priceC.text.trim()) ??
+                                  p.price;
+                              await LocalDbService.insertVariant(
+                                ProductVariant(
+                                  id: const Uuid().v4(),
+                                  productId: p.id,
+                                  label: nameC.text.trim(),
+                                  price: price,
+                                  stock: qty,
+                                ),
+                              );
+                              total += qty;
+                              if (price < minPrice) minPrice = price;
+                            }
+                            // Full construction: copyWith deliberately has no
+                            // price parameter.
+                            await LocalDbService.updateProduct(
+                              Product(
+                                id: p.id,
+                                name: p.name,
+                                description: p.description,
+                                price: minPrice,
+                                buyingPrice: p.buyingPrice,
+                                taxPercent: p.taxPercent,
+                                category: p.category,
+                                emoji: p.emoji,
+                                sku: p.sku,
+                                stock: total,
+                                barcodeNo: p.barcodeNo,
+                                dealerName: dealer,
+                                purchaseDate: pd,
+                              ),
+                            );
+                          } else if (variants.isEmpty) {
                             final next = resultFor(p.stock, ctrls[p.id]!.text);
+                            final newPrice =
+                                double.tryParse(
+                                  priceCtrls[p.id]!.text.trim(),
+                                ) ??
+                                p.price;
                             final stockChanged = next != p.stock;
+                            final priceChanged =
+                                (newPrice - p.price).abs() > 0.005;
                             // Only stamp the purchase date on an actual restock;
                             // a dealer-only edit must not invent a date the
                             // product never had.
                             final newPd = stockChanged ? pd : p.purchaseDate;
                             if (stockChanged ||
+                                priceChanged ||
                                 dealer != p.dealerName ||
                                 newPd != p.purchaseDate) {
+                              // Full construction: copyWith deliberately has
+                              // no price parameter.
                               await LocalDbService.updateProduct(
-                                p.copyWith(
+                                Product(
+                                  id: p.id,
+                                  name: p.name,
+                                  description: p.description,
+                                  price: newPrice,
+                                  buyingPrice: p.buyingPrice,
+                                  taxPercent: p.taxPercent,
+                                  category: p.category,
+                                  emoji: p.emoji,
+                                  sku: p.sku,
                                   stock: next,
+                                  barcodeNo: p.barcodeNo,
                                   dealerName: dealer,
                                   purchaseDate: newPd,
                                 ),
@@ -15500,12 +15885,37 @@ end tell
                                 v.stock,
                                 ctrls[v.id]!.text,
                               );
-                              if (next != v.stock) {
-                                anyStockChanged = true;
+                              final newPrice =
+                                  double.tryParse(
+                                    priceCtrls[v.id]!.text.trim(),
+                                  ) ??
+                                  v.price;
+                              final priceChanged =
+                                  (newPrice - v.price).abs() > 0.005;
+                              if (next != v.stock || priceChanged) {
+                                if (next != v.stock) anyStockChanged = true;
                                 await LocalDbService.updateVariant(
-                                  v.copyWith(stock: next),
+                                  v.copyWith(stock: next, price: newPrice),
                                 );
                               }
+                            }
+                            // Variants that arrived new with this purchase.
+                            for (final (nameC, priceC, qtyC) in newVariants) {
+                              final label = nameC.text.trim();
+                              if (label.isEmpty) continue;
+                              final qty = int.tryParse(qtyC.text.trim()) ?? 0;
+                              await LocalDbService.insertVariant(
+                                ProductVariant(
+                                  id: const Uuid().v4(),
+                                  productId: p.id,
+                                  label: label,
+                                  price:
+                                      double.tryParse(priceC.text.trim()) ??
+                                      p.price,
+                                  stock: qty,
+                                ),
+                              );
+                              if (qty > 0) anyStockChanged = true;
                             }
                             // Dealer and purchase date are recorded on the
                             // parent product; only stamp the date on a real
@@ -15560,25 +15970,31 @@ end tell
     for (final c in ctrls.values) {
       c.dispose();
     }
+    for (final c in priceCtrls.values) {
+      c.dispose();
+    }
+    for (final (nameC, priceC, qtyC) in newVariants) {
+      nameC.dispose();
+      priceC.dispose();
+      qtyC.dispose();
+    }
   }
 
-  Widget _stockRow({
+  /// One row of the Update Stock list: name + live stock preview on the
+  /// left, editable price and qty boxes on the right.
+  Widget _restockRow({
     required String label,
     required int current,
-    required TextEditingController ctrl,
+    required TextEditingController priceCtrl,
+    required TextEditingController qtyCtrl,
     required bool addMode,
-    required VoidCallback onChanged,
     required int Function(int, String) resultFor,
+    required VoidCallback onChanged,
   }) {
-    final next = resultFor(current, ctrl.text);
-    final changed = ctrl.text.trim().isNotEmpty && next != current;
-    return Container(
+    final next = resultFor(current, qtyCtrl.text);
+    final changed = qtyCtrl.text.trim().isNotEmpty && next != current;
+    return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: AppColors.surfaceVariant,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: AppColors.border),
-      ),
       child: Row(
         children: [
           Expanded(
@@ -15589,16 +16005,18 @@ end tell
                   label,
                   overflow: TextOverflow.ellipsis,
                   style: GoogleFonts.inter(
-                    fontSize: 13,
+                    fontSize: 13.5,
                     fontWeight: FontWeight.w600,
                     color: AppColors.textDark,
                   ),
                 ),
-                const SizedBox(height: 2),
+                const SizedBox(height: 3),
                 Text(
-                  changed ? 'now $current  →  $next' : 'in stock: $current',
+                  changed
+                      ? 'In stock: $current  →  $next'
+                      : 'In stock: $current',
                   style: GoogleFonts.inter(
-                    fontSize: 10.5,
+                    fontSize: 11,
                     fontWeight: changed ? FontWeight.w600 : FontWeight.w400,
                     color: changed ? AppColors.success : AppColors.textMuted,
                   ),
@@ -15606,46 +16024,95 @@ end tell
               ],
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 10),
           SizedBox(
-            width: 92,
-            height: 36,
+            width: 104,
+            child: _miniInput(
+              priceCtrl,
+              '0.00',
+              decimal: true,
+              prefix: _currencySymbol,
+              align: TextAlign.right,
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 72,
+            child: _miniInput(
+              qtyCtrl,
+              addMode ? '+0' : '$current',
+              digits: true,
+              onChanged: (_) => onChanged(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Compact bordered input used across the Update Stock dialog.
+  Widget _miniInput(
+    TextEditingController ctrl,
+    String hint, {
+    bool decimal = false,
+    bool digits = false,
+    bool autofocus = false,
+    TextAlign align = TextAlign.center,
+    Color fill = Colors.white,
+    String? prefix,
+    ValueChanged<String>? onChanged,
+  }) {
+    return Container(
+      height: 40,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      decoration: BoxDecoration(
+        color: fill,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        children: [
+          if (prefix != null) ...[
+            Text(
+              prefix,
+              style: GoogleFonts.inter(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w500,
+                color: AppColors.textMuted,
+              ),
+            ),
+            const SizedBox(width: 4),
+          ],
+          Expanded(
             child: TextField(
               controller: ctrl,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              textAlign: TextAlign.center,
-              onChanged: (_) => onChanged(),
+              autofocus: autofocus,
+              textAlign: align,
+              keyboardType: decimal
+                  ? const TextInputType.numberWithOptions(decimal: true)
+                  : digits
+                  ? TextInputType.number
+                  : TextInputType.text,
+              inputFormatters: [
+                if (decimal)
+                  FilteringTextInputFormatter.allow(
+                    RegExp(r'^\d*\.?\d{0,2}'),
+                  ),
+                if (digits) FilteringTextInputFormatter.digitsOnly,
+              ],
               style: GoogleFonts.inter(
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
                 color: AppColors.textDark,
               ),
-              decoration: InputDecoration(
-                hintText: addMode ? '+ qty' : '$current',
+              decoration: InputDecoration.collapsed(
+                hintText: hint,
                 hintStyle: GoogleFonts.inter(
-                  fontSize: 12,
+                  fontSize: 12.5,
                   color: AppColors.textMuted,
                 ),
-                filled: true,
-                fillColor: Colors.white,
-                contentPadding: EdgeInsets.zero,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: const BorderSide(color: AppColors.border),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: const BorderSide(color: AppColors.border),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: const BorderSide(
-                    color: AppColors.accentBlue,
-                    width: 1.5,
-                  ),
-                ),
               ),
+              onChanged: onChanged,
             ),
           ),
         ],

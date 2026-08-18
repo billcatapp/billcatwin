@@ -200,12 +200,18 @@ class ThermalPrinter {
           : '${rate.toStringAsFixed(1)}%';
     }
 
+    // Stores that don't charge tax get the TAX% column dropped entirely;
+    // its width goes back to the item name.
+    final showTaxCol =
+        tx.taxAmount > 0 || tx.items.any((i) => i.taxPercent > 0);
+    final nameW = showTaxCol ? _nameW : _nameW + _taxW;
+
     b.addAll([_esc, 0x21, 0x08]); // bold
     _line(
       b,
-      'ITEM'.padRight(_nameW) +
+      'ITEM'.padRight(nameW) +
           'QTY'.padLeft(4).padRight(_qtyW) +
-          'TAX%'.padLeft(_taxW) +
+          (showTaxCol ? 'TAX%'.padLeft(_taxW) : '') +
           'PRICE'.padLeft(_priceW),
     );
     b.addAll([_esc, 0x21, 0x00]);
@@ -215,12 +221,12 @@ class ThermalPrinter {
       final incl = lineInclusive(i);
       inclusiveSubtotal += incl;
       final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
-      final nameLines = _wrap(i.displayName, _nameW);
+      final nameLines = _wrap(i.displayName, nameW);
       _line(
         b,
-        nameLines.first.padRight(_nameW) +
+        nameLines.first.padRight(nameW) +
             '${i.quantity}'.padLeft(4).padRight(_qtyW) +
-            pct(rate).padLeft(_taxW) +
+            (showTaxCol ? pct(rate).padLeft(_taxW) : '') +
             money(incl).padLeft(_priceW),
       );
       for (final l in nameLines.skip(1)) {

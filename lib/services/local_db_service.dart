@@ -124,6 +124,14 @@ class LocalDbService {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
       version: 17,
+      // Hardening against "database is locked" (SQLITE_BUSY) when another
+      // process briefly holds the file (leftover instance, antivirus scan):
+      // WAL lets readers and writers coexist, and busy_timeout makes a write
+      // wait up to 5s for the lock instead of failing the bill instantly.
+      onConfigure: (db) async {
+        await db.rawQuery('PRAGMA journal_mode=WAL');
+        await db.rawQuery('PRAGMA busy_timeout=5000');
+      },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 4) {
           try {

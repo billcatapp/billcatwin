@@ -67,7 +67,17 @@ class CartProvider extends ChangeNotifier {
 
   double get taxAmount =>
       taxBreakdown.values.fold(0.0, (s, v) => s + v);
-  double get total => subtotal - discountAmount + taxAmount;
+
+  /// Exact pre-round total; kept for the round-off calculation.
+  double get rawTotal => subtotal - discountAmount + taxAmount;
+
+  /// Payable total, rounded to the nearest rupee (Indian retail standard).
+  /// This is what gets charged, saved and split — not the paise-exact figure.
+  double get total => rawTotal.roundToDouble();
+
+  /// Signed adjustment between the exact and payable totals, e.g. +0.44 when
+  /// 1234.56 rounds up to 1235.
+  double get roundOff => total - rawTotal;
 
   // [productId] here means "line key" — for products without a variant this
   // is just the product id, so every existing call site keeps working as-is.

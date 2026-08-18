@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:ffi' hide Size;
 import 'dart:io';
 import 'package:app_links/app_links.dart';
+import 'package:ffi/ffi.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -18,11 +20,65 @@ const _supabaseAnonKey =
 
 final _navigatorKey = GlobalKey<NavigatorState>();
 
+/// Windows single-instance guard. Two BillCat processes sharing one SQLite
+/// file is the classic cause of "database is locked" failures when closing a
+/// bill (a leftover instance after an update, or the app opened twice).
+/// Returns false when another instance already runs — after bringing that
+/// instance's window to the front. The mutex handle is deliberately never
+/// closed; Windows releases it when the process exits.
+bool _acquireSingleInstanceLock() {
+  if (!Platform.isWindows) return true;
+  final kernel32 = DynamicLibrary.open('kernel32.dll');
+  final createMutex = kernel32
+      .lookupFunction<
+        IntPtr Function(Pointer<Void>, Int32, Pointer<Utf16>),
+        int Function(Pointer<Void>, int, Pointer<Utf16>)
+      >('CreateMutexW');
+  final getLastError = kernel32
+      .lookupFunction<Uint32 Function(), int Function()>('GetLastError');
+  final name = 'BillCat_SingleInstance_Mutex'.toNativeUtf16();
+  createMutex(nullptr, 0, name);
+  final alreadyRunning = getLastError() == 183; // ERROR_ALREADY_EXISTS
+  calloc.free(name);
+  if (!alreadyRunning) return true;
+
+  // Focus the running instance so the double-click still "opens" BillCat.
+  final user32 = DynamicLibrary.open('user32.dll');
+  final findWindow = user32
+      .lookupFunction<
+        IntPtr Function(Pointer<Utf16>, Pointer<Utf16>),
+        int Function(Pointer<Utf16>, Pointer<Utf16>)
+      >('FindWindowW');
+  final showWindow = user32
+      .lookupFunction<Int32 Function(IntPtr, Int32), int Function(int, int)>(
+        'ShowWindow',
+      );
+  final setForegroundWindow = user32
+      .lookupFunction<Int32 Function(IntPtr), int Function(int)>(
+        'SetForegroundWindow',
+      );
+  final title = 'BillCat'.toNativeUtf16();
+  final hwnd = findWindow(nullptr, title);
+  calloc.free(title);
+  if (hwnd != 0) {
+    showWindow(hwnd, 9); // SW_RESTORE
+    setForegroundWindow(hwnd);
+  }
+  return false;
+}
+
 void main() {
   // runZonedGuarded ensures ensureInitialized and runApp share the same zone,
   // and catches background Supabase auth errors thrown when offline.
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
+
+    // A second instance would share the SQLite file with the first and turn
+    // every bill save into a "database is locked" coin flip. Hand over to
+    // the running instance instead.
+    if (!_acquireSingleInstanceLock()) {
+      exit(0);
+    }
 
     if (Platform.isWindows || Platform.isLinux) {
       sqfliteFfiInit();
