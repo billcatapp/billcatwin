@@ -21042,14 +21042,12 @@ end tell
   }
 
   void _showTransactionDetail(TransactionRecord t) {
-    final payLabel =
-        {
-          'cash': 'Cash',
-          'card': 'Card',
-          'upi': 'UPI/QR',
-          'hybrid': 'Hybrid',
-        }[t.paymentMethod] ??
-        t.paymentMethod;
+    // Editable on the spot: payment method and tax. Every change is saved
+    // immediately (unsynced + rev bump) and the dialog keeps showing the
+    // edited values.
+    var payMethod = t.paymentMethod;
+    var taxAmount = t.taxAmount;
+    var total = t.total;
     final dt = t.createdAt;
     final dateStr =
         '${dt.day.toString().padLeft(2, '0')} ${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][dt.month - 1]} ${dt.year}';
@@ -21060,7 +21058,48 @@ end tell
 
     showDialog(
       context: context,
-      builder: (ctx) => Dialog(
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          final payLabel =
+              {
+                'cash': 'Cash',
+                'card': 'Card',
+                'upi': 'UPI/QR',
+                'hybrid': 'Hybrid',
+              }[payMethod] ??
+              payMethod;
+
+          // The record with the current edits applied — what gets printed.
+          TransactionRecord edited() => TransactionRecord(
+            id: t.id,
+            invoiceNumber: t.invoiceNumber,
+            customerName: t.customerName,
+            customerPhone: t.customerPhone,
+            items: t.items,
+            subtotal: t.subtotal,
+            discountAmount: t.discountAmount,
+            taxAmount: taxAmount,
+            total: total,
+            paymentMethod: payMethod,
+            createdAt: t.createdAt,
+            synced: t.synced,
+            balanceDue: t.balanceDue,
+            hybridCash: payMethod == 'hybrid' ? t.hybridCash : 0,
+            hybridUpi: payMethod == 'hybrid' ? t.hybridUpi : 0,
+          );
+
+          Future<void> persist() async {
+            await LocalDbService.updateTransactionPaymentAndTax(
+              t.id,
+              paymentMethod: payMethod,
+              taxAmount: taxAmount,
+              total: total,
+            );
+            ConnectivityService.instance.syncNow();
+            _loadDashboardData();
+          }
+
+          return Dialog(
         backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         child: SizedBox(
@@ -21097,21 +21136,89 @@ end tell
                         ],
                       ),
                     ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 5,
+                    // Tap to change the payment method; saved immediately.
+                    PopupMenuButton<String>(
+                      tooltip: 'Change payment method',
+                      offset: const Offset(0, 34),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
                       ),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFEEF2FF),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Text(
-                        payLabel,
-                        style: GoogleFonts.inter(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.primary,
+                      color: Colors.white,
+                      elevation: 4,
+                      onSelected: (v) {
+                        setLocal(() => payMethod = v);
+                        persist();
+                      },
+                      itemBuilder: (_) => [
+                        for (final m in [
+                          'cash',
+                          'card',
+                          'upi',
+                          // Hybrid needs a cash/UPI split, which an edit
+                          // can't invent — only keep it if it already was.
+                          if (t.paymentMethod == 'hybrid') 'hybrid',
+                        ])
+                          PopupMenuItem<String>(
+                            value: m,
+                            height: 38,
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    {
+                                      'cash': 'Cash',
+                                      'card': 'Card',
+                                      'upi': 'UPI/QR',
+                                      'hybrid': 'Hybrid',
+                                    }[m]!,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 13,
+                                      fontWeight: m == payMethod
+                                          ? FontWeight.w700
+                                          : FontWeight.w500,
+                                      color: m == payMethod
+                                          ? AppColors.primary
+                                          : AppColors.textDark,
+                                    ),
+                                  ),
+                                ),
+                                if (m == payMethod)
+                                  const Icon(
+                                    Icons.check_rounded,
+                                    size: 15,
+                                    color: AppColors.primary,
+                                  ),
+                              ],
+                            ),
+                          ),
+                      ],
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEEF2FF),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              payLabel,
+                              style: GoogleFonts.inter(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.primary,
+                              ),
+                            ),
+                            const SizedBox(width: 2),
+                            const Icon(
+                              Icons.keyboard_arrow_down_rounded,
+                              size: 15,
+                              color: AppColors.primary,
+                            ),
+                          ],
                         ),
                       ),
                     ),
@@ -21247,7 +21354,7 @@ end tell
                               SizedBox(
                                 width: 40,
                                 child: Text(
-                                  '�—${item.quantity}',
+                                  '×${item.quantity}',
                                   textAlign: TextAlign.center,
                                   style: GoogleFonts.inter(
                                     fontSize: 12,
@@ -21305,11 +21412,130 @@ end tell
                         '-${_fmt(t.discountAmount)}',
                         valueColor: Colors.green,
                       ),
-                    if (t.taxAmount > 0)
-                      _txDetailRow(
-                        'Tax ($_taxLabel)',
-                        '${_fmt(t.taxAmount)}',
+                    // Tax: always visible, tap the pencil to edit; total
+                    // re-derives and both are saved immediately.
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 3),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              'Tax ($_taxLabel)',
+                              style: GoogleFonts.inter(
+                                fontSize: 13,
+                                color: AppColors.textMuted,
+                              ),
+                            ),
+                          ),
+                          InkWell(
+                            borderRadius: BorderRadius.circular(6),
+                            onTap: () async {
+                              final ctrl = TextEditingController(
+                                text: taxAmount > 0
+                                    ? taxAmount.toStringAsFixed(2)
+                                    : '',
+                              );
+                              final saved = await showDialog<bool>(
+                                context: ctx,
+                                builder: (c2) => AlertDialog(
+                                  backgroundColor: Colors.white,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                  title: Text(
+                                    'Edit Tax Amount',
+                                    style: GoogleFonts.manrope(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                  content: SizedBox(
+                                    width: 240,
+                                    child: TextField(
+                                      controller: ctrl,
+                                      autofocus: true,
+                                      keyboardType:
+                                          const TextInputType.numberWithOptions(
+                                            decimal: true,
+                                          ),
+                                      inputFormatters: [
+                                        FilteringTextInputFormatter.allow(
+                                          RegExp(r'^\d*\.?\d{0,2}'),
+                                        ),
+                                      ],
+                                      style: GoogleFonts.inter(fontSize: 13),
+                                      decoration: _dlgInputDecor('0.00'),
+                                      onSubmitted: (_) =>
+                                          Navigator.pop(c2, true),
+                                    ),
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(c2, false),
+                                      child: Text(
+                                        'Cancel',
+                                        style: GoogleFonts.inter(
+                                          color: AppColors.textMuted,
+                                        ),
+                                      ),
+                                    ),
+                                    ElevatedButton(
+                                      onPressed: () =>
+                                          Navigator.pop(c2, true),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: AppColors.primary,
+                                        foregroundColor: Colors.white,
+                                        elevation: 0,
+                                        shape: RoundedRectangleBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            8,
+                                          ),
+                                        ),
+                                      ),
+                                      child: Text(
+                                        'Save',
+                                        style: GoogleFonts.inter(
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                              if (saved == true) {
+                                final v =
+                                    double.tryParse(ctrl.text.trim()) ?? 0;
+                                setLocal(() {
+                                  taxAmount = v;
+                                  total =
+                                      t.subtotal - t.discountAmount + v;
+                                });
+                                persist();
+                              }
+                            },
+                            child: Row(
+                              children: [
+                                Text(
+                                  '${_fmt(taxAmount)}',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w500,
+                                    color: AppColors.textDark,
+                                  ),
+                                ),
+                                const SizedBox(width: 5),
+                                const Icon(
+                                  Icons.edit_outlined,
+                                  size: 13,
+                                  color: AppColors.textMuted,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
+                    ),
                     const SizedBox(height: 6),
                     Row(
                       children: [
@@ -21324,7 +21550,7 @@ end tell
                           ),
                         ),
                         Text(
-                          '${_fmt(t.total)}',
+                          '${_fmt(total)}',
                           style: GoogleFonts.manrope(
                             fontSize: 16,
                             fontWeight: FontWeight.w800,
@@ -21434,7 +21660,9 @@ end tell
                       child: ElevatedButton.icon(
                         onPressed: () {
                           Navigator.pop(ctx);
-                          _printRecord(t);
+                          // Straight to the default printer, standard receipt
+                          // layout, with any edits made here included.
+                          _printRecord(edited(), toPrinter: true);
                         },
                         icon: const Icon(Icons.print_outlined, size: 15),
                         label: Text(
@@ -21461,6 +21689,8 @@ end tell
             ],
           ),
         ),
+          );
+        },
       ),
     );
   }

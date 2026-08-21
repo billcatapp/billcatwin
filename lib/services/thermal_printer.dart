@@ -182,12 +182,10 @@ class ThermalPrinter {
     // ── Item table: ITEM | QTY | PRICE ───────────────────────────────────
     // Each line is shown TAX-INCLUSIVE (the item's GST share folded into
     // its price) and no separate GST row is printed — display only, the
-    // charged totals are untouched. Items sold before per-item rates were
-    // recorded (taxPercent 0) fall back to the bill's effective rate.
-    final fallbackRate =
-        (tx.taxAmount > 0 && (tx.subtotal - tx.discountAmount) > 0)
-        ? tx.taxAmount / (tx.subtotal - tx.discountAmount) * 100
-        : 0.0;
+    // charged totals are untouched. Items without their own recorded rate
+    // follow the store's default tax rate — never a blended bill average,
+    // which used to smear one taxed item's GST across every line.
+    final fallbackRate = double.tryParse(taxRate) ?? 0.0;
     double lineInclusive(TransactionItem i) {
       final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
       return i.total * (1 + rate / 100);

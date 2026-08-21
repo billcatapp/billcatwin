@@ -1180,6 +1180,26 @@ class LocalDbService {
     });
   }
 
+  /// Edits the payment method and/or tax of an already-saved bill. A plain
+  /// row update — no stock movement — marked unsynced with a rev bump so it
+  /// pushes to the cloud like any other local edit. Moving off hybrid clears
+  /// the stored split.
+  static Future<void> updateTransactionPaymentAndTax(
+    String id, {
+    required String paymentMethod,
+    required double taxAmount,
+    required double total,
+  }) async {
+    final database = await db;
+    await database.rawUpdate(
+      'UPDATE transactions SET payment_method = ?, tax_amount = ?, total = ?, '
+      "hybrid_cash = CASE WHEN ? = 'hybrid' THEN hybrid_cash ELSE 0 END, "
+      "hybrid_upi = CASE WHEN ? = 'hybrid' THEN hybrid_upi ELSE 0 END, "
+      'synced = 0, rev = rev + 1 WHERE id = ?',
+      [paymentMethod, taxAmount, total, paymentMethod, paymentMethod, id],
+    );
+  }
+
   /// Records a return or exchange. Identical atomic write to a sale, except
   /// the record's item quantities are negative, so the same arithmetic puts
   /// the goods back into stock instead of taking them out. The customer is
