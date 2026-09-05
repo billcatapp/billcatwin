@@ -2,6 +2,7 @@
 import 'dart:io';
 import 'dart:math' show max;
 import 'dart:typed_data';
+import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -189,6 +190,21 @@ class _BillingScreenState extends State<BillingScreen> {
   // Reports state
   String _reportView = 'Sales';
   String _utilitiesView = 'Delivery';
+  // GST page state. Deliberately separate from the Sales report's
+  // _reportSalesPeriod/_customTxList — those are rewritten by _reportPeriodBtn
+  // and _applyCustomRange, so sharing them would retarget the Sales report
+  // whenever the GST period changed.
+  String _gstPeriod = 'This Month';
+  // Rate slab shown on the GST page. null = every slab. Filtering is display
+  // only: the excluded slabs stay in the totals line and in the export, since
+  // nil-rated supplies still have to be declared (GSTR-3B 3.1(c)).
+  double? _gstRateFilter;
+  String _gstInvoiceSearch = '';
+  DateTimeRange? _gstCustomRange;
+  String _gstCustomLabel = '';
+  List<TransactionRecord>? _gstTxList;
+  bool _gstLoading = false;
+  String? _gstError;
   // Dealers page data, reloaded when the page opens or a dealer changes.
   Future<(List<Dealer>, List<Product>, Map<String, List<ProductVariant>>)>?
   _dealersPageFuture;
@@ -1734,8 +1750,10 @@ class _BillingScreenState extends State<BillingScreen> {
           // Refresh so newly added products/dealers show up on open.
           if (value == 'Dealers') _dealersPageFuture = _loadDealersPage();
         });
+        // Outside setState: _loadGstPage calls setState itself.
+        if (value == 'GST') _loadGstPage();
       },
-      itemBuilder: (_) => ['Delivery', 'Dealers']
+      itemBuilder: (_) => ['Delivery', 'Dealers', 'GST']
           .map(
             (v) => PopupMenuItem<String>(
               value: v,
@@ -1746,6 +1764,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     switch (v) {
                       'Delivery' => Icons.local_shipping_outlined,
                       'Dealers' => Icons.storefront_outlined,
+                      'GST' => Icons.receipt_long_outlined,
                       _ => Icons.build_outlined,
                     },
                     size: 16,
@@ -19720,11 +19739,300 @@ end tell
     ),
   );
 
-  Future<void> _printSalesTable(
+  /// Taxable value and tax for one bill, split the way the GST page does so
+  /// the sales table, the GST page and every export agree. Null when no line
+  /// carried a rate above 0%, or the bill can't be attributed to a rate.
+  ({double taxable, double tax})? _salesRowGst(TransactionRecord t) {
+    final split = _gstSplitBill(t, double.tryParse(_taxRateDisplay) ?? 0);
+    if (!split.split) return null;
+    var taxable = 0.0;
+    var tax = 0.0;
+    for (final e in split.byRate.entries) {
+      if (e.key <= 0) continue;
+      taxable += e.value.$1;
+      tax += e.value.$2;
+    }
+    if (taxable == 0 && tax == 0) return null;
+    return (taxable: taxable, tax: tax);
+  }
+
+  /// Save dialog shared by the sales exports. Returns null if cancelled, and
+  /// always comes back with the extension on.
+  Future<String?> _pickSavePath(
+    String prefix,
+    String periodLabel,
+    String ext,
+  ) async {
+    final slug = periodLabel
+        .replaceAll(RegExp(r'[^A-Za-z0-9]+'), '-')
+        .toLowerCase();
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: 'Save $prefix',
+      fileName: '$prefix-$slug.$ext',
+      type: FileType.custom,
+      allowedExtensions: [ext],
+    );
+    if (path == null) return null;
+    return path.toLowerCase().endsWith('.$ext') ? path : '$path.$ext';
+  }
+
+  Widget _salesExportMenu(
+    List<TransactionRecord> txList,
+    String periodLabel,
+  ) {
+    final items = <(String, IconData, String)>[
+      ('print', Icons.print_rounded, 'Print'),
+      ('pdf', Icons.picture_as_pdf_outlined, 'Save as PDF'),
+      ('excel', Icons.table_chart_outlined, 'Save as Excel'),
+      ('zip', Icons.folder_zip_outlined, 'ZIP — all invoices'),
+    ];
+    return PopupMenuButton<String>(
+      tooltip: '',
+      offset: const Offset(0, 44),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      color: Colors.white,
+      elevation: 4,
+      onSelected: (v) {
+        if (v == 'print') _printSalesTable(txList, periodLabel);
+        if (v == 'pdf') _saveSalesTablePdf(txList, periodLabel);
+        if (v == 'excel') _exportSalesCsv(txList, periodLabel);
+        if (v == 'zip') _zipAllInvoices(txList, periodLabel);
+      },
+      itemBuilder: (_) => items
+          .map(
+            (e) => PopupMenuItem<String>(
+              value: e.$1,
+              height: 40,
+              child: Row(
+                children: [
+                  Icon(e.$2, size: 16, color: AppColors.textMuted),
+                  const SizedBox(width: 10),
+                  Text(
+                    e.$3,
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          )
+          .toList(),
+      child: Container(
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E293B),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Icon(Icons.print_rounded, color: Colors.white, size: 16),
+      ),
+    );
+  }
+
+  Future<void> _saveSalesTablePdf(
     List<TransactionRecord> txList,
     String periodLabel,
   ) async {
-    if (txList.isEmpty) return;
+    final doc = await _buildSalesTableDoc(txList, periodLabel);
+    if (doc == null) {
+      _showToast('No transactions to export', isError: true);
+      return;
+    }
+    final path = await _pickSavePath('sales', periodLabel, 'pdf');
+    if (path == null) return;
+    try {
+      await File(path).writeAsBytes(await doc.save());
+      if (mounted) _showToast('Saved $path');
+    } catch (e) {
+      if (mounted) _showToast('Could not save: $e', isError: true);
+    }
+  }
+
+  /// CSV of the sales table, GST columns included. Opens in Excel and Sheets.
+  Future<void> _exportSalesCsv(
+    List<TransactionRecord> txList,
+    String periodLabel,
+  ) async {
+    if (txList.isEmpty) {
+      _showToast('No transactions to export', isError: true);
+      return;
+    }
+    String n(double v) => v.toStringAsFixed(2);
+
+    final b = StringBuffer();
+    b.writeln('${_csvCell('Transaction History')},${_csvCell(periodLabel)}');
+    if (_storeGstin.trim().isNotEmpty) {
+      b.writeln('GSTIN,${_csvCell(_storeGstin.trim())}');
+    }
+    b.writeln('Transactions,${txList.length}');
+    b.writeln();
+    b.writeln(
+      'Date,Invoice,Status,Customer,Items,Payment,'
+      'Taxable,CGST,SGST,${_csvCell(_taxLabel)},Total',
+    );
+    for (final t in txList) {
+      final g = _salesRowGst(t);
+      final items = t.items.fold<int>(0, (s, i) => s + i.quantity).abs();
+      b.writeln(
+        '${t.createdAt.toIso8601String().substring(0, 16).replaceFirst('T', ' ')},'
+        '${_csvCell(t.displayInvoice)},${_csvCell(_txStatus(t).label)},'
+        '${_csvCell(t.customerName ?? '')},$items,'
+        '${_csvCell(t.paymentMethod)},'
+        '${g == null ? '' : n(g.taxable)},'
+        '${g == null ? '' : n(g.tax / 2)},'
+        '${g == null ? '' : n(g.tax / 2)},'
+        '${g == null ? '' : n(g.tax)},'
+        '${n(t.total)}',
+      );
+    }
+
+    final path = await _pickSavePath('sales', periodLabel, 'csv');
+    if (path == null) return;
+    try {
+      await File(path).writeAsString(b.toString());
+      if (mounted) _showToast('Saved $path');
+    } catch (e) {
+      if (mounted) _showToast('Could not save: $e', isError: true);
+    }
+  }
+
+  /// Every invoice in the period as its own PDF inside one .zip, built with
+  /// the same ReceiptPrinter the app prints with, so the files in the archive
+  /// are the invoices the customer got. A bill that fails to render is
+  /// skipped and counted rather than aborting the whole archive.
+  Future<void> _zipAllInvoices(
+    List<TransactionRecord> txList,
+    String periodLabel,
+  ) async {
+    if (txList.isEmpty) {
+      _showToast('No invoices to bundle', isError: true);
+      return;
+    }
+    final path = await _pickSavePath('invoices', periodLabel, 'zip');
+    if (path == null || !mounted) return;
+
+    // Captured before the awaits so the progress dialog can be dismissed
+    // without reaching for context afterwards.
+    final nav = Navigator.of(context);
+    final progress = ValueNotifier<int>(0);
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+        ),
+        content: SizedBox(
+          width: 280,
+          child: Row(
+            children: [
+              const SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: ValueListenableBuilder<int>(
+                  valueListenable: progress,
+                  builder: (_, v, _) => Text(
+                    'Building invoice $v of ${txList.length}…',
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    final archive = Archive();
+    final used = <String>{};
+    var failed = 0;
+    try {
+      for (final t in txList) {
+        try {
+          final bytes = await ReceiptPrinter.buildPdf(
+            t,
+            storeName: _storeName,
+            storeAddress: _storeAddress,
+            storePhone: _storePhone,
+            storeEmail: _storeEmail,
+            storeGstin: _storeGstin,
+            receiptFooter: _receiptFooter,
+            taxLabel: _taxLabel,
+            taxRate: _taxRateDisplay,
+            currencySymbol: _currencySymbol,
+            // Pinned, not taken from settings. The counter layout is tuned for
+            // a thermal receipt (the 'Theme *' layouts render narrow), but an
+            // archive handed to an accountant wants the formal A4 tax invoice
+            // every time — so the bundle stays consistent whatever the counter
+            // is set to print.
+            paperSize: 'A4',
+            orientation: 'Portrait',
+            layout: 'Classic',
+            storeTerms: _storeTerms,
+            logoPath: _logoPath,
+            storeUpiId: _storeUpiId,
+            docType: 'Invoice',
+          );
+          // Same name the single-invoice save uses, so a file pulled out of
+          // the archive is indistinguishable from one saved on its own.
+          var name =
+              'Receipt-${t.displayInvoice.replaceAll('#', '')}'.replaceAll(
+                RegExp(r'[^A-Za-z0-9._-]'),
+                '',
+              );
+          if (name.isEmpty) name = 'Receipt';
+          // Two bills sharing a number would collide inside the archive.
+          var unique = name;
+          var dup = 2;
+          while (!used.add(unique)) {
+            unique = '$name-$dup';
+            dup++;
+          }
+          archive.addFile(ArchiveFile.bytes('$unique.pdf', bytes));
+        } catch (_) {
+          failed++;
+        }
+        progress.value = progress.value + 1;
+      }
+      await File(path).writeAsBytes(ZipEncoder().encodeBytes(archive));
+    } catch (e) {
+      nav.pop();
+      progress.dispose();
+      if (mounted) _showToast('Could not build zip: $e', isError: true);
+      return;
+    }
+    nav.pop();
+    progress.dispose();
+    final saved = txList.length - failed;
+    if (mounted) {
+      _showToast(
+        failed == 0
+            ? 'Saved $saved invoice${saved == 1 ? '' : 's'} to $path'
+            : 'Saved $saved of ${txList.length} — $failed could not be built',
+        isError: failed > 0,
+      );
+    }
+  }
+
+  /// Builds the sales table document once so Print and Save-as-PDF cannot
+  /// drift apart. Carries the same TAXABLE / CGST / SGST / GST columns the
+  /// on-screen table shows, split by _gstSplitBill so every surface agrees.
+  Future<pw.Document?> _buildSalesTableDoc(
+    List<TransactionRecord> txList,
+    String periodLabel,
+  ) async {
+    if (txList.isEmpty) return null;
     final regularData = await rootBundle.load(
       'assets/fonts/NotoSans-Regular.ttf',
     );
@@ -19743,8 +20051,9 @@ end tell
     final doc = pw.Document();
     doc.addPage(
       pw.MultiPage(
-        pageFormat: PdfPageFormat.a4,
-        margin: const pw.EdgeInsets.all(32),
+        // Landscape: nine columns do not fit portrait legibly.
+        pageFormat: PdfPageFormat.a4.landscape,
+        margin: const pw.EdgeInsets.all(28),
         build: (ctx) => [
           pw.Text(
             'Transaction History – $periodLabel',
@@ -19754,16 +20063,30 @@ end tell
           pw.Table(
             border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.5),
             columnWidths: {
-              0: const pw.FlexColumnWidth(2),
+              0: const pw.FlexColumnWidth(2.4),
               1: const pw.FlexColumnWidth(2),
-              2: const pw.FlexColumnWidth(3),
-              3: const pw.FlexColumnWidth(2),
+              2: const pw.FlexColumnWidth(2.6),
+              3: const pw.FlexColumnWidth(1.6),
               4: const pw.FlexColumnWidth(2),
+              5: const pw.FlexColumnWidth(1.7),
+              6: const pw.FlexColumnWidth(1.7),
+              7: const pw.FlexColumnWidth(1.7),
+              8: const pw.FlexColumnWidth(2),
             },
             children: [
               pw.TableRow(
                 decoration: const pw.BoxDecoration(color: PdfColors.grey200),
-                children: ['DATE', 'INVOICE', 'CUSTOMER', 'PAYMENT', 'TOTAL']
+                children: [
+                  'DATE',
+                  'INVOICE',
+                  'CUSTOMER',
+                  'PAYMENT',
+                  'TAXABLE',
+                  'CGST',
+                  'SGST',
+                  _taxLabel.toUpperCase(),
+                  'TOTAL',
+                ]
                     .map(
                       (h) => pw.Padding(
                         padding: const pw.EdgeInsets.all(6),
@@ -19775,25 +20098,36 @@ end tell
                     )
                     .toList(),
               ),
-              ...rows.map(
-                (t) => pw.TableRow(
+              ...rows.map((t) {
+                final g = _salesRowGst(t);
+                return pw.TableRow(
                   children: [
                     _pdfCell(t.createdAt.toString().substring(0, 16), regular),
                     _pdfCell(t.displayInvoice, regular),
                     _pdfCell(t.customerName ?? '—', regular),
                     _pdfCell(t.paymentMethod, regular),
-                    _pdfCell(
-                      '${_fmt(t.total)}',
-                      bold,
-                    ),
+                    _pdfCell(g == null ? '—' : _fmt(g.taxable), regular),
+                    _pdfCell(g == null ? '—' : _fmt(g.tax / 2), regular),
+                    _pdfCell(g == null ? '—' : _fmt(g.tax / 2), regular),
+                    _pdfCell(g == null ? '—' : _fmt(g.tax), regular),
+                    _pdfCell(_fmt(t.total), bold),
                   ],
-                ),
-              ),
+                );
+              }),
             ],
           ),
         ],
       ),
     );
+    return doc;
+  }
+
+  Future<void> _printSalesTable(
+    List<TransactionRecord> txList,
+    String periodLabel,
+  ) async {
+    final doc = await _buildSalesTableDoc(txList, periodLabel);
+    if (doc == null) return;
     final bytes = await doc.save();
     await Printing.layoutPdf(
       onLayout: (_) => bytes,
@@ -20042,12 +20376,13 @@ end tell
           ),
           const SizedBox(height: 4),
           Text(
-            'May ${DateTime.now().day}, ${DateTime.now().year}',
+            _fmtDate(DateTime.now()),
             style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
           ),
           const SizedBox(height: 24),
           if (_utilitiesView == 'Delivery') _buildDeliveryView(),
           if (_utilitiesView == 'Dealers') _buildDealersView(),
+          if (_utilitiesView == 'GST') _buildGstView(),
         ],
       ),
     );
@@ -20480,6 +20815,1224 @@ end tell
     );
   }
 
+  // ── GST View ─────────────────────────────────────────────────────────────────
+
+  static const _gstMonths = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ];
+
+  /// Inclusive start/end plus a label for the selected period. Local
+  /// DateTimes only: getTransactionsForRange compares a date-only substring
+  /// against naive local timestamps, so a UTC value shifts the month boundary.
+  (DateTime, DateTime, String) _gstRangeFor(String period) {
+    final now = DateTime.now();
+    switch (period) {
+      case 'Last Month':
+        final prev = DateTime(
+          now.year,
+          now.month,
+          1,
+        ).subtract(const Duration(days: 1));
+        return (
+          DateTime(prev.year, prev.month, 1),
+          prev,
+          '${_gstMonths[prev.month - 1]} ${prev.year}',
+        );
+      case 'Custom':
+        final r = _gstCustomRange;
+        if (r != null) return (r.start, r.end, _gstCustomLabel);
+        return (
+          DateTime(now.year, now.month, 1),
+          now,
+          '${_gstMonths[now.month - 1]} ${now.year}',
+        );
+      default:
+        return (
+          DateTime(now.year, now.month, 1),
+          now,
+          '${_gstMonths[now.month - 1]} ${now.year} (to date)',
+        );
+    }
+  }
+
+  Future<void> _loadGstPage() async {
+    setState(() {
+      _gstLoading = true;
+      _gstError = null;
+    });
+    try {
+      final (from, to, _) = _gstRangeFor(_gstPeriod);
+      final txns = await LocalDbService.getTransactionsForRange(from, to);
+      if (!mounted) return;
+      setState(() {
+        _gstTxList = txns;
+        _gstLoading = false;
+      });
+    } catch (e) {
+      // Without this the screen would spin forever on a failed read.
+      if (!mounted) return;
+      setState(() {
+        _gstError = '$e';
+        _gstLoading = false;
+      });
+    }
+  }
+
+  /// Splits one bill's taxable value and tax across rate slabs.
+  ///
+  /// This mirrors ReceiptPrinter._taxByRate rather than calling it — that
+  /// method is library-private to receipt_printer.dart and unreachable from
+  /// here. Nothing in the tax path is edited; the printed invoice remains the
+  /// source of truth for what was charged.
+  ///
+  /// The guard is deliberately wider than the printer's `sub <= 0`, because
+  /// two cases that are harmless on a single invoice are not harmless in an
+  /// aggregate:
+  ///  - A return carries negated subtotal, discount and tax, so `sub` is
+  ///    negative and the printer drops it. Its negative tax is real and has to
+  ///    reduce the period, and a wholly negated bill still yields a sane
+  ///    factor, so it is kept here.
+  ///  - An exchange merges a reversal and a sale into one row but keeps only
+  ///    the reversal's discount, so a near-even swap leaves a tiny subtotal
+  ///    against a whole discount and `factor` explodes. `sub` stays positive,
+  ///    so the printer's guard misses it entirely.
+  /// A bill that fails the check is reported as unsplittable rather than
+  /// silently inflating a slab; the caller shows it as Unallocated.
+  ({Map<double, (double, double)> byRate, bool split}) _gstSplitBill(
+    TransactionRecord tx,
+    double fallbackRate,
+  ) {
+    final out = <double, (double, double)>{};
+    final sub = tx.items.fold<double>(0, (s, i) => s + i.total);
+    if (sub.abs() < 0.005) return (byRate: out, split: false);
+    final factor = (sub - tx.discountAmount) / sub;
+    if (!factor.isFinite || factor < 0 || factor > 1.000001) {
+      return (byRate: out, split: false);
+    }
+    for (final i in tx.items) {
+      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+      final taxable = i.total * factor;
+      final prev = out[rate] ?? (0.0, 0.0);
+      out[rate] = (prev.$1 + taxable, prev.$2 + taxable * rate / 100);
+    }
+    return (byRate: out, split: true);
+  }
+
+  /// Period totals. The headline figures come straight from stored columns;
+  /// only the rate-slab split is derived, which is why the two are reconciled
+  /// against each other on screen.
+  ({
+    Map<double, (double, double)> byRate,
+    double unallocatedTaxable,
+    double unallocatedTax,
+    double recordedTaxable,
+    double recordedTax,
+    int bills,
+  })
+  _gstAggregate(List<TransactionRecord> txns) {
+    final fallback = double.tryParse(_taxRateDisplay) ?? 0;
+    final byRate = <double, (double, double)>{};
+    var unTaxable = 0.0;
+    var unTax = 0.0;
+    var recTaxable = 0.0;
+    var recTax = 0.0;
+    for (final t in txns) {
+      recTaxable += t.subtotal - t.discountAmount;
+      recTax += t.taxAmount;
+      final r = _gstSplitBill(t, fallback);
+      if (!r.split) {
+        unTaxable += t.subtotal - t.discountAmount;
+        unTax += t.taxAmount;
+        continue;
+      }
+      r.byRate.forEach((rate, v) {
+        final prev = byRate[rate] ?? (0.0, 0.0);
+        byRate[rate] = (prev.$1 + v.$1, prev.$2 + v.$2);
+      });
+    }
+    return (
+      byRate: byRate,
+      unallocatedTaxable: unTaxable,
+      unallocatedTax: unTax,
+      recordedTaxable: recTaxable,
+      recordedTax: recTax,
+      bills: txns.length,
+    );
+  }
+
+  Widget _gstPeriodBtn(String label) {
+    final active = _gstPeriod == label;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _gstPeriod = label);
+        _loadGstPage();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? AppColors.primary : AppColors.surfaceVariant,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: active ? AppColors.primary : AppColors.border,
+          ),
+        ),
+        child: Text(
+          label,
+          style: GoogleFonts.inter(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: active ? Colors.white : AppColors.textMuted,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Rate-slab selector. Display only — nothing is dropped from the totals
+  /// line or from the export.
+  Widget _gstRateChip(String label, double? rate) {
+    final active = _gstRateFilter == rate;
+    return GestureDetector(
+      onTap: () => setState(() => _gstRateFilter = rate),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: active ? AppColors.accentBlue : Colors.white,
+          borderRadius: BorderRadius.circular(7),
+          border: Border.all(
+            color: active ? AppColors.accentBlue : AppColors.border,
+          ),
+        ),
+        child: Text(
+          label,
+          style: GoogleFonts.inter(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: active ? Colors.white : AppColors.textMuted,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _gstCustomBtn() {
+    final active = _gstPeriod == 'Custom';
+    return GestureDetector(
+      onTap: _pickGstCustomPeriod,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? AppColors.primary : AppColors.surfaceVariant,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: active ? AppColors.primary : AppColors.border,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.event_outlined,
+              size: 14,
+              color: active ? Colors.white : AppColors.textMuted,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              active && _gstCustomLabel.isNotEmpty ? _gstCustomLabel : 'Custom',
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: active ? Colors.white : AppColors.textMuted,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickGstCustomPeriod() async {
+    final result = await showDialog<({DateTimeRange range, String label})>(
+      context: context,
+      builder: (_) => _CalendarPeriodPicker(
+        initialStart: _gstCustomRange?.start,
+        initialEnd: _gstCustomRange?.end,
+      ),
+    );
+    if (result == null || !mounted) return;
+    setState(() {
+      _gstCustomRange = DateTimeRange(
+        start: result.range.start,
+        end: result.range.end,
+      );
+      _gstCustomLabel = result.label;
+      _gstPeriod = 'Custom';
+    });
+    await _loadGstPage();
+  }
+
+  Widget _gstDownloadBtn(IconData icon, VoidCallback onTap) => GestureDetector(
+    onTap: onTap,
+    child: Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Icon(icon, color: AppColors.textMuted, size: 18),
+    ),
+  );
+
+  Widget _gstRow(
+    String rate,
+    String taxable,
+    String cgst,
+    String sgst,
+    String tax, {
+    bool bold = false,
+    Color? color,
+  }) {
+    final style = GoogleFonts.inter(
+      fontSize: 12.5,
+      fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
+      color: color ?? AppColors.textDark,
+    );
+    Widget cell(String t, int flex, {bool right = true}) => Expanded(
+      flex: flex,
+      child: Text(t, textAlign: right ? TextAlign.right : TextAlign.left, style: style),
+    );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 11),
+      child: Row(
+        children: [
+          cell(rate, 2, right: false),
+          cell(taxable, 3),
+          cell(cgst, 3),
+          cell(sgst, 3),
+          cell(tax, 3),
+        ],
+      ),
+    );
+  }
+
+  /// One row per invoice, with CGST/SGST derived from the rate each line
+  /// actually carried. Bills whose every line is 0% are left out — they carry
+  /// no tax, so they are not taxable supplies — but they are counted and
+  /// reported back so nothing disappears silently. [only] restricts to a
+  /// single slab when the rate filter is on.
+  ({
+    List<
+      ({
+        String invoice,
+        DateTime date,
+        String customer,
+        List<double> rates,
+        double taxable,
+        double tax,
+      })
+    >
+    rows,
+    int excluded,
+    double excludedTaxable,
+  })
+  _gstInvoiceRows(List<TransactionRecord> txns, {double? only}) {
+    final fallback = double.tryParse(_taxRateDisplay) ?? 0;
+    final rows =
+        <
+          ({
+            String invoice,
+            DateTime date,
+            String customer,
+            List<double> rates,
+            double taxable,
+            double tax,
+          })
+        >[];
+    var excluded = 0;
+    var excludedTaxable = 0.0;
+
+    for (final t in txns) {
+      final split = _gstSplitBill(t, fallback);
+      // Unsplittable bills (see _gstSplitBill) can't be attributed to a rate,
+      // so they belong with the excluded set rather than in a rate row.
+      final taxed = split.split
+          ? {
+              for (final e in split.byRate.entries)
+                if (e.key > 0 && (only == null || e.key == only)) e.key: e.value,
+            }
+          : const <double, (double, double)>{};
+      if (taxed.isEmpty) {
+        excluded++;
+        excludedTaxable += t.subtotal - t.discountAmount;
+        continue;
+      }
+      final rates = taxed.keys.toList()..sort();
+      rows.add((
+        invoice: t.displayInvoice,
+        date: t.createdAt,
+        customer: t.customerName ?? '',
+        rates: rates,
+        taxable: taxed.values.fold<double>(0, (s, v) => s + v.$1),
+        tax: taxed.values.fold<double>(0, (s, v) => s + v.$2),
+      ));
+    }
+    rows.sort((a, b) => b.date.compareTo(a.date));
+    return (rows: rows, excluded: excluded, excludedTaxable: excludedTaxable);
+  }
+
+  String _gstRatesLabel(List<double> rates) =>
+      rates.map((r) => '${_formatRate(r)}%').join(', ');
+
+  String _gstShortDateTime(DateTime d) {
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    final m = d.minute.toString().padLeft(2, '0');
+    return '${d.day.toString().padLeft(2, '0')}/'
+        '${d.month.toString().padLeft(2, '0')} '
+        '$h:$m ${d.hour < 12 ? 'AM' : 'PM'}';
+  }
+
+  /// Invoice-wise register for the period. Virtualised, so a month with
+  /// thousands of bills scrolls without building every row up front.
+  Widget _gstInvoiceTable(List<TransactionRecord> txns) {
+    final data = _gstInvoiceRows(txns, only: _gstRateFilter);
+    final q = _gstInvoiceSearch.trim().toLowerCase();
+    final rows = q.isEmpty
+        ? data.rows
+        : data.rows
+              .where(
+                (r) =>
+                    r.invoice.toLowerCase().contains(q) ||
+                    r.customer.toLowerCase().contains(q),
+              )
+              .toList();
+
+    Widget cell(String t, int flex, {bool right = false, bool bold = false}) =>
+        Expanded(
+          flex: flex,
+          child: Text(
+            t,
+            textAlign: right ? TextAlign.right : TextAlign.left,
+            overflow: TextOverflow.ellipsis,
+            style: GoogleFonts.inter(
+              fontSize: 12.5,
+              fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
+              color: AppColors.textDark,
+            ),
+          ),
+        );
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                'Invoices',
+                style: GoogleFonts.manrope(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: AppColors.textDark,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                '${rows.length} taxable',
+                style: GoogleFonts.inter(
+                  fontSize: 12,
+                  color: AppColors.textMuted,
+                ),
+              ),
+              const Spacer(),
+              SizedBox(
+                width: 260,
+                height: 36,
+                child: TextField(
+                  onChanged: (v) => setState(() => _gstInvoiceSearch = v),
+                  style: GoogleFonts.inter(fontSize: 12.5),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    filled: true,
+                    fillColor: Colors.white,
+                    hintText: 'Search invoice or customer',
+                    hintStyle: GoogleFonts.inter(
+                      fontSize: 12.5,
+                      color: AppColors.textMuted,
+                    ),
+                    prefixIcon: const Icon(
+                      Icons.search_rounded,
+                      color: AppColors.textMuted,
+                      size: 17,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 10),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: const BorderSide(color: AppColors.border),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: const BorderSide(color: AppColors.border),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: const BorderSide(color: AppColors.primary),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(flex: 3, child: _dashColHeader('DATE')),
+              Expanded(flex: 3, child: _dashColHeader('INVOICE')),
+              Expanded(flex: 4, child: _dashColHeader('CUSTOMER')),
+              Expanded(flex: 2, child: _dashColHeader('RATE', right: true)),
+              Expanded(flex: 3, child: _dashColHeader('TAXABLE', right: true)),
+              Expanded(flex: 3, child: _dashColHeader('CGST', right: true)),
+              Expanded(flex: 3, child: _dashColHeader('SGST', right: true)),
+              Expanded(flex: 3, child: _dashColHeader('TOTAL TAX', right: true)),
+            ],
+          ),
+          const Divider(height: 18, color: AppColors.border),
+          if (rows.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 28),
+              child: Center(
+                child: Text(
+                  q.isEmpty
+                      ? 'No taxable invoices in this period.'
+                      : 'No invoice matches "$_gstInvoiceSearch".',
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+              ),
+            )
+          else
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 420),
+              child: ListView.separated(
+                shrinkWrap: true,
+                itemCount: rows.length,
+                separatorBuilder: (_, _) =>
+                    const Divider(height: 1, color: AppColors.border),
+                itemBuilder: (_, i) {
+                  final r = rows[i];
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 11),
+                    child: Row(
+                      children: [
+                        cell(_gstShortDateTime(r.date), 3),
+                        cell(r.invoice, 3, bold: true),
+                        cell(r.customer.isEmpty ? '—' : r.customer, 4),
+                        cell(_gstRatesLabel(r.rates), 2, right: true),
+                        cell(_fmt(r.taxable), 3, right: true),
+                        cell(_fmt(r.tax / 2), 3, right: true),
+                        cell(_fmt(r.tax / 2), 3, right: true),
+                        cell(_fmt(r.tax), 3, right: true),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          if (data.excluded > 0) ...[
+            const Divider(height: 18, color: AppColors.border),
+            Text(
+              '${data.excluded} invoice${data.excluded == 1 ? '' : 's'} '
+              'left out (${_fmt(data.excludedTaxable)}) — no line on them '
+              'carried a rate above 0%. They are not taxable supplies, but if '
+              'any are exempt or nil-rated sales they still belong in '
+              'GSTR-3B 3.1(c).',
+              style: GoogleFonts.inter(
+                fontSize: 11.5,
+                height: 1.45,
+                color: AppColors.textMuted,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGstView() {
+    final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
+    final txns = _gstTxList;
+
+    return Expanded(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                'For $periodLabel',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  color: AppColors.textMuted,
+                ),
+              ),
+              const Spacer(),
+              _gstPeriodBtn('This Month'),
+              const SizedBox(width: 8),
+              _gstPeriodBtn('Last Month'),
+              const SizedBox(width: 8),
+              _gstCustomBtn(),
+              const SizedBox(width: 14),
+              _printIconBtn(_printGstSummary),
+              const SizedBox(width: 8),
+              _gstDownloadBtn(Icons.picture_as_pdf_outlined, _saveGstPdf),
+              const SizedBox(width: 8),
+              _gstDownloadBtn(Icons.table_chart_outlined, _exportGstCsv),
+            ],
+          ),
+          const SizedBox(height: 20),
+          if (_gstLoading)
+            const Expanded(child: Center(child: CircularProgressIndicator()))
+          else if (_gstError != null)
+            Expanded(
+              child: Center(
+                child: Text(
+                  'Could not load bills for this period.\n$_gstError',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+              ),
+            )
+          else if (txns == null)
+            const Expanded(child: SizedBox())
+          else if (txns.isEmpty)
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Container(
+                      width: 72,
+                      height: 72,
+                      decoration: BoxDecoration(
+                        color: AppColors.accentBlue.withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: const Icon(
+                        Icons.receipt_long_outlined,
+                        size: 36,
+                        color: AppColors.accentBlue,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      'No bills in this period',
+                      style: GoogleFonts.manrope(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.textDark,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Pick another period to see the $_taxLabel collected on your sales.',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            Expanded(child: _gstBody(_gstAggregate(txns), txns)),
+        ],
+      ),
+    );
+  }
+
+  Widget _gstBody(
+    ({
+      Map<double, (double, double)> byRate,
+      double unallocatedTaxable,
+      double unallocatedTax,
+      double recordedTaxable,
+      double recordedTax,
+      int bills,
+    })
+    agg,
+    List<TransactionRecord> txns,
+  ) {
+    final rates = agg.byRate.keys.toList()..sort();
+    final computedTax =
+        agg.byRate.values.fold<double>(0, (s, v) => s + v.$2) +
+        agg.unallocatedTax;
+    final computedTaxable =
+        agg.byRate.values.fold<double>(0, (s, v) => s + v.$1) +
+        agg.unallocatedTaxable;
+    final delta = agg.recordedTax - computedTax;
+    final hasUnallocated =
+        agg.unallocatedTax.abs() >= 0.005 ||
+        agg.unallocatedTaxable.abs() >= 0.005;
+
+    // With a slab selected the headline figures have to come from the split
+    // rather than the stored per-bill columns, because one bill can carry
+    // several rates. Unfiltered they stay on the stored columns, which are
+    // exact.
+    final filter = _gstRateFilter;
+    final shownRates = filter == null
+        ? rates
+        : rates.where((r) => r == filter).toList();
+    final filtered = filter != null;
+    final slab = filtered ? (agg.byRate[filter] ?? (0.0, 0.0)) : null;
+    final headTaxable = filtered ? slab!.$1 : agg.recordedTaxable;
+    final headTax = filtered ? slab!.$2 : agg.recordedTax;
+    final excludedTaxable = computedTaxable - headTaxable;
+    final excludedTax = computedTax - headTax;
+    final half = headTax / 2;
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (rates.length > 1) ...[
+            Row(
+              children: [
+                Text(
+                  'SHOW',
+                  style: GoogleFonts.inter(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textMuted,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                _gstRateChip('All rates', null),
+                for (final r in rates) ...[
+                  const SizedBox(width: 8),
+                  _gstRateChip('${_formatRate(r)}%', r),
+                ],
+              ],
+            ),
+            const SizedBox(height: 18),
+          ],
+          Row(
+            children: [
+              _reportSummaryCard(
+                filtered
+                    ? 'Taxable Value (${_formatRate(filter)}%)'
+                    : 'Taxable Value',
+                _fmt(headTaxable),
+                Icons.sell_outlined,
+                AppColors.accentBlue,
+                currencyIcon: _currencySymbol,
+              ),
+              const SizedBox(width: 16),
+              _reportSummaryCard(
+                '$_taxLabel Collected',
+                _fmt(headTax),
+                Icons.account_balance_outlined,
+                AppColors.accent,
+                currencyIcon: _currencySymbol,
+              ),
+              const SizedBox(width: 16),
+              _reportSummaryCard(
+                'CGST',
+                _fmt(half),
+                Icons.call_split_rounded,
+                const Color(0xFF8B5CF6),
+              ),
+              const SizedBox(width: 16),
+              _reportSummaryCard(
+                'SGST',
+                _fmt(half),
+                Icons.call_split_rounded,
+                const Color(0xFF8B5CF6),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      'Rate-wise breakdown',
+                      style: GoogleFonts.manrope(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.textDark,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '${agg.bills} bill${agg.bills == 1 ? '' : 's'}',
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(flex: 2, child: _dashColHeader('RATE')),
+                    Expanded(
+                      flex: 3,
+                      child: _dashColHeader('TAXABLE VALUE', right: true),
+                    ),
+                    Expanded(flex: 3, child: _dashColHeader('CGST', right: true)),
+                    Expanded(flex: 3, child: _dashColHeader('SGST', right: true)),
+                    Expanded(
+                      flex: 3,
+                      child: _dashColHeader('TOTAL TAX', right: true),
+                    ),
+                  ],
+                ),
+                const Divider(height: 18, color: AppColors.border),
+                for (final r in shownRates)
+                  _gstRow(
+                    '${_formatRate(r)}%',
+                    _fmt(agg.byRate[r]!.$1),
+                    _fmt(agg.byRate[r]!.$2 / 2),
+                    _fmt(agg.byRate[r]!.$2 / 2),
+                    _fmt(agg.byRate[r]!.$2),
+                  ),
+                if (hasUnallocated && !filtered)
+                  _gstRow(
+                    'Unallocated',
+                    _fmt(agg.unallocatedTaxable),
+                    '—',
+                    '—',
+                    _fmt(agg.unallocatedTax),
+                    color: const Color(0xFFF59E0B),
+                  ),
+                if (filtered && excludedTaxable.abs() >= 0.005)
+                  _gstRow(
+                    'Not shown',
+                    _fmt(excludedTaxable),
+                    '—',
+                    '—',
+                    _fmt(excludedTax),
+                    color: AppColors.textMuted,
+                  ),
+                const Divider(height: 18, color: AppColors.border),
+                // Always every slab, filter or not — the filter narrows what
+                // you read, never what the period actually came to.
+                _gstRow(
+                  filtered ? 'Total (all rates)' : 'Total',
+                  _fmt(computedTaxable),
+                  _fmt(computedTax / 2),
+                  _fmt(computedTax / 2),
+                  _fmt(computedTax),
+                  bold: true,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          _gstInvoiceTable(txns),
+          const SizedBox(height: 16),
+          if (filtered) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: AppColors.accentBlue.withValues(alpha: 0.06),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: AppColors.accentBlue.withValues(alpha: 0.25),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.filter_alt_outlined,
+                    size: 16,
+                    color: AppColors.accentBlue,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Showing the ${_formatRate(filter)}% slab only. '
+                      '${_fmt(excludedTaxable)} of taxable value at other rates '
+                      'is not in the cards above. Nil-rated and exempt supplies '
+                      'still have to be declared separately (GSTR-3B 3.1(c)), so '
+                      'the export carries every slab whichever filter is set.',
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        height: 1.45,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+          if (delta.abs() >= 0.5)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF59E0B).withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: const Color(0xFFF59E0B).withValues(alpha: 0.35),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.info_outline_rounded,
+                    size: 16,
+                    color: Color(0xFFF59E0B),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Tax recorded on bills is ${_fmt(agg.recordedTax)}, '
+                      'but the rate-wise split adds up to ${_fmt(computedTax)} '
+                      '(difference ${_fmt(delta)}). Returns are taxed by scaling '
+                      'the original bill rather than by rate, and a bill whose '
+                      'tax was edited after the sale keeps its original line '
+                      'rates — either can move the two apart. The figures above '
+                      'the table come straight from the bills.',
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        height: 1.45,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          if (delta.abs() >= 0.5) const SizedBox(height: 12),
+          Text(
+            'CGST and SGST are shown as an equal half of the tax, the same split '
+            'your invoices print. Place of supply is not recorded, so inter-state '
+            'sales are not separated out. HSN codes are not stored, so no HSN '
+            'summary is available. Bills made before per-item rates existed are '
+            'counted at the current store rate of $_taxRateDisplay%.',
+            style: GoogleFonts.inter(
+              fontSize: 11.5,
+              height: 1.5,
+              color: AppColors.textMuted,
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+
+  /// Builds the summary document once, so print and save-to-file
+  /// produce byte-identical output. Null when there is nothing to report.
+  Future<(pw.Document, String)?> _buildGstPdf() async {
+    final txns = _gstTxList;
+    if (txns == null || txns.isEmpty) {
+      _showToast('No bills in this period', isError: true);
+      return null;
+    }
+    final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
+    final agg = _gstAggregate(txns);
+    final rates = agg.byRate.keys.toList()..sort();
+    final computedTax =
+        agg.byRate.values.fold<double>(0, (s, v) => s + v.$2) +
+        agg.unallocatedTax;
+    final computedTaxable =
+        agg.byRate.values.fold<double>(0, (s, v) => s + v.$1) +
+        agg.unallocatedTaxable;
+    final hasUnallocated =
+        agg.unallocatedTax.abs() >= 0.005 ||
+        agg.unallocatedTaxable.abs() >= 0.005;
+
+    final regularData = await rootBundle.load(
+      'assets/fonts/NotoSans-Regular.ttf',
+    );
+    final boldData = await rootBundle.load('assets/fonts/NotoSans-Bold.ttf');
+    final regular = pw.Font.ttf(regularData);
+    final bold = pw.Font.ttf(boldData);
+
+    pw.TableRow row(List<String> cells, {bool head = false}) => pw.TableRow(
+      decoration: head
+          ? const pw.BoxDecoration(color: PdfColors.grey200)
+          : null,
+      children: cells
+          .map(
+            (c) => pw.Padding(
+              padding: const pw.EdgeInsets.all(6),
+              child: pw.Text(
+                c,
+                style: pw.TextStyle(
+                  font: head ? bold : regular,
+                  fontSize: head ? 8 : 9,
+                ),
+              ),
+            ),
+          )
+          .toList(),
+    );
+
+    final doc = pw.Document();
+    doc.addPage(
+      pw.MultiPage(
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.all(32),
+        build: (ctx) => [
+          pw.Text(
+            '$_taxLabel Summary – $periodLabel',
+            style: pw.TextStyle(font: bold, fontSize: 16),
+          ),
+          if (_storeGstin.trim().isNotEmpty) ...[
+            pw.SizedBox(height: 4),
+            pw.Text(
+              'GSTIN: ${_storeGstin.trim()}',
+              style: pw.TextStyle(font: regular, fontSize: 10),
+            ),
+          ],
+          pw.SizedBox(height: 4),
+          pw.Text(
+            '${agg.bills} bill${agg.bills == 1 ? '' : 's'}  ·  '
+            'Taxable ${_fmt(agg.recordedTaxable)}  ·  '
+            'Tax ${_fmt(agg.recordedTax)}',
+            style: pw.TextStyle(font: regular, fontSize: 10),
+          ),
+          pw.SizedBox(height: 12),
+          pw.Table(
+            border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.5),
+            columnWidths: {
+              0: const pw.FlexColumnWidth(2),
+              1: const pw.FlexColumnWidth(3),
+              2: const pw.FlexColumnWidth(3),
+              3: const pw.FlexColumnWidth(3),
+              4: const pw.FlexColumnWidth(3),
+            },
+            children: [
+              row([
+                'RATE',
+                'TAXABLE VALUE',
+                'CGST',
+                'SGST',
+                'TOTAL TAX',
+              ], head: true),
+              for (final r in rates)
+                row([
+                  '${_formatRate(r)}%',
+                  _fmt(agg.byRate[r]!.$1),
+                  _fmt(agg.byRate[r]!.$2 / 2),
+                  _fmt(agg.byRate[r]!.$2 / 2),
+                  _fmt(agg.byRate[r]!.$2),
+                ]),
+              if (hasUnallocated)
+                row([
+                  'Unallocated',
+                  _fmt(agg.unallocatedTaxable),
+                  '—',
+                  '—',
+                  _fmt(agg.unallocatedTax),
+                ]),
+              row([
+                'Total',
+                _fmt(computedTaxable),
+                _fmt(computedTax / 2),
+                _fmt(computedTax / 2),
+                _fmt(computedTax),
+              ], head: true),
+            ],
+          ),
+          pw.SizedBox(height: 10),
+          pw.Text(
+            'CGST and SGST are shown as an equal half of the tax, the same split '
+            'the invoices print. Place of supply is not recorded, so inter-state '
+            'sales are not separated out. HSN codes are not stored. Bills made '
+            'before per-item rates existed are counted at the current store rate '
+            'of $_taxRateDisplay%.',
+            style: pw.TextStyle(
+              font: regular,
+              fontSize: 8,
+              color: PdfColors.grey700,
+            ),
+          ),
+        ],
+      ),
+    );
+    return (doc, periodLabel);
+  }
+
+  Future<void> _printGstSummary() async {
+    final built = await _buildGstPdf();
+    if (built == null) return;
+    final (doc, periodLabel) = built;
+    await Printing.layoutPdf(
+      onLayout: (_) => doc.save(),
+      name: '$_taxLabel $periodLabel',
+    );
+  }
+
+  /// Writes the same document straight to a file the user picks, so a summary
+  /// can be filed or emailed without going through the print dialog.
+  Future<void> _saveGstPdf() async {
+    final built = await _buildGstPdf();
+    if (built == null) return;
+    final (doc, periodLabel) = built;
+    final slug = periodLabel
+        .replaceAll(RegExp(r'[^A-Za-z0-9]+'), '-')
+        .toLowerCase();
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: 'Save $_taxLabel summary',
+      fileName: 'gst-$slug.pdf',
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+    );
+    if (path == null) return;
+    try {
+      final withExt = path.toLowerCase().endsWith('.pdf') ? path : '$path.pdf';
+      await File(withExt).writeAsBytes(await doc.save());
+      if (mounted) _showToast('Saved $withExt');
+    } catch (e) {
+      if (mounted) _showToast('Could not save: $e', isError: true);
+    }
+  }
+
+  static String _csvCell(String v) => v.contains(RegExp(r'[",\n]'))
+      ? '"${v.replaceAll('"', '""')}"'
+      : v;
+
+  Future<void> _exportGstCsv() async {
+    final txns = _gstTxList;
+    if (txns == null || txns.isEmpty) {
+      _showToast('No bills in this period', isError: true);
+      return;
+    }
+    final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
+    final agg = _gstAggregate(txns);
+    final rates = agg.byRate.keys.toList()..sort();
+    final computedTax =
+        agg.byRate.values.fold<double>(0, (s, v) => s + v.$2) +
+        agg.unallocatedTax;
+    final computedTaxable =
+        agg.byRate.values.fold<double>(0, (s, v) => s + v.$1) +
+        agg.unallocatedTaxable;
+    final hasUnallocated =
+        agg.unallocatedTax.abs() >= 0.005 ||
+        agg.unallocatedTaxable.abs() >= 0.005;
+
+    String n(double v) => v.toStringAsFixed(2);
+
+    final b = StringBuffer();
+    b.writeln('${_csvCell('$_taxLabel Summary')},${_csvCell(periodLabel)}');
+    if (_storeGstin.trim().isNotEmpty) {
+      b.writeln('GSTIN,${_csvCell(_storeGstin.trim())}');
+    }
+    b.writeln('Bills,${agg.bills}');
+    b.writeln('Taxable value on bills,${n(agg.recordedTaxable)}');
+    b.writeln('Tax recorded on bills,${n(agg.recordedTax)}');
+    b.writeln();
+    b.writeln('Rate %,Taxable Value,CGST,SGST,Total Tax');
+    for (final r in rates) {
+      final v = agg.byRate[r]!;
+      b.writeln(
+        '${_formatRate(r)},${n(v.$1)},${n(v.$2 / 2)},${n(v.$2 / 2)},${n(v.$2)}',
+      );
+    }
+    if (hasUnallocated) {
+      b.writeln(
+        'Unallocated,${n(agg.unallocatedTaxable)},,,${n(agg.unallocatedTax)}',
+      );
+    }
+    b.writeln(
+      'Total,${n(computedTaxable)},${n(computedTax / 2)},${n(computedTax / 2)},'
+      '${n(computedTax)}',
+    );
+    b.writeln();
+    b.writeln(
+      _csvCell(
+        'CGST and SGST are an equal half of the tax, the same split the '
+        'invoices print. Place of supply is not recorded. HSN codes are not '
+        'stored. Bills made before per-item rates existed are counted at the '
+        'current store rate of $_taxRateDisplay%.',
+      ),
+    );
+
+    // Invoice-wise register. Every taxable bill in the period, so the summary
+    // above can be traced back to the bills it came from.
+    final reg = _gstInvoiceRows(txns);
+    b.writeln();
+    b.writeln('Invoices,${reg.rows.length}');
+    b.writeln('Date,Invoice,Customer,Rate %,Taxable Value,CGST,SGST,Total Tax');
+    for (final r in reg.rows) {
+      b.writeln(
+        '${r.date.toIso8601String().substring(0, 16).replaceFirst('T', ' ')},'
+        '${_csvCell(r.invoice)},${_csvCell(r.customer)},'
+        '${_csvCell(r.rates.map(_formatRate).join(' + '))},'
+        '${n(r.taxable)},${n(r.tax / 2)},${n(r.tax / 2)},${n(r.tax)}',
+      );
+    }
+    if (reg.excluded > 0) {
+      b.writeln();
+      b.writeln(
+        _csvCell(
+          '${reg.excluded} invoice(s) totalling ${n(reg.excludedTaxable)} are '
+          'not listed: no line carried a rate above 0%, so they are not '
+          'taxable supplies. Exempt or nil-rated sales among them still '
+          'belong in GSTR-3B 3.1(c).',
+        ),
+      );
+    }
+
+    final slug = periodLabel
+        .replaceAll(RegExp(r'[^A-Za-z0-9]+'), '-')
+        .toLowerCase();
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: 'Save $_taxLabel summary',
+      fileName: 'gst-$slug.csv',
+      type: FileType.custom,
+      allowedExtensions: ['csv'],
+    );
+    if (path == null) return;
+    try {
+      final withExt = path.toLowerCase().endsWith('.csv') ? path : '$path.csv';
+      await File(withExt).writeAsString(b.toString());
+      if (mounted) _showToast('Saved $withExt');
+    } catch (e) {
+      if (mounted) _showToast('Could not save: $e', isError: true);
+    }
+  }
+
   // ── Reports View ─────────────────────────────────────────────────────────────
 
   Future<void> _loadReportCustomers() async {
@@ -20797,7 +22350,7 @@ end tell
                     ),
                   ),
                   const SizedBox(width: 8),
-                  _printIconBtn(() => _printSalesTable(txList, periodLabel)),
+                  _salesExportMenu(txList, periodLabel),
                 ],
               ),
               const SizedBox(height: 16),
@@ -20824,9 +22377,25 @@ end tell
                     children: [
                       Expanded(flex: 3, child: _dashColHeader('DATE / TIME')),
                       Expanded(flex: 3, child: _dashColHeader('INVOICE')),
-                      Expanded(flex: 4, child: _dashColHeader('CUSTOMER')),
+                      Expanded(flex: 3, child: _dashColHeader('CUSTOMER')),
                       Expanded(flex: 2, child: _dashColHeader('ITEMS')),
                       Expanded(flex: 2, child: _dashColHeader('PAYMENT')),
+                      Expanded(
+                        flex: 3,
+                        child: _dashColHeader('TAXABLE', right: true),
+                      ),
+                      Expanded(
+                        flex: 2,
+                        child: _dashColHeader('CGST', right: true),
+                      ),
+                      Expanded(
+                        flex: 2,
+                        child: _dashColHeader('SGST', right: true),
+                      ),
+                      Expanded(
+                        flex: 2,
+                        child: _dashColHeader(_taxLabel, right: true),
+                      ),
                       Expanded(
                         flex: 2,
                         child: _dashColHeader('TOTAL', right: true),
@@ -20871,6 +22440,18 @@ end tell
                           'hybrid': 'Hybrid',
                         }[t.paymentMethod] ??
                         t.paymentMethod;
+                    // Split the same way the GST page does, so the two screens
+                    // can never disagree. Lines at 0% are left out: they carry
+                    // no tax, so they are not taxable supplies. A bill with no
+                    // taxed line, or one the rate split can't attribute (see
+                    // _gstSplitBill), shows a dash rather than a wrong figure.
+                    final rowGst = _salesRowGst(t);
+                    final hasGst = rowGst != null;
+                    final gstTaxable = rowGst?.taxable ?? 0;
+                    final gstTax = rowGst?.tax ?? 0;
+                    // Sign in front of the symbol, matching the TOTAL column.
+                    String gstCell(double v) =>
+                        v < 0 ? '-${_fmt(v.abs())}' : _fmt(v);
                     return Column(
                       children: [
                         InkWell(
@@ -20933,7 +22514,7 @@ end tell
                                   ),
                                 ),
                                 Expanded(
-                                  flex: 4,
+                                  flex: 3,
                                   child: Text(
                                     customer,
                                     style: GoogleFonts.inter(
@@ -20961,6 +22542,51 @@ end tell
                                     style: GoogleFonts.inter(
                                       fontSize: 12,
                                       color: AppColors.textDark,
+                                    ),
+                                  ),
+                                ),
+                                Expanded(
+                                  flex: 3,
+                                  child: Text(
+                                    hasGst ? gstCell(gstTaxable) : '—',
+                                    textAlign: TextAlign.right,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12,
+                                      color: AppColors.textMuted,
+                                    ),
+                                  ),
+                                ),
+                                Expanded(
+                                  flex: 2,
+                                  child: Text(
+                                    hasGst ? gstCell(gstTax / 2) : '—',
+                                    textAlign: TextAlign.right,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12,
+                                      color: AppColors.textMuted,
+                                    ),
+                                  ),
+                                ),
+                                Expanded(
+                                  flex: 2,
+                                  child: Text(
+                                    hasGst ? gstCell(gstTax / 2) : '—',
+                                    textAlign: TextAlign.right,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12,
+                                      color: AppColors.textMuted,
+                                    ),
+                                  ),
+                                ),
+                                Expanded(
+                                  flex: 2,
+                                  child: Text(
+                                    hasGst ? gstCell(gstTax) : '—',
+                                    textAlign: TextAlign.right,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: AppColors.accent,
                                     ),
                                   ),
                                 ),
