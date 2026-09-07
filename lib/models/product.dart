@@ -7,6 +7,10 @@ class Product {
   final double price;
   final double buyingPrice;
   final double taxPercent;
+
+  /// HSN/SAC classification code for tax invoices and the GSTR-1 HSN summary.
+  /// Empty when not yet classified; the invoice prints an em-dash for those.
+  final String hsnCode;
   final String category;
   final String emoji;
   final String sku;
@@ -27,6 +31,7 @@ class Product {
     required this.price,
     this.buyingPrice = 0.0,
     this.taxPercent = 0.0,
+    this.hsnCode = '',
     required this.category,
     required this.emoji,
     required this.sku,
@@ -43,6 +48,7 @@ class Product {
     'price': price,
     'buying_price': buyingPrice,
     'tax_percent': taxPercent,
+    'hsn_code': hsnCode,
     'category': category,
     'emoji': emoji,
     'sku': sku,
@@ -60,6 +66,7 @@ class Product {
     price: (m['price'] as num).toDouble(),
     buyingPrice: (m['buying_price'] as num?)?.toDouble() ?? 0.0,
     taxPercent: (m['tax_percent'] as num?)?.toDouble() ?? 0.0,
+    hsnCode: (m['hsn_code'] as String?) ?? '',
     category: m['category'] as String,
     emoji: m['emoji'] as String,
     sku: m['sku'] as String,
@@ -76,6 +83,7 @@ class Product {
     String? dealerName,
     String? purchaseDate,
     String? category,
+    String? hsnCode,
   }) => Product(
     id: id,
     name: name,
@@ -83,6 +91,7 @@ class Product {
     price: price,
     buyingPrice: buyingPrice,
     taxPercent: taxPercent,
+    hsnCode: hsnCode ?? this.hsnCode,
     category: category ?? this.category,
     emoji: emoji,
     sku: sku,

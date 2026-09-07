@@ -446,6 +446,7 @@ class ConnectivityService extends ChangeNotifier {
                         'price': p.price,
                         'buying_price': p.buyingPrice,
                         'tax_percent': p.taxPercent,
+                        'hsn_code': p.hsnCode,
                         'category': p.category,
                         'emoji': p.emoji,
                         'sku': p.sku,
@@ -930,6 +931,9 @@ class ConnectivityService extends ChangeNotifier {
     'price': _asDouble(r['price']),
     'buying_price': _asDouble(r['buying_price']),
     'tax_percent': _asDouble(r['tax_percent']),
+    // Empty when the cloud column is absent, so a pull still succeeds against
+    // a project that has not run the hsn_code migration yet.
+    'hsn_code': (r['hsn_code'] as String?) ?? '',
     'category': r['category'],
     'emoji': r['emoji'],
     'sku': r['sku'],

@@ -58,6 +58,7 @@ class LocalDbService {
       'deleted': 'INTEGER NOT NULL DEFAULT 0',
       'buying_price': 'REAL NOT NULL DEFAULT 0',
       'tax_percent': 'REAL NOT NULL DEFAULT 0',
+      'hsn_code': "TEXT NOT NULL DEFAULT ''",
       'description': 'TEXT NOT NULL DEFAULT ""',
       'barcode_no': "TEXT NOT NULL DEFAULT ''",
       'dealer_name': "TEXT NOT NULL DEFAULT ''",
@@ -123,7 +124,7 @@ class LocalDbService {
   static Future<Database> _openVersioned(String dbPath, String userId) async {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 17,
+      version: 18,
       // Hardening against "database is locked" (SQLITE_BUSY) when another
       // process briefly holds the file (leftover instance, antivirus scan):
       // WAL lets readers and writers coexist, and busy_timeout makes a write
@@ -274,6 +275,34 @@ class LocalDbService {
             } catch (_) {}
           }
         }
+        if (oldVersion < 18) {
+          // HSN/SAC code per product, for tax invoices and the GSTR-1 HSN
+          // summary. Blank on every existing row; the invoice keeps printing
+          // its em-dash until a code is filled in.
+          try {
+            await db.execute(
+              "ALTER TABLE products ADD COLUMN hsn_code TEXT NOT NULL "
+              "DEFAULT ''",
+            );
+          } catch (_) {}
+          // Per-product tax rates were removed from the product form in
+          // v1.9.1; every product now follows the store-wide rate. Clearing
+          // the column is what makes that inheritance take effect, since
+          // CartProvider treats 0 as "use the store rate" and freezes the
+          // resolved rate onto each bill line. Past bills keep the rate they
+          // were charged at.
+          // synced = 0 / rev + 1 is load-bearing, not decoration: a plain
+          // UPDATE leaves synced = 1, and insertProductsSynced overwrites any
+          // synced row on the next pull, so the cloud's old rates would come
+          // straight back. Marking the rows dirty makes the zero survive the
+          // merge and then push up, exactly as softDeleteAllInTables does.
+          try {
+            await db.execute(
+              'UPDATE products SET tax_percent = 0, synced = 0, '
+              'rev = rev + 1 WHERE tax_percent != 0',
+            );
+          } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -318,6 +347,7 @@ class LocalDbService {
         price REAL NOT NULL,
         buying_price REAL NOT NULL DEFAULT 0,
         tax_percent REAL NOT NULL DEFAULT 0,
+        hsn_code TEXT NOT NULL DEFAULT '',
         category TEXT NOT NULL,
         emoji TEXT NOT NULL,
         sku TEXT NOT NULL,
@@ -818,14 +848,15 @@ class LocalDbService {
     final database = await db;
     await database.rawUpdate(
       'UPDATE products SET name = ?, price = ?, buying_price = ?, '
-      'tax_percent = ?, category = ?, emoji = ?, sku = ?, stock = ?, '
-      'description = ?, barcode_no = ?, dealer_name = ?, purchase_date = ?, '
-      'synced = 0, rev = rev + 1 WHERE id = ?',
+      'tax_percent = ?, hsn_code = ?, category = ?, emoji = ?, sku = ?, '
+      'stock = ?, description = ?, barcode_no = ?, dealer_name = ?, '
+      'purchase_date = ?, synced = 0, rev = rev + 1 WHERE id = ?',
       [
         p.name,
         p.price,
         p.buyingPrice,
         p.taxPercent,
+        p.hsnCode,
         p.category,
         p.emoji,
         p.sku,

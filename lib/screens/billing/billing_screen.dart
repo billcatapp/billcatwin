@@ -300,6 +300,12 @@ class _BillingScreenState extends State<BillingScreen> {
   String _receiptFooter = 'Thank you for your purchase!';
   String _taxLabel = 'GST';
   String _taxRateDisplay = '0';
+
+  /// GST switch on the running bill. Off means this one bill is billed at 0%;
+  /// the shop's saved tax_rate is never written, and the switch returns to on
+  /// for the next bill so a one-off untaxed sale can't quietly leave the rest
+  /// of the day untaxed.
+  bool _gstEnabled = true;
   String _currencySymbol = '₹';
   String _currencyCode = 'INR';
 
@@ -355,9 +361,22 @@ class _BillingScreenState extends State<BillingScreen> {
   bool _isPrinting = false;
   Timer? _printSafetyTimer;
   bool _addingCustomProduct = false;
+  // Set while a billing dialog is open: what Enter should confirm. The
+  // product search field keeps keyboard focus behind the modal barrier, so
+  // the dialog itself never sees the key — the global handler does.
+  VoidCallback? _dialogEnterAction;
   final _customNameCtrl = TextEditingController();
   final _customPriceCtrl = TextEditingController();
   final _customQtyCtrl = TextEditingController(text: '1');
+  final _customNameFocus = FocusNode();
+  // Arrow-key cursor over the product grid: index into _displayGridItems
+  // of the card lit up as if the mouse were hovering it, null when the
+  // keyboard isn't driving. Enter picks it, Esc lets go.
+  int? _gridCursor;
+  final _gridKey = GlobalKey();
+  final _gridCursorKey = GlobalKey();
+  // Lets Ctrl+D open the discount input, which owns its own state.
+  final _discountKey = GlobalKey<_DiscountToggleState>();
   final _customPriceFocus = FocusNode();
   // Picking a suggestion fills the fields; mute the list until the name is
   // typed in again, or the picked product would immediately re-list itself.
@@ -561,9 +580,26 @@ class _BillingScreenState extends State<BillingScreen> {
     } catch (_) {}
   }
 
+  /// The store rate, or 0 while the GST switch is off. Bill-scoped only.
+  double get _effectiveTaxRate =>
+      _gstEnabled ? (double.tryParse(_taxRateDisplay) ?? 0.0) : 0.0;
+
   void _syncTaxRate() {
     final cart = context.read<CartProvider>();
-    cart.setTaxRate(double.tryParse(_taxRateDisplay) ?? 0.0);
+    cart.setTaxRate(_effectiveTaxRate);
+  }
+
+  void _setGstEnabled(bool on) {
+    setState(() => _gstEnabled = on);
+    // Deliberately no saveSettings: the shop rate stays as configured.
+    context.read<CartProvider>().setTaxRate(_effectiveTaxRate);
+  }
+
+  /// Puts GST back on once a bill is finished or cleared.
+  void _resetGstToggle() {
+    if (_gstEnabled) return;
+    if (mounted) setState(() => _gstEnabled = true);
+    context.read<CartProvider>().setTaxRate(_effectiveTaxRate);
   }
 
   // Applies a tax rate entered from the cart summary: updates the running bill
@@ -677,13 +713,24 @@ class _BillingScreenState extends State<BillingScreen> {
   // field that caught it. Slow (human) typing is left completely alone.
   bool _handleGlobalKey(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
+
+    // A billing dialog is open: Enter confirms it, wherever focus sits.
+    final dialogEnter = _dialogEnterAction;
+    if (dialogEnter != null &&
+        (event.logicalKey == LogicalKeyboardKey.enter ||
+            event.logicalKey == LogicalKeyboardKey.numpadEnter)) {
+      dialogEnter();
+      return true;
+    }
     // Only active on the Billing tab, and not while a modal dialog is open.
     if (_selectedTab != 1 || ModalRoute.of(context)?.isCurrent != true) {
       return false;
     }
 
-    // Billing shortcuts: Ctrl+P = Print Bill, Ctrl+C = Paid/Close Bill,
-    // Alt+X = print (per saved Print Bill toggles) + close bill in one go.
+    // Billing shortcuts: Ctrl+B = Print Bill, Ctrl+C = Paid/Close Bill,
+    // Ctrl+P = next payment method, Ctrl+D = discount, Ctrl+= = open the
+    // custom-item row, Alt+X = print (per saved Print Bill toggles) + close
+    // bill in one go.
     final key = event.logicalKey;
     if (HardwareKeyboard.instance.isAltPressed) {
       if (key == LogicalKeyboardKey.keyX) {
@@ -694,9 +741,13 @@ class _BillingScreenState extends State<BillingScreen> {
       return false;
     }
     if (HardwareKeyboard.instance.isControlPressed) {
-      if (key == LogicalKeyboardKey.keyP) {
+      if (key == LogicalKeyboardKey.keyB) {
         final cart = context.read<CartProvider>();
         if (cart.items.isNotEmpty && !_isPrinting) _showPrintBillDialog(cart);
+        return true;
+      }
+      if (key == LogicalKeyboardKey.keyP) {
+        _cyclePaymentMethod();
         return true;
       }
       if (key == LogicalKeyboardKey.keyC) {
@@ -704,9 +755,62 @@ class _BillingScreenState extends State<BillingScreen> {
         if (cart.items.isNotEmpty) _closeBill(context, cart);
         return true;
       }
+      if (key == LogicalKeyboardKey.keyD) {
+        _discountKey.currentState?.openInput();
+        return true;
+      }
+      // Ctrl+= opens the inline custom-item row. Unlike bare "+", this works
+      // even while the cursor sits in the search box or a cart field.
+      if (key == LogicalKeyboardKey.equal) {
+        if (!_addingCustomProduct) {
+          setState(() {
+            _addingCustomProduct = true;
+            _customNameCtrl.clear();
+            _customPriceCtrl.clear();
+          });
+        }
+        _focusCustomName();
+        return true;
+      }
       // Any other Ctrl combo (copy/paste in fields, etc.) — leave it alone and
       // don't let it feed the scan buffer.
       return false;
+    }
+
+    // Arrow keys drive the product grid the way the mouse hovers it. Never
+    // take them off a text field the cashier is typing in (customer name,
+    // custom item, discount…); the product search box is the exception,
+    // since it holds focus all the time.
+    final isArrow =
+        key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown ||
+        key == LogicalKeyboardKey.arrowLeft ||
+        key == LogicalKeyboardKey.arrowRight;
+    if (isArrow || key == LogicalKeyboardKey.escape) {
+      final focusCtx = FocusManager.instance.primaryFocus?.context;
+      final inOtherField =
+          !_searchFocus.hasFocus &&
+          focusCtx != null &&
+          (focusCtx.widget is EditableText ||
+              focusCtx.findAncestorWidgetOfExactType<EditableText>() !=
+                  null);
+      if (!inOtherField) {
+        if (key == LogicalKeyboardKey.escape) {
+          if (_gridCursor == null) return false;
+          setState(() => _gridCursor = null);
+          return true;
+        }
+        // Left/right belong to the search caret until the grid cursor is
+        // up, so editing a typed query keeps working.
+        final horizontal =
+            key == LogicalKeyboardKey.arrowLeft ||
+            key == LogicalKeyboardKey.arrowRight;
+        if (!(horizontal &&
+            _gridCursor == null &&
+            _searchController.text.isNotEmpty)) {
+          return _moveGridCursor(key);
+        }
+      }
     }
 
     // "+" opens the custom product row — but never while the cursor is in a
@@ -721,6 +825,7 @@ class _BillingScreenState extends State<BillingScreen> {
         if (!_addingCustomProduct) {
           setState(() => _addingCustomProduct = true);
         }
+        _focusCustomName();
         return true;
       }
     }
@@ -741,6 +846,13 @@ class _BillingScreenState extends State<BillingScreen> {
       if (wasRapid && code.length >= 6 && _looksLikeCode(code)) {
         _addScannedCodeToCart(code);
         return true; // consume the scanner's Enter so fields don't also submit
+      }
+      // Not a scan: if the arrow keys have a card lit up, Enter picks it.
+      final cursor = _gridCursor;
+      final items = _displayGridItems;
+      if (cursor != null && cursor < items.length) {
+        _activateGridItem(items[cursor], context.read<CartProvider>());
+        return true;
       }
       return false;
     }
@@ -1243,6 +1355,7 @@ class _BillingScreenState extends State<BillingScreen> {
     _customNameCtrl.dispose();
     _customPriceCtrl.dispose();
     _customQtyCtrl.dispose();
+    _customNameFocus.dispose();
     _customPriceFocus.dispose();
     super.dispose();
   }
@@ -1280,13 +1393,20 @@ class _BillingScreenState extends State<BillingScreen> {
                           index: _selectedTab,
                           children: [
                             _buildDashboardView(),
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                _buildLeftPanel(),
-                                _buildResizeDivider(),
-                                _buildRightPanel(),
-                              ],
+                            Actions(
+                              actions: <Type, Action<Intent>>{
+                                DirectionalFocusIntent:
+                                    _SwallowDirectionalFocus(),
+                              },
+                              child: Row(
+                                crossAxisAlignment:
+                                    CrossAxisAlignment.stretch,
+                                children: [
+                                  _buildLeftPanel(),
+                                  _buildResizeDivider(),
+                                  _buildRightPanel(),
+                                ],
+                              ),
                             ),
                             _buildInventoryView(),
                             _buildReportsView(),
@@ -1604,8 +1724,40 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
             const SizedBox(width: 8),
           ],
-          // Print Barcodes (Inventory tab) or Printer (other tabs)
+          // Bulk Add + Print Barcodes (Inventory tab) or Printer (other tabs)
           if (_selectedTab == 2) ...[
+            GestureDetector(
+              onTap: _showBulkAddProductDialog,
+              child: Container(
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppColors.border),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.playlist_add_rounded,
+                      color: AppColors.primary,
+                      size: 17,
+                    ),
+                    const SizedBox(width: 7),
+                    Text(
+                      'Bulk Add',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.primary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
             GestureDetector(
               onTap: () {
                 _bulkPrintQtys = {
@@ -1844,7 +1996,11 @@ class _BillingScreenState extends State<BillingScreen> {
                           // Barcode scans are handled globally by _handleGlobalKey
                           // (works even when this box isn't focused); here we only
                           // drive the live product filter as the user types.
-                          setState(() => _searchQuery = v);
+                          setState(() {
+                            _searchQuery = v;
+                            // The grid renumbers under a new query.
+                            _gridCursor = null;
+                          });
                         },
                         onSubmitted: (v) {
                           // If a scan was just processed globally, its Enter/text
@@ -2005,6 +2161,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     radius: const Radius.circular(4),
                     thumbVisibility: false,
                     child: GridView.builder(
+                      key: _gridKey,
                       controller: controller,
                       padding: const EdgeInsets.only(right: 8),
                       gridDelegate:
@@ -2017,28 +2174,13 @@ class _BillingScreenState extends State<BillingScreen> {
                       itemCount: _displayGridItems.length,
                       itemBuilder: (_, i) {
                         final item = _displayGridItems[i];
+                        final lit = _gridCursor == i;
                         if (item is Product) {
                           return _ProductCard(
+                            key: lit ? _gridCursorKey : null,
+                            highlighted: lit,
                             product: item,
-                            onTap: () {
-                              final variants =
-                                  _variantsByProduct[item.id] ??
-                                  const <ProductVariant>[];
-                              if (variants.isEmpty) {
-                                // No variants → add straight to the cart.
-                                cart.addProduct(item);
-                              } else {
-                                // Has variants → slide the variant cards out
-                                // inline (tap again to collapse), same as the
-                                // chevron arrow.
-                                setState(() {
-                                  _expandedVariantProductId =
-                                      _expandedVariantProductId == item.id
-                                      ? null
-                                      : item.id;
-                                });
-                              }
-                            },
+                            onTap: () => _activateGridItem(item, cart),
                             currencySymbol: _currencySymbol,
                             variants: _variantsByProduct[item.id] ?? const [],
                             effectiveTaxRate: item.taxPercent > 0
@@ -2057,6 +2199,8 @@ class _BillingScreenState extends State<BillingScreen> {
                         }
                         final pair = item as (Product, ProductVariant);
                         return _VariantCard(
+                          key: lit ? _gridCursorKey : null,
+                          highlighted: lit,
                           product: pair.$1,
                           variant: pair.$2,
                           currencySymbol: _currencySymbol,
@@ -2591,11 +2735,14 @@ class _BillingScreenState extends State<BillingScreen> {
                             ),
                             const SizedBox(height: 14),
                             OutlinedButton.icon(
-                              onPressed: () => setState(() {
-                                _addingCustomProduct = true;
-                                _customNameCtrl.clear();
-                                _customPriceCtrl.clear();
-                              }),
+                              onPressed: () {
+                                setState(() {
+                                  _addingCustomProduct = true;
+                                  _customNameCtrl.clear();
+                                  _customPriceCtrl.clear();
+                                });
+                                _focusCustomName();
+                              },
                               icon: const Icon(Icons.add_rounded, size: 15),
                               label: Text(
                                 'Custom Product',
@@ -2653,15 +2800,113 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
+  // Columns the grid is currently showing — the same arithmetic Flutter's
+  // SliverGridDelegateWithMaxCrossAxisExtent does, against the grid's own
+  // measured width less its 8px right padding.
+  int get _gridColumns {
+    final box = _gridKey.currentContext?.findRenderObject() as RenderBox?;
+    final width = (box?.size.width ?? 0) - 8;
+    if (width <= 0) return 1;
+    final columns = (width / (220 + 20)).ceil();
+    return columns < 1 ? 1 : columns;
+  }
+
+  // Arrow keys walk the grid card by card. The first press just lights up
+  // the first card; after that left/right step one and up/down step a row.
+  bool _moveGridCursor(LogicalKeyboardKey key) {
+    final items = _displayGridItems;
+    if (items.isEmpty) return true;
+    final current = _gridCursor;
+    final int next;
+    if (current == null) {
+      next = 0;
+    } else if (key == LogicalKeyboardKey.arrowRight) {
+      next = current + 1;
+    } else if (key == LogicalKeyboardKey.arrowLeft) {
+      next = current - 1;
+    } else if (key == LogicalKeyboardKey.arrowDown) {
+      next = current + _gridColumns;
+    } else {
+      next = current - _gridColumns;
+    }
+    // At the edges, stay put rather than wrapping to the far side.
+    if (next < 0 || next >= items.length) return true;
+    setState(() => _gridCursor = next);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _gridCursorKey.currentContext;
+      if (ctx == null) return;
+      Scrollable.ensureVisible(
+        ctx,
+        alignment: 0.5,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+      );
+    });
+    return true;
+  }
+
+  // One path for picking a grid card, whether by mouse or by Enter on the
+  // arrow-key cursor, so the two behave identically.
+  void _activateGridItem(Object item, CartProvider cart) {
+    if (item is Product) {
+      final variants =
+          _variantsByProduct[item.id] ?? const <ProductVariant>[];
+      if (variants.isEmpty) {
+        // No variants → add straight to the cart.
+        cart.addProduct(item);
+      } else {
+        // Has variants → slide the variant cards out inline (pick again to
+        // collapse), same as the chevron arrow.
+        setState(() {
+          _expandedVariantProductId =
+              _expandedVariantProductId == item.id ? null : item.id;
+        });
+      }
+      return;
+    }
+    final pair = item as (Product, ProductVariant);
+    // Mirrors the variant card's own guard: nothing left, nothing added.
+    final inCart = cart.quantityInCartForVariant(pair.$1.id, pair.$2.id);
+    if (pair.$2.stock - inCart > 0) cart.addVariant(pair.$1, pair.$2);
+  }
+
+  // Ctrl+P: steps the payment method on by one — Cash, Card, UPI/QR,
+  // Hybrid, then back to Cash. PaymentMethod's declaration order is the
+  // order the buttons sit in on screen, so this walks them left to right.
+  void _cyclePaymentMethod() {
+    final cart = context.read<CartProvider>();
+    final methods = PaymentMethod.values;
+    final next = methods[(cart.paymentMethod.index + 1) % methods.length];
+    cart.setPaymentMethod(next);
+    if (next == PaymentMethod.hybrid) {
+      // Empty fields — cashier types one, the other follows.
+      _hybridCashCtrl.clear();
+      _hybridUpiCtrl.clear();
+    }
+  }
+
+  // Puts the cursor in the custom item's name field once the row is on
+  // screen. `autofocus` alone does not do it: the product search field
+  // normally holds focus, and Flutter skips autofocus when the scope
+  // already has a focused node.
+  void _focusCustomName() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _customNameFocus.requestFocus();
+    });
+  }
+
   Widget _addCustomProductBtn(CartProvider cart) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: OutlinedButton.icon(
-        onPressed: () => setState(() {
-          _addingCustomProduct = true;
-          _customNameCtrl.clear();
-          _customPriceCtrl.clear();
-        }),
+        onPressed: () {
+          setState(() {
+            _addingCustomProduct = true;
+            _customNameCtrl.clear();
+            _customPriceCtrl.clear();
+          });
+          _focusCustomName();
+        },
         icon: const Icon(Icons.add, size: 18, color: AppColors.primary),
         label: Text(
           'CUSTOM PRODUCT',
@@ -2746,6 +2991,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   children: [
                     TextField(
                       controller: _customNameCtrl,
+                      focusNode: _customNameFocus,
                       autofocus: true,
                       style: GoogleFonts.inter(
                         fontSize: 13,
@@ -3010,7 +3256,11 @@ class _BillingScreenState extends State<BillingScreen> {
                 ),
               ),
               const SizedBox(width: 10),
-              _DiscountToggle(cart: cart, currencySymbol: _currencySymbol),
+              _DiscountToggle(
+                key: _discountKey,
+                cart: cart,
+                currencySymbol: _currencySymbol,
+              ),
               const Spacer(),
               Text(
                 '-${_fmt(cart.discountAmount)}',
@@ -3023,36 +3273,18 @@ class _BillingScreenState extends State<BillingScreen> {
             ],
           ),
           const SizedBox(height: 10),
-          // Tax rows — one per distinct rate in the cart. Products carry their
-          // own rate; the store-wide rate covers products that don't set one.
+          // One tax row with an on/off switch, shown whether or not the cart
+          // has anything taxable yet. The rate itself lives in Settings.
           ...() {
-            final breakdown = cart.taxBreakdown;
-            if (breakdown.isEmpty) {
-              // Store doesn't use tax at all — drop the row from the bill
-              // entirely instead of showing a dead 0% line.
-              if ((double.tryParse(_taxRateDisplay) ?? 0) <= 0) {
-                return <Widget>[];
-              }
-              // Nothing taxable yet — keep the store rate visible and editable.
-              return [
-                _TaxSummaryRow(
-                  label: 'TAX ($_taxLabel $_taxRateDisplay%)',
-                  amount: 0,
-                  currencySymbol: _currencySymbol,
-                  rate: _taxRateDisplay,
-                  onRateChanged: _applyTaxRate,
-                ),
-              ];
+            // Store doesn't use tax at all — drop the row from the bill
+            // entirely instead of showing a dead line.
+            if ((double.tryParse(_taxRateDisplay) ?? 0) <= 0) {
+              return <Widget>[];
             }
-            final rates = breakdown.keys.toList()..sort();
             return [
-              for (int i = 0; i < rates.length; i++) ...[
-                if (i > 0) const SizedBox(height: 6),
-                _summaryRow(
-                  'TAX ($_taxLabel ${_formatRate(rates[i])}%)',
-                  breakdown[rates[i]]!,
-                ),
-              ],
+              _gstToggleRow(
+                cart.taxBreakdown.values.fold<double>(0, (s, v) => s + v),
+              ),
             ];
           }(),
           // Nearest-rupee adjustment between the exact figure and what the
@@ -3342,6 +3574,49 @@ class _BillingScreenState extends State<BillingScreen> {
             fontSize: 13,
             fontWeight: FontWeight.w700,
             color: AppColors.textDark,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Tax line for the bill: label, an on/off switch, and the amount. No
+  /// percentage and no rate box — the rate is a shop setting, this only
+  /// decides whether the running bill carries it.
+  Widget _gstToggleRow(double amount) {
+    return Row(
+      children: [
+        Text(
+          // Always the shop's configured rate, so the switch reads as "5% on
+          // or off" rather than flipping to 0% and hiding what it would apply.
+          'TAX ($_taxLabel $_taxRateDisplay%)',
+          style: GoogleFonts.inter(
+            fontSize: 10,
+            fontWeight: FontWeight.w500,
+            color: AppColors.textMuted,
+            letterSpacing: 1.5,
+          ),
+        ),
+        const SizedBox(width: 10),
+        SizedBox(
+          height: 20,
+          child: Transform.scale(
+            scale: 0.72,
+            child: Switch(
+              value: _gstEnabled,
+              onChanged: _setGstEnabled,
+              activeTrackColor: AppColors.primary,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ),
+        const Spacer(),
+        Text(
+          _fmt(_gstEnabled ? amount : 0),
+          style: GoogleFonts.inter(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: _gstEnabled ? AppColors.textDark : AppColors.textMuted,
           ),
         ),
       ],
@@ -3653,6 +3928,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       : () {
                           cart.clearCart();
                           _pendingInvoiceNumber = null;
+                          _resetGstToggle();
                         },
                   icon: const Icon(Icons.delete_sweep_outlined, size: 16),
                   label: Text(
@@ -11008,7 +11284,34 @@ class _BillingScreenState extends State<BillingScreen> {
     bool sendWhatsApp = _sendWhatsAppPref;
     String docType = 'Invoice';
     final phoneCtrl = TextEditingController(text: cart.customerPhone);
+    // Guards against a doubled Enter firing the print/send twice.
+    bool submitted = false;
 
+    void confirm(BuildContext ctx) {
+      if (submitted) return;
+      submitted = true;
+      final snapshot = _snapshotCart(cart);
+      // Remember the toggle states for next time.
+      _sendToPrinterPref = sendToPrinter;
+      _sendWhatsAppPref = sendWhatsApp;
+      LocalDbService.saveSettings({
+        'print_send_to_printer': sendToPrinter ? '1' : '0',
+        'print_send_whatsapp': sendWhatsApp ? '1' : '0',
+      });
+      Navigator.pop(ctx);
+      if (sendToPrinter) {
+        _printCurrentBill(cart, docType: docType, toPrinter: true);
+      }
+      if (sendWhatsApp) {
+        _sendInvoiceViaWhatsApp(
+          snapshot,
+          phoneCtrl.text.trim(),
+          docType: docType,
+        );
+      }
+    }
+
+    _dialogEnterAction = () => confirm(context);
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -11305,30 +11608,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     const SizedBox(width: 10),
                     Expanded(
                       child: ElevatedButton.icon(
-                        onPressed: () {
-                          final snapshot = _snapshotCart(cart);
-                          // Remember the toggle states for next time.
-                          _sendToPrinterPref = sendToPrinter;
-                          _sendWhatsAppPref = sendWhatsApp;
-                          LocalDbService.saveSettings({
-                            'print_send_to_printer': sendToPrinter ? '1' : '0',
-                            'print_send_whatsapp': sendWhatsApp ? '1' : '0',
-                          });
-                          Navigator.pop(ctx);
-                          if (sendToPrinter)
-                            _printCurrentBill(
-                              cart,
-                              docType: docType,
-                              toPrinter: true,
-                            );
-                          if (sendWhatsApp) {
-                            _sendInvoiceViaWhatsApp(
-                              snapshot,
-                              phoneCtrl.text.trim(),
-                              docType: docType,
-                            );
-                          }
-                        },
+                        onPressed: () => confirm(ctx),
                         icon: sendToPrinter
                             ? const Icon(Icons.print_rounded, size: 15)
                             : const SizedBox.shrink(),
@@ -11357,7 +11637,7 @@ class _BillingScreenState extends State<BillingScreen> {
           ),
         ),
       ),
-    );
+    ).whenComplete(() => _dialogEnterAction = null);
   }
 
   void _clearPrintingState() {
@@ -11502,6 +11782,8 @@ class _BillingScreenState extends State<BillingScreen> {
 
   void _closeBill(BuildContext context, CartProvider cart) {
     bool sendWaAfterClose = false;
+    // Guards against a doubled Enter checking the bill out twice.
+    bool submitted = false;
     final hasPhone = cart.customerPhone.isNotEmpty;
     final hasWa = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
     final paidCtrl = TextEditingController(text: cart.total.toStringAsFixed(2));
@@ -11524,6 +11806,65 @@ class _BillingScreenState extends State<BillingScreen> {
               ((cart.hybridCash + cart.hybridUpi) - total).abs() < 0.01;
           // A credit sale must name who owes the balance.
           final canConfirm = (!isCredit || hasCustomer) && hybridBalanced;
+
+          // Enter anywhere in the dialog confirms too, so a bill can be
+          // closed without reaching for the mouse.
+          Future<void> confirm() async {
+            if (submitted || !canConfirm) return;
+            submitted = true;
+            // Reuse the number already printed on this bill, if any, so
+            // the receipt and the saved sale share one invoice number.
+            final invNum =
+                _pendingInvoiceNumber ??
+                LocalDbService.generateInvoiceId();
+            _pendingInvoiceNumber = null;
+            final snapshot = _snapshotCart(
+              cart,
+              invoiceNumber: invNum,
+              balanceDue: balanceDue,
+            );
+            final phone = cart.customerPhone;
+            Navigator.pop(ctx);
+            try {
+              await cart.checkout(
+                invoiceNumber: invNum,
+                amountPaid: paid,
+              );
+              _resetGstToggle();
+            } catch (e) {
+              // The checkout is atomic, so nothing was saved: keep the
+              // cart and the number intact for a clean retry and tell the
+              // user, instead of leaving a dead-looking button.
+              _pendingInvoiceNumber = invNum;
+              // Guard on the State, not on `context`: that one belongs to
+              // the cart's Consumer, which is unmounted whenever the view
+              // swaps (opening Settings mid-checkout) — and dropping the
+              // reason is the exact silence this fix exists to remove.
+              if (!mounted) return;
+              _showToast('Could not save the bill: $e', isError: true);
+              return;
+            }
+            _customerNameCtrl.clear();
+            _customerPhoneCtrl.clear();
+            // Next bill starts back on Cash with a fresh split.
+            cart.setPaymentMethod(PaymentMethod.cash);
+            _hybridCashCtrl.clear();
+            _hybridUpiCtrl.clear();
+            _loadProducts();
+            _loadDashboardData();
+            if (!context.mounted) return;
+            _showToast('Payment successful!');
+            if (_autoPrint) {
+              await _printRecord(snapshot);
+            }
+            _autoSavePdf(snapshot);
+            if (sendWaAfterClose) {
+              _sendInvoiceViaWhatsApp(snapshot, phone);
+            }
+          }
+
+          _dialogEnterAction = confirm;
+
           return AlertDialog(
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
@@ -11579,6 +11920,7 @@ class _BillingScreenState extends State<BillingScreen> {
               TextField(
                 controller: paidCtrl,
                 onChanged: (_) => setLocal(() {}),
+                onSubmitted: (_) => confirm(),
                 keyboardType: const TextInputType.numberWithOptions(
                   decimal: true,
                 ),
@@ -11737,58 +12079,7 @@ class _BillingScreenState extends State<BillingScreen> {
               ),
             ),
             ElevatedButton(
-              onPressed: !canConfirm
-                  ? null
-                  : () async {
-                // Reuse the number already printed on this bill, if any, so
-                // the receipt and the saved sale share one invoice number.
-                final invNum =
-                    _pendingInvoiceNumber ??
-                    LocalDbService.generateInvoiceId();
-                _pendingInvoiceNumber = null;
-                final snapshot = _snapshotCart(
-                  cart,
-                  invoiceNumber: invNum,
-                  balanceDue: balanceDue,
-                );
-                final phone = cart.customerPhone;
-                Navigator.pop(ctx);
-                try {
-                  await cart.checkout(
-                    invoiceNumber: invNum,
-                    amountPaid: paid,
-                  );
-                } catch (e) {
-                  // The checkout is atomic, so nothing was saved: keep the
-                  // cart and the number intact for a clean retry and tell the
-                  // user, instead of leaving a dead-looking button.
-                  _pendingInvoiceNumber = invNum;
-                  // Guard on the State, not on `context`: that one belongs to
-                  // the cart's Consumer, which is unmounted whenever the view
-                  // swaps (opening Settings mid-checkout) — and dropping the
-                  // reason is the exact silence this fix exists to remove.
-                  if (!mounted) return;
-                  _showToast('Could not save the bill: $e', isError: true);
-                  return;
-                }
-                _customerNameCtrl.clear();
-                _customerPhoneCtrl.clear();
-                // Next bill starts back on Cash with a fresh split.
-                cart.setPaymentMethod(PaymentMethod.cash);
-                _hybridCashCtrl.clear();
-                _hybridUpiCtrl.clear();
-                _loadProducts();
-                _loadDashboardData();
-                if (!context.mounted) return;
-                _showToast('Payment successful!');
-                if (_autoPrint) {
-                  await _printRecord(snapshot);
-                }
-                _autoSavePdf(snapshot);
-                if (sendWaAfterClose) {
-                  _sendInvoiceViaWhatsApp(snapshot, phone);
-                }
-              },
+              onPressed: !canConfirm ? null : confirm,
               style: ElevatedButton.styleFrom(
                 backgroundColor: AppColors.success,
                 disabledBackgroundColor: AppColors.success.withValues(
@@ -11811,7 +12102,10 @@ class _BillingScreenState extends State<BillingScreen> {
           );
         },
       ),
-    ).whenComplete(() => _disposeAfterDialog(paidCtrl));
+    ).whenComplete(() {
+      _dialogEnterAction = null;
+      _disposeAfterDialog(paidCtrl);
+    });
   }
 
   /// Alt+X fast path: saves the bill as fully paid and, in the same action,
@@ -11834,6 +12128,7 @@ class _BillingScreenState extends State<BillingScreen> {
     final phone = cart.customerPhone;
     try {
       await cart.checkout(invoiceNumber: invNum, amountPaid: total);
+      _resetGstToggle();
     } catch (e) {
       _pendingInvoiceNumber = invNum;
       if (!mounted) return;
@@ -16147,9 +16442,7 @@ end tell
     final buyingPriceCtrl = TextEditingController(
       text: p.buyingPrice > 0 ? p.buyingPrice.toStringAsFixed(2) : '',
     );
-    final taxPercentCtrl = TextEditingController(
-      text: p.taxPercent > 0 ? p.taxPercent.toStringAsFixed(2) : '',
-    );
+    final hsnCtrl = TextEditingController(text: p.hsnCode);
     final stockCtrl = TextEditingController(text: '${p.stock}');
     final dealerCtrl = TextEditingController(text: p.dealerName);
     // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
@@ -16163,7 +16456,7 @@ end tell
     final priceFocus = FocusNode();
     final stockFocus = FocusNode();
     final buyingFocus = FocusNode();
-    final taxFocus = FocusNode();
+    final hsnFocus = FocusNode();
     final dateFocus = FocusNode();
     // Arrow keys move between fields (Up/Down always; Left/Right at caret edges).
     _wireArrowNav([
@@ -16173,7 +16466,7 @@ end tell
       (priceFocus, priceCtrl),
       (stockFocus, stockCtrl),
       (buyingFocus, buyingPriceCtrl),
-      (taxFocus, taxPercentCtrl),
+      (hsnFocus, hsnCtrl),
     ]);
     List<String> tags = p.description.isNotEmpty
         ? p.description
@@ -16265,7 +16558,10 @@ end tell
               buyingPrice: variants.isEmpty
                   ? double.tryParse(baseBuyingText) ?? 0.0
                   : variants.first.buyingPrice,
-              taxPercent: double.tryParse(taxPercentCtrl.text) ?? 0.0,
+              // 0 means "use the store-wide rate": CartProvider resolves it
+              // at checkout and freezes the rate onto the bill line.
+              taxPercent: 0.0,
+              hsnCode: hsnCtrl.text.trim(),
               category: category,
               emoji: emoji,
               sku: skuCtrl.text.trim().isEmpty ? p.sku : skuCtrl.text.trim(),
@@ -16890,7 +17186,7 @@ end tell
                                             textInputAction:
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
-                                                taxFocus.requestFocus(),
+                                                hsnFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -16915,31 +17211,28 @@ end tell
                                         crossAxisAlignment:
                                             CrossAxisAlignment.start,
                                         children: [
-                                          _dlgLabel('TAX (%)'),
+                                          _dlgLabel('HSN / SAC'),
                                           const SizedBox(height: 6),
                                           TextFormField(
-                                            controller: taxPercentCtrl,
-                                            focusNode: taxFocus,
+                                            controller: hsnCtrl,
+                                            focusNode: hsnFocus,
                                             textInputAction:
                                                 TextInputAction.done,
                                             onFieldSubmitted: (_) => saveEdit(),
-                                            keyboardType:
-                                                const TextInputType.numberWithOptions(
-                                                  decimal: true,
-                                                ),
+                                            keyboardType: TextInputType.number,
                                             inputFormatters: [
                                               FilteringTextInputFormatter.allow(
-                                                RegExp(r'^\d*\.?\d{0,2}'),
+                                                RegExp(r'^\d{0,8}'),
                                               ),
                                             ],
-                                            onChanged: (_) => setLocal(() {}),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
                                             ),
-                                            // Empty = fall back to the store-wide rate
+                                            // Blank is fine: the invoice keeps
+                                            // its em-dash until a code is set.
                                             decoration: _dlgInputDecor(
-                                              '$_taxRateDisplay (default)',
+                                              'e.g. 8517',
                                             ),
                                           ),
                                         ],
@@ -16950,7 +17243,7 @@ end tell
                                 const SizedBox(height: 18),
                                 _finalPriceCard(
                                   priceCtrl.text,
-                                  taxPercentCtrl.text,
+                                  _taxRateDisplay,
                                 ),
                                 const SizedBox(height: 18),
                                 _dlgLabel('TAGS'),
@@ -17222,10 +17515,7 @@ end tell
     final skuCtrl = TextEditingController();
     final priceCtrl = TextEditingController();
     final buyingPriceCtrl = TextEditingController();
-    // New products inherit the store-wide tax rate from Settings by default.
-    final taxPercentCtrl = TextEditingController(
-      text: (double.tryParse(_taxRateDisplay) ?? 0) > 0 ? _taxRateDisplay : '',
-    );
+    final hsnCtrl = TextEditingController();
     final stockCtrl = TextEditingController();
     final dealerCtrl = TextEditingController();
     // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
@@ -17239,7 +17529,7 @@ end tell
     final priceFocus = FocusNode();
     final stockFocus = FocusNode();
     final buyingFocus = FocusNode();
-    final taxFocus = FocusNode();
+    final hsnFocus = FocusNode();
     final dateFocus = FocusNode();
     // Arrow keys move between fields (Up/Down always; Left/Right at caret edges).
     _wireArrowNav([
@@ -17249,7 +17539,7 @@ end tell
       (priceFocus, priceCtrl),
       (stockFocus, stockCtrl),
       (buyingFocus, buyingPriceCtrl),
-      (taxFocus, taxPercentCtrl),
+      (hsnFocus, hsnCtrl),
     ]);
     List<String> tags = [];
     final tagInputCtrl = TextEditingController();
@@ -17373,7 +17663,10 @@ end tell
               name: nameCtrl.text.trim(),
               price: productPrice,
               buyingPrice: productBuying,
-              taxPercent: double.tryParse(taxPercentCtrl.text) ?? 0.0,
+              // 0 means "use the store-wide rate": CartProvider resolves it
+              // at checkout and freezes the rate onto the bill line.
+              taxPercent: 0.0,
+              hsnCode: hsnCtrl.text.trim(),
               category: category,
               emoji: emoji,
               sku: sku,
@@ -18064,7 +18357,7 @@ end tell
                                             textInputAction:
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
-                                                taxFocus.requestFocus(),
+                                                hsnFocus.requestFocus(),
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -18089,31 +18382,28 @@ end tell
                                         crossAxisAlignment:
                                             CrossAxisAlignment.start,
                                         children: [
-                                          _dlgLabel('TAX (%)'),
+                                          _dlgLabel('HSN / SAC'),
                                           const SizedBox(height: 6),
                                           TextFormField(
-                                            controller: taxPercentCtrl,
-                                            focusNode: taxFocus,
+                                            controller: hsnCtrl,
+                                            focusNode: hsnFocus,
                                             textInputAction:
                                                 TextInputAction.done,
                                             onFieldSubmitted: (_) => saveNew(),
-                                            keyboardType:
-                                                const TextInputType.numberWithOptions(
-                                                  decimal: true,
-                                                ),
+                                            keyboardType: TextInputType.number,
                                             inputFormatters: [
                                               FilteringTextInputFormatter.allow(
-                                                RegExp(r'^\d*\.?\d{0,2}'),
+                                                RegExp(r'^\d{0,8}'),
                                               ),
                                             ],
-                                            onChanged: (_) => setLocal(() {}),
                                             style: GoogleFonts.inter(
                                               fontSize: 13,
                                               color: AppColors.textDark,
                                             ),
-                                            // Empty = fall back to the store-wide rate
+                                            // Blank is fine: the invoice keeps
+                                            // its em-dash until a code is set.
                                             decoration: _dlgInputDecor(
-                                              '$_taxRateDisplay (default)',
+                                              'e.g. 8517',
                                             ),
                                           ),
                                         ],
@@ -18124,7 +18414,7 @@ end tell
                                 const SizedBox(height: 18),
                                 _finalPriceCard(
                                   priceCtrl.text,
-                                  taxPercentCtrl.text,
+                                  _taxRateDisplay,
                                 ),
                                 const SizedBox(height: 18),
                                 _dlgLabel('TAGS'),
@@ -18348,6 +18638,977 @@ end tell
                                 fontWeight: FontWeight.w600,
                               ),
                             ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  // ── Bulk Add Products Dialog ──────────────────────────────────────────────
+
+  /// SKU for one bulk row: unique against saved products *and* the other rows
+  /// being typed in the same dialog. Starts from [_generateUniqueSku] (which
+  /// only knows about saved products) then bumps the trailing number until it
+  /// clears the pending rows too.
+  String _uniqueBulkSku(String name, Set<String> pending) {
+    var sku = _generateUniqueSku(name);
+    if (!pending.contains(sku)) return sku;
+    final m = RegExp(r'^(.*?)(\d+)$').firstMatch(sku);
+    final prefix = m != null ? m.group(1)! : sku;
+    var n = m != null ? int.parse(m.group(2)!) : 1;
+    do {
+      n++;
+      sku = '$prefix${n.toString().padLeft(2, '0')}';
+    } while (pending.contains(sku) || _products.any((p) => p.sku == sku));
+    return sku;
+  }
+
+  /// Spreadsheet-style entry for adding several products in one pass. Each row
+  /// is one line of stock; rows that repeat a product name are saved as a
+  /// single product carrying those variants, each keeping its own price and
+  /// stock. Dealer and purchase date are typed once and stamped on every row.
+  /// Rows left completely blank are ignored, so trailing spares never block a
+  /// save.
+  void _showBulkAddProductDialog() {
+    final defaultCategory = _userCategories.isNotEmpty
+        ? _userCategories.first
+        : '';
+    final rows = <_BulkProductRow>[
+      for (var i = 0; i < 3; i++) _BulkProductRow(category: defaultCategory),
+    ];
+    final dealerCtrl = TextEditingController();
+    // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
+    // is needed when it resolves.
+    final List<Dealer> dealerOptions = [];
+    LocalDbService.getDealers().then(dealerOptions.addAll);
+    DateTime? purchaseDate = DateTime.now();
+    int filledCount = 0;
+    int productCount = 0;
+    bool saving = false;
+
+    // Column widths shared by the header strip and every row so the two stay
+    // aligned. Name / variant / SKU / category divide up whatever is left.
+    const wNum = 38.0;
+    const wHsn = 96.0;
+    const wPrice = 100.0;
+    const wStock = 78.0;
+    const wBuying = 100.0;
+    const wActions = 78.0;
+    const rowHeight = 46.0;
+
+    /// Rows are one product per *name*, so every row repeating a name is one
+    /// of its variants.
+    String groupKey(_BulkProductRow r) => r.nameCtrl.text.trim().toLowerCase();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          // Numeric labels are right-aligned so each sits over the digits it
+          // describes.
+          Widget colLabel(String text, {bool trailing = false}) => Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Align(
+              alignment: trailing
+                  ? Alignment.centerRight
+                  : Alignment.centerLeft,
+              child: Text(
+                text,
+                style: GoogleFonts.inter(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.textMuted,
+                  letterSpacing: 0.9,
+                ),
+              ),
+            ),
+          );
+
+          // Cells sit borderless inside the table and only the focused one
+          // draws a ring, so the grid stays quiet until you type in it.
+          Widget cellField(
+            TextEditingController ctrl,
+            String hint, {
+            bool numeric = false,
+            FocusNode? focusNode,
+            List<TextInputFormatter>? formatters,
+            ValueChanged<String>? onChanged,
+            TextAlign align = TextAlign.start,
+          }) => TextField(
+            controller: ctrl,
+            focusNode: focusNode,
+            onChanged: onChanged,
+            textAlign: align,
+            cursorColor: AppColors.primary,
+            inputFormatters: formatters,
+            keyboardType: numeric
+                ? const TextInputType.numberWithOptions(decimal: true)
+                : TextInputType.text,
+            style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+            decoration: InputDecoration(
+              hintText: hint,
+              hintStyle: GoogleFonts.inter(
+                color: AppColors.textMuted.withValues(alpha: 0.42),
+                fontSize: 12.5,
+              ),
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 11,
+              ),
+              border: InputBorder.none,
+              enabledBorder: InputBorder.none,
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(7),
+                borderSide: const BorderSide(
+                  color: AppColors.primary,
+                  width: 1.5,
+                ),
+              ),
+            ),
+          );
+
+          void recount() {
+            final entered = rows.where((r) => !r.isBlank).toList();
+            final names = entered
+                .map(groupKey)
+                .where((n) => n.isNotEmpty)
+                .toSet();
+            setLocal(() {
+              filledCount = entered.length;
+              productCount = names.length;
+            });
+          }
+
+          // Auto-SKU follows the product name, and every row of the same
+          // product shares one code because they are one product. A code typed
+          // by hand wins, and its whole group follows it.
+          void regenSkus() {
+            final assigned = <String, String>{};
+            final taken = <String>{};
+            for (final r in rows) {
+              if (r.skuAuto) continue;
+              final key = groupKey(r);
+              final s = r.skuCtrl.text.trim().toUpperCase();
+              if (key.isEmpty || s.isEmpty) continue;
+              assigned.putIfAbsent(key, () => s);
+              taken.add(s);
+            }
+            for (final r in rows) {
+              if (!r.skuAuto) continue;
+              final key = groupKey(r);
+              if (key.isEmpty) {
+                r.skuCtrl.text = '';
+                continue;
+              }
+              final existing = assigned[key];
+              if (existing != null) {
+                r.skuCtrl.text = existing;
+                continue;
+              }
+              final sku = _uniqueBulkSku(r.nameCtrl.text.trim(), taken);
+              assigned[key] = sku;
+              taken.add(sku);
+              r.skuCtrl.text = sku;
+            }
+          }
+
+          // Drops a sibling row directly under [i] carrying the same product
+          // identity, so it joins that product's group and only the variant's
+          // own name, price and stock are left to type.
+          void addVariantRow(int i) {
+            final src = rows[i];
+            final row = _BulkProductRow(category: src.category);
+            row.nameCtrl.text = src.nameCtrl.text;
+            row.hsnCtrl.text = src.hsnCtrl.text;
+            rows.insert(i + 1, row);
+            regenSkus();
+            recount();
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              row.variantFocus.requestFocus();
+            });
+          }
+
+          Future<void> saveAll() async {
+            if (saving) return;
+            for (final r in rows) {
+              r.error = null;
+            }
+            final entered = rows.where((r) => !r.isBlank).toList();
+            if (entered.isEmpty) {
+              _showToast('Enter at least one product', isError: true);
+              return;
+            }
+
+            String? firstProblem;
+            void fail(_BulkProductRow r, String msg) {
+              r.error = msg;
+              firstProblem ??= 'Row ${rows.indexOf(r) + 1}: $msg';
+            }
+
+            // Rows that repeat a product name are one product's variants, kept
+            // in the order they appear in the grid.
+            final groups = <String, List<_BulkProductRow>>{};
+            for (final r in entered) {
+              (groups[groupKey(r)] ??= []).add(r);
+            }
+
+            final seenSkus = <String>{};
+            final prepared = <Product>[];
+            final preparedVariants = <String, List<ProductVariant>>{};
+
+            for (final group in groups.values) {
+              final head = group.first;
+              final name = head.nameCtrl.text.trim();
+              if (name.isEmpty) {
+                for (final r in group) {
+                  fail(r, 'Name required');
+                }
+                continue;
+              }
+
+              var numbersOk = true;
+              for (final r in group) {
+                if (double.tryParse(r.priceCtrl.text.trim()) == null) {
+                  fail(r, 'Price required');
+                  numbersOk = false;
+                } else if (int.tryParse(r.stockCtrl.text.trim()) == null) {
+                  fail(r, 'Stock required');
+                  numbersOk = false;
+                }
+              }
+              if (!numbersOk) continue;
+
+              final labels = group
+                  .map((r) => r.variantCtrl.text.trim())
+                  .toList();
+              // Two rows of the same product are only meaningful when each
+              // says which variant it is.
+              if (group.length > 1) {
+                var missing = false;
+                for (var i = 0; i < group.length; i++) {
+                  if (labels[i].isEmpty) {
+                    fail(
+                      group[i],
+                      'Repeats a product name above — give this row a variant',
+                    );
+                    missing = true;
+                  }
+                }
+                if (missing) continue;
+              }
+              var dupes = false;
+              final seenLabels = <String>{};
+              for (var i = 0; i < group.length; i++) {
+                if (labels[i].isEmpty) continue;
+                if (!seenLabels.add(labels[i].toLowerCase())) {
+                  fail(group[i], 'Variant "${labels[i]}" is repeated');
+                  dupes = true;
+                }
+              }
+              if (dupes) continue;
+
+              var sku = head.skuCtrl.text.trim().toUpperCase();
+              if (sku.isEmpty) sku = _uniqueBulkSku(name, seenSkus);
+              if (_products.any((p) => p.sku == sku)) {
+                fail(head, 'SKU "$sku" already exists');
+                continue;
+              }
+              if (!seenSkus.add(sku)) {
+                fail(head, 'SKU "$sku" is used by another product');
+                continue;
+              }
+
+              final hasVariants = labels.any((l) => l.isNotEmpty);
+              final prices = group
+                  .map((r) => double.parse(r.priceCtrl.text.trim()))
+                  .toList();
+              final stocks = group
+                  .map((r) => int.parse(r.stockCtrl.text.trim()))
+                  .toList();
+              final productId = const Uuid().v4();
+              prepared.add(
+                Product(
+                  id: productId,
+                  name: name,
+                  // Same derivation the single Add Product dialog uses: with
+                  // variants the product has no base of its own, so its price
+                  // is the cheapest variant and its stock the sum of them.
+                  price: prices.reduce((a, b) => a < b ? a : b),
+                  buyingPrice:
+                      double.tryParse(head.buyingCtrl.text.trim()) ?? 0.0,
+                  // 0 means "use the store-wide rate": CartProvider resolves it
+                  // at checkout and freezes the rate onto the bill line.
+                  taxPercent: 0.0,
+                  hsnCode: head.hsnCtrl.text.trim(),
+                  category: head.category,
+                  emoji: '',
+                  sku: sku,
+                  stock: hasVariants
+                      ? stocks.reduce((a, b) => a + b)
+                      : stocks.first,
+                  dealerName: dealerCtrl.text.trim(),
+                  purchaseDate: purchaseDate != null
+                      ? _isoDate(purchaseDate!)
+                      : '',
+                ),
+              );
+              if (hasVariants) {
+                preparedVariants[productId] = [
+                  for (var i = 0; i < group.length; i++)
+                    ProductVariant(
+                      id: const Uuid().v4(),
+                      productId: productId,
+                      label: labels[i],
+                      price: prices[i],
+                      buyingPrice:
+                          double.tryParse(group[i].buyingCtrl.text.trim()) ??
+                          0.0,
+                      stock: stocks[i],
+                    ),
+                ];
+              }
+            }
+
+            if (firstProblem != null) {
+              setLocal(() {});
+              // Written from inside fail(), so it needs the explicit unwrap.
+              _showToast(firstProblem!, isError: true);
+              return;
+            }
+            setLocal(() => saving = true);
+            for (final p in prepared) {
+              await LocalDbService.insertProduct(p);
+              for (final v
+                  in preparedVariants[p.id] ?? const <ProductVariant>[]) {
+                await LocalDbService.insertVariant(v);
+              }
+            }
+            ConnectivityService.instance.syncNow();
+            if (!ctx.mounted) return;
+            setState(() {
+              _products.addAll(prepared);
+              for (final e in preparedVariants.entries) {
+                if (e.value.isNotEmpty) _variantsByProduct[e.key] = e.value;
+              }
+            });
+            Navigator.pop(ctx);
+            _showToast(
+              prepared.length == 1
+                  ? '${prepared.first.name} added to inventory'
+                  : '${prepared.length} products added to inventory',
+            );
+          }
+
+          Widget categoryCell(int i) => DropdownButtonFormField<String>(
+            value: rows[i].category.isEmpty ? null : rows[i].category,
+            isDense: true,
+            isExpanded: true,
+            iconSize: 18,
+            icon: const Icon(
+              Icons.keyboard_arrow_down_rounded,
+              color: AppColors.textMuted,
+            ),
+            style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+            dropdownColor: Colors.white,
+            items: [
+              ..._userCategories.map(
+                (c) => DropdownMenuItem(
+                  value: c,
+                  child: Text(
+                    c,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ),
+              ),
+              DropdownMenuItem(
+                value: '__add__',
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.add_rounded,
+                      size: 14,
+                      color: AppColors.accentBlue,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Add Category',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.accentBlue,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            onChanged: (v) async {
+              if (v == '__add__') {
+                final newCat = await _showAddCategoryDialog(ctx);
+                if (newCat == null || newCat.isEmpty) return;
+                if (!_userCategories.contains(newCat)) {
+                  await LocalDbService.saveCategory(newCat);
+                  ConnectivityService.instance.syncNow();
+                  setState(() => _userCategories.add(newCat));
+                }
+                setLocal(() => rows[i].category = newCat);
+              } else if (v != null) {
+                setLocal(() => rows[i].category = v);
+              }
+            },
+            decoration: InputDecoration(
+              hintText: 'Category',
+              hintStyle: GoogleFonts.inter(
+                color: AppColors.textMuted.withValues(alpha: 0.42),
+                fontSize: 12.5,
+              ),
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 8,
+              ),
+              border: InputBorder.none,
+              enabledBorder: InputBorder.none,
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(7),
+                borderSide: const BorderSide(
+                  color: AppColors.primary,
+                  width: 1.5,
+                ),
+              ),
+            ),
+          );
+
+          Widget dataRow(int i) {
+            final r = rows[i];
+            final bad = r.error != null;
+            final key = groupKey(r);
+            // Rows of the same product get an accent down their left edge, so
+            // a group reads as one product at a glance.
+            final grouped =
+                key.isNotEmpty &&
+                rows.where((o) => groupKey(o) == key).length > 1;
+            return Container(
+              decoration: BoxDecoration(
+                color: bad
+                    ? AppColors.error.withValues(alpha: 0.04)
+                    : Colors.white,
+                border: Border(
+                  bottom: const BorderSide(color: AppColors.border),
+                  left: BorderSide(
+                    color: grouped
+                        ? AppColors.primary.withValues(alpha: 0.45)
+                        : Colors.transparent,
+                    width: 2.5,
+                  ),
+                ),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    height: rowHeight,
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: wNum,
+                          child: Center(
+                            child: Text(
+                              '${i + 1}',
+                              style: GoogleFonts.inter(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: bad
+                                    ? AppColors.error
+                                    : AppColors.textMuted.withValues(
+                                        alpha: 0.65,
+                                      ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          flex: 3,
+                          child: cellField(
+                            r.nameCtrl,
+                            'e.g. Wireless Mouse',
+                            onChanged: (_) {
+                              regenSkus();
+                              recount();
+                            },
+                          ),
+                        ),
+                        Expanded(
+                          flex: 2,
+                          child: cellField(
+                            r.variantCtrl,
+                            'e.g. Large',
+                            focusNode: r.variantFocus,
+                            onChanged: (_) => recount(),
+                          ),
+                        ),
+                        Expanded(
+                          flex: 2,
+                          child: cellField(
+                            r.skuCtrl,
+                            'auto',
+                            onChanged: (_) {
+                              r.skuAuto = false;
+                              regenSkus();
+                              recount();
+                            },
+                          ),
+                        ),
+                        SizedBox(
+                          width: wHsn,
+                          child: cellField(
+                            r.hsnCtrl,
+                            'e.g. 8517',
+                            numeric: true,
+                            // Same rule as the single product dialogs: up to
+                            // 8 digits, and blank is allowed.
+                            formatters: [
+                              FilteringTextInputFormatter.allow(
+                                RegExp(r'^\d{0,8}'),
+                              ),
+                            ],
+                            onChanged: (_) => recount(),
+                          ),
+                        ),
+                        Expanded(flex: 2, child: categoryCell(i)),
+                        SizedBox(
+                          width: wPrice,
+                          child: cellField(
+                            r.priceCtrl,
+                            '0.00',
+                            numeric: true,
+                            align: TextAlign.end,
+                            onChanged: (_) => recount(),
+                          ),
+                        ),
+                        SizedBox(
+                          width: wStock,
+                          child: cellField(
+                            r.stockCtrl,
+                            '0',
+                            numeric: true,
+                            align: TextAlign.end,
+                            onChanged: (_) => recount(),
+                          ),
+                        ),
+                        SizedBox(
+                          width: wBuying,
+                          child: cellField(
+                            r.buyingCtrl,
+                            '0.00',
+                            numeric: true,
+                            align: TextAlign.end,
+                            onChanged: (_) => recount(),
+                          ),
+                        ),
+                        SizedBox(
+                          width: wActions,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              IconButton(
+                                tooltip: 'Add a variant of this product',
+                                // Meaningless until the product is named, and
+                                // the new row copies that name to join its
+                                // group.
+                                onPressed:
+                                    saving || r.nameCtrl.text.trim().isEmpty
+                                    ? null
+                                    : () => addVariantRow(i),
+                                icon: const Icon(Icons.add_rounded, size: 17),
+                                color: AppColors.accentBlue,
+                                style: IconButton.styleFrom(
+                                  minimumSize: const Size(28, 28),
+                                  padding: EdgeInsets.zero,
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: 'Remove row',
+                                onPressed: rows.length == 1 || saving
+                                    ? null
+                                    : () {
+                                        rows.removeAt(i);
+                                        regenSkus();
+                                        recount();
+                                      },
+                                icon: const Icon(Icons.close_rounded, size: 15),
+                                color: AppColors.textMuted,
+                                style: IconButton.styleFrom(
+                                  minimumSize: const Size(28, 28),
+                                  padding: EdgeInsets.zero,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (bad)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Padding(
+                        padding: const EdgeInsets.only(
+                          left: wNum + 12,
+                          bottom: 9,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(
+                              Icons.error_outline_rounded,
+                              size: 13,
+                              color: AppColors.error,
+                            ),
+                            const SizedBox(width: 5),
+                            Text(
+                              r.error!,
+                              style: GoogleFonts.inter(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w500,
+                                color: AppColors.error,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            );
+          }
+
+          final screenWidth = MediaQuery.of(ctx).size.width;
+          return Dialog(
+            backgroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(ctx).size.height * 0.85,
+              ),
+              child: SizedBox(
+                width: screenWidth * 0.94 < 1180 ? screenWidth * 0.94 : 1180,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Header
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(24, 18, 18, 18),
+                      decoration: const BoxDecoration(
+                        color: AppColors.surfaceVariant,
+                        borderRadius: BorderRadius.vertical(
+                          top: Radius.circular(16),
+                        ),
+                        border: Border(
+                          bottom: BorderSide(color: AppColors.border),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 34,
+                            height: 34,
+                            decoration: BoxDecoration(
+                              color: AppColors.primary,
+                              borderRadius: BorderRadius.circular(9),
+                            ),
+                            child: const Icon(
+                              Icons.playlist_add_rounded,
+                              color: Colors.white,
+                              size: 19,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                'Bulk Add Products',
+                                style: GoogleFonts.manrope(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.textDark,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                'One row per line of stock · repeat a product name to add its variants',
+                                style: GoogleFonts.inter(
+                                  fontSize: 12,
+                                  color: AppColors.textMuted,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const Spacer(),
+                          IconButton(
+                            onPressed: saving ? null : () => Navigator.pop(ctx),
+                            icon: const Icon(
+                              Icons.close_rounded,
+                              size: 18,
+                              color: AppColors.textMuted,
+                            ),
+                            style: IconButton.styleFrom(
+                              minimumSize: const Size(32, 32),
+                              padding: EdgeInsets.zero,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // Shared fields — stamped on every row on save
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(24, 16, 24, 16),
+                      decoration: const BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(color: AppColors.border),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Text(
+                            'APPLIES TO ALL ROWS',
+                            style: GoogleFonts.inter(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.textMuted,
+                              letterSpacing: 0.9,
+                            ),
+                          ),
+                          const SizedBox(width: 20),
+                          Expanded(
+                            flex: 3,
+                            child: _dealerDropdownField(
+                              ctrl: dealerCtrl,
+                              dealers: dealerOptions,
+                              setLocal: setLocal,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            flex: 2,
+                            child: _dlgDateField(
+                              ctx: ctx,
+                              value: purchaseDate,
+                              onChanged: (d) =>
+                                  setLocal(() => purchaseDate = d),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // The grid
+                    Flexible(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(24, 18, 24, 20),
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            border: Border.all(color: AppColors.border),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          clipBehavior: Clip.antiAlias,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                height: 36,
+                                decoration: const BoxDecoration(
+                                  color: AppColors.surfaceVariant,
+                                  border: Border(
+                                    bottom: BorderSide(color: AppColors.border),
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    // Matches the rows' 2.5px group accent.
+                                    const SizedBox(width: wNum + 2.5),
+                                    Expanded(
+                                      flex: 3,
+                                      child: colLabel('PRODUCT NAME'),
+                                    ),
+                                    Expanded(
+                                      flex: 2,
+                                      child: colLabel('VARIANT'),
+                                    ),
+                                    Expanded(flex: 2, child: colLabel('SKU')),
+                                    SizedBox(
+                                      width: wHsn,
+                                      child: colLabel('HSN'),
+                                    ),
+                                    Expanded(
+                                      flex: 2,
+                                      child: colLabel('CATEGORY'),
+                                    ),
+                                    SizedBox(
+                                      width: wPrice,
+                                      child: colLabel('PRICE', trailing: true),
+                                    ),
+                                    SizedBox(
+                                      width: wStock,
+                                      child: colLabel('STOCK', trailing: true),
+                                    ),
+                                    SizedBox(
+                                      width: wBuying,
+                                      child: colLabel('BUYING', trailing: true),
+                                    ),
+                                    const SizedBox(width: wActions),
+                                  ],
+                                ),
+                              ),
+                              Flexible(
+                                child: SingleChildScrollView(
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      for (var i = 0; i < rows.length; i++)
+                                        dataRow(i),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Padding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    10,
+                                    7,
+                                    10,
+                                    7,
+                                  ),
+                                  child: TextButton.icon(
+                                    onPressed: saving
+                                        ? null
+                                        : () => setLocal(
+                                            () => rows.add(
+                                              _BulkProductRow(
+                                                category: defaultCategory,
+                                              ),
+                                            ),
+                                          ),
+                                    icon: const Icon(
+                                      Icons.add_rounded,
+                                      size: 16,
+                                      color: AppColors.accentBlue,
+                                    ),
+                                    label: Text(
+                                      'Add Row',
+                                      style: GoogleFonts.inter(
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: AppColors.accentBlue,
+                                      ),
+                                    ),
+                                    style: TextButton.styleFrom(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 10,
+                                        vertical: 6,
+                                      ),
+                                      minimumSize: Size.zero,
+                                      tapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    // Actions
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 16,
+                      ),
+                      decoration: const BoxDecoration(
+                        border: Border(
+                          top: BorderSide(color: AppColors.border),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Text(
+                            filledCount == 0
+                                ? 'Fill in a row to continue'
+                                : '$filledCount of ${rows.length} rows ready · '
+                                      '$productCount product${productCount == 1 ? '' : 's'}',
+                            style: GoogleFonts.inter(
+                              fontSize: 12.5,
+                              color: AppColors.textMuted,
+                            ),
+                          ),
+                          const Spacer(),
+                          TextButton(
+                            onPressed: saving ? null : () => Navigator.pop(ctx),
+                            child: Text(
+                              'Cancel',
+                              style: GoogleFonts.inter(
+                                fontSize: 13,
+                                color: AppColors.textMuted,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          ElevatedButton(
+                            onPressed: saving || filledCount == 0
+                                ? null
+                                : saveAll,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.primary,
+                              foregroundColor: Colors.white,
+                              disabledBackgroundColor: AppColors.border,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 24,
+                                vertical: 12,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              elevation: 0,
+                            ),
+                            child: saving
+                                ? const SizedBox(
+                                    width: 15,
+                                    height: 15,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : Text(
+                                    productCount <= 1
+                                        ? 'Add Product'
+                                        : 'Add $productCount Products',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
                           ),
                         ],
                       ),
@@ -21082,48 +22343,81 @@ end tell
     await _loadGstPage();
   }
 
-  Widget _gstDownloadBtn(IconData icon, VoidCallback onTap) => GestureDetector(
-    onTap: onTap,
-    child: Container(
-      width: 36,
-      height: 36,
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: AppColors.border),
-      ),
-      child: Icon(icon, color: AppColors.textMuted, size: 18),
-    ),
-  );
-
-  Widget _gstRow(
-    String rate,
-    String taxable,
-    String cgst,
-    String sgst,
-    String tax, {
-    bool bold = false,
-    Color? color,
-  }) {
-    final style = GoogleFonts.inter(
-      fontSize: 12.5,
-      fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
-      color: color ?? AppColors.textDark,
-    );
-    Widget cell(String t, int flex, {bool right = true}) => Expanded(
-      flex: flex,
-      child: Text(t, textAlign: right ? TextAlign.right : TextAlign.left, style: style),
-    );
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 11),
-      child: Row(
-        children: [
-          cell(rate, 2, right: false),
-          cell(taxable, 3),
-          cell(cgst, 3),
-          cell(sgst, 3),
-          cell(tax, 3),
-        ],
+  /// Single entry point for getting the period out of the app. The three
+  /// destinations live in the menu rather than as separate buttons.
+  Widget _gstExportMenu() {
+    final items = <(String, IconData, String)>[
+      ('zip', Icons.folder_zip_outlined, 'ZIP — all bills'),
+      ('csv', Icons.table_chart_outlined, 'CSV report'),
+      ('pdf', Icons.picture_as_pdf_outlined, 'PDF report'),
+    ];
+    // Every bill in the period, not just the taxable ones the register lists.
+    final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
+    return PopupMenuButton<String>(
+      tooltip: '',
+      offset: const Offset(0, 44),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      color: Colors.white,
+      elevation: 4,
+      onSelected: (v) {
+        if (v == 'zip') _zipAllInvoices(_gstTaxableBills().$1, periodLabel);
+        if (v == 'csv') _exportGstCsv();
+        if (v == 'pdf') _saveGstPdf();
+      },
+      itemBuilder: (_) => items
+          .map(
+            (e) => PopupMenuItem<String>(
+              value: e.$1,
+              height: 40,
+              child: Row(
+                children: [
+                  Icon(e.$2, size: 16, color: AppColors.textMuted),
+                  const SizedBox(width: 10),
+                  Text(
+                    e.$3,
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          )
+          .toList(),
+      child: Container(
+        height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        decoration: BoxDecoration(
+          color: AppColors.primary,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.file_download_outlined,
+              color: Colors.white,
+              size: 16,
+            ),
+            const SizedBox(width: 8),
+            Text(
+              'Export $_taxLabel record',
+              style: GoogleFonts.inter(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(width: 2),
+            const Icon(
+              Icons.keyboard_arrow_down_rounded,
+              color: Colors.white,
+              size: 16,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -21378,9 +22672,29 @@ end tell
     );
   }
 
+  /// Bills in the loaded period that actually carry GST, plus a count of the
+  /// ones dropped. Everything on this page — cards, register, both exports and
+  /// the ZIP — works from this list, so a 0%/untaxed bill is never shown,
+  /// counted or exported.
+  (List<TransactionRecord>, int) _gstTaxableBills() {
+    final all = _gstTxList;
+    if (all == null) return (const <TransactionRecord>[], 0);
+    final taxable = <TransactionRecord>[];
+    var excluded = 0;
+    for (final t in all) {
+      if (_salesRowGst(t) != null) {
+        taxable.add(t);
+      } else {
+        excluded++;
+      }
+    }
+    return (taxable, excluded);
+  }
+
   Widget _buildGstView() {
     final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
-    final txns = _gstTxList;
+    final (taxableBills, excludedBills) = _gstTaxableBills();
+    final txns = _gstTxList == null ? null : taxableBills;
 
     return Expanded(
       child: Column(
@@ -21402,11 +22716,7 @@ end tell
               const SizedBox(width: 8),
               _gstCustomBtn(),
               const SizedBox(width: 14),
-              _printIconBtn(_printGstSummary),
-              const SizedBox(width: 8),
-              _gstDownloadBtn(Icons.picture_as_pdf_outlined, _saveGstPdf),
-              const SizedBox(width: 8),
-              _gstDownloadBtn(Icons.table_chart_outlined, _exportGstCsv),
+              _gstExportMenu(),
             ],
           ),
           const SizedBox(height: 20),
@@ -21468,7 +22778,9 @@ end tell
               ),
             )
           else
-            Expanded(child: _gstBody(_gstAggregate(txns), txns)),
+            Expanded(
+              child: _gstBody(_gstAggregate(txns), txns, excludedBills),
+            ),
         ],
       ),
     );
@@ -21485,6 +22797,7 @@ end tell
     })
     agg,
     List<TransactionRecord> txns,
+    int excludedBills,
   ) {
     final rates = agg.byRate.keys.toList()..sort();
     final computedTax =
@@ -21494,24 +22807,17 @@ end tell
         agg.byRate.values.fold<double>(0, (s, v) => s + v.$1) +
         agg.unallocatedTaxable;
     final delta = agg.recordedTax - computedTax;
-    final hasUnallocated =
-        agg.unallocatedTax.abs() >= 0.005 ||
-        agg.unallocatedTaxable.abs() >= 0.005;
 
     // With a slab selected the headline figures have to come from the split
     // rather than the stored per-bill columns, because one bill can carry
     // several rates. Unfiltered they stay on the stored columns, which are
     // exact.
     final filter = _gstRateFilter;
-    final shownRates = filter == null
-        ? rates
-        : rates.where((r) => r == filter).toList();
     final filtered = filter != null;
     final slab = filtered ? (agg.byRate[filter] ?? (0.0, 0.0)) : null;
     final headTaxable = filtered ? slab!.$1 : agg.recordedTaxable;
     final headTax = filtered ? slab!.$2 : agg.recordedTax;
     final excludedTaxable = computedTaxable - headTaxable;
-    final excludedTax = computedTax - headTax;
     final half = headTax / 2;
 
     return SingleChildScrollView(
@@ -21576,94 +22882,6 @@ end tell
             ],
           ),
           const SizedBox(height: 24),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: AppColors.border),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Text(
-                      'Rate-wise breakdown',
-                      style: GoogleFonts.manrope(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
-                        color: AppColors.textDark,
-                      ),
-                    ),
-                    const Spacer(),
-                    Text(
-                      '${agg.bills} bill${agg.bills == 1 ? '' : 's'}',
-                      style: GoogleFonts.inter(
-                        fontSize: 12,
-                        color: AppColors.textMuted,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                Row(
-                  children: [
-                    Expanded(flex: 2, child: _dashColHeader('RATE')),
-                    Expanded(
-                      flex: 3,
-                      child: _dashColHeader('TAXABLE VALUE', right: true),
-                    ),
-                    Expanded(flex: 3, child: _dashColHeader('CGST', right: true)),
-                    Expanded(flex: 3, child: _dashColHeader('SGST', right: true)),
-                    Expanded(
-                      flex: 3,
-                      child: _dashColHeader('TOTAL TAX', right: true),
-                    ),
-                  ],
-                ),
-                const Divider(height: 18, color: AppColors.border),
-                for (final r in shownRates)
-                  _gstRow(
-                    '${_formatRate(r)}%',
-                    _fmt(agg.byRate[r]!.$1),
-                    _fmt(agg.byRate[r]!.$2 / 2),
-                    _fmt(agg.byRate[r]!.$2 / 2),
-                    _fmt(agg.byRate[r]!.$2),
-                  ),
-                if (hasUnallocated && !filtered)
-                  _gstRow(
-                    'Unallocated',
-                    _fmt(agg.unallocatedTaxable),
-                    '—',
-                    '—',
-                    _fmt(agg.unallocatedTax),
-                    color: const Color(0xFFF59E0B),
-                  ),
-                if (filtered && excludedTaxable.abs() >= 0.005)
-                  _gstRow(
-                    'Not shown',
-                    _fmt(excludedTaxable),
-                    '—',
-                    '—',
-                    _fmt(excludedTax),
-                    color: AppColors.textMuted,
-                  ),
-                const Divider(height: 18, color: AppColors.border),
-                // Always every slab, filter or not — the filter narrows what
-                // you read, never what the period actually came to.
-                _gstRow(
-                  filtered ? 'Total (all rates)' : 'Total',
-                  _fmt(computedTaxable),
-                  _fmt(computedTax / 2),
-                  _fmt(computedTax / 2),
-                  _fmt(computedTax),
-                  bold: true,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
           _gstInvoiceTable(txns),
           const SizedBox(height: 16),
           if (filtered) ...[
@@ -21741,6 +22959,20 @@ end tell
               ),
             ),
           if (delta.abs() >= 0.5) const SizedBox(height: 12),
+          if (excludedBills > 0) ...[
+            Text(
+              '$excludedBills bill${excludedBills == 1 ? '' : 's'} in this '
+              'period carried no $_taxLabel and '
+              '${excludedBills == 1 ? 'is' : 'are'} not included above, in the '
+              'exports, or in the ZIP.',
+              style: GoogleFonts.inter(
+                fontSize: 11.5,
+                height: 1.5,
+                color: AppColors.textMuted,
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
           Text(
             'CGST and SGST are shown as an equal half of the tax, the same split '
             'your invoices print. Place of supply is not recorded, so inter-state '
@@ -21762,8 +22994,8 @@ end tell
   /// Builds the summary document once, so print and save-to-file
   /// produce byte-identical output. Null when there is nothing to report.
   Future<(pw.Document, String)?> _buildGstPdf() async {
-    final txns = _gstTxList;
-    if (txns == null || txns.isEmpty) {
+    final (txns, _) = _gstTaxableBills();
+    if (txns.isEmpty) {
       _showToast('No bills in this period', isError: true);
       return null;
     }
@@ -21893,16 +23125,6 @@ end tell
     return (doc, periodLabel);
   }
 
-  Future<void> _printGstSummary() async {
-    final built = await _buildGstPdf();
-    if (built == null) return;
-    final (doc, periodLabel) = built;
-    await Printing.layoutPdf(
-      onLayout: (_) => doc.save(),
-      name: '$_taxLabel $periodLabel',
-    );
-  }
-
   /// Writes the same document straight to a file the user picks, so a summary
   /// can be filed or emailed without going through the print dialog.
   Future<void> _saveGstPdf() async {
@@ -21933,8 +23155,8 @@ end tell
       : v;
 
   Future<void> _exportGstCsv() async {
-    final txns = _gstTxList;
-    if (txns == null || txns.isEmpty) {
+    final (txns, excludedBills) = _gstTaxableBills();
+    if (txns.isEmpty) {
       _showToast('No bills in this period', isError: true);
       return;
     }
@@ -22002,14 +23224,17 @@ end tell
         '${n(r.taxable)},${n(r.tax / 2)},${n(r.tax / 2)},${n(r.tax)}',
       );
     }
-    if (reg.excluded > 0) {
+    // reg.excluded is 0 by construction now — the untaxed bills were dropped
+    // before the aggregate was built — so report the count from the source
+    // filter instead, and keep it to a single line rather than listing them.
+    if (excludedBills > 0) {
       b.writeln();
       b.writeln(
         _csvCell(
-          '${reg.excluded} invoice(s) totalling ${n(reg.excludedTaxable)} are '
-          'not listed: no line carried a rate above 0%, so they are not '
-          'taxable supplies. Exempt or nil-rated sales among them still '
-          'belong in GSTR-3B 3.1(c).',
+          '$excludedBills bill(s) in this period carried no $_taxLabel and are '
+          'excluded from every figure above. They are not taxable supplies, '
+          'but exempt or nil-rated sales among them still belong in '
+          'GSTR-3B 3.1(c).',
         ),
       );
     }
@@ -25640,6 +26865,16 @@ class _MediumInitialsBox extends StatelessWidget {
   }
 }
 
+/// Eats arrow-key focus traversal on the billing tab. A single-line
+/// TextField hands its up/down arrows back to the framework, which then
+/// jumps focus to the next field — from the product search box straight
+/// into Customer Name and Phone Number. Here the arrows belong to the
+/// product grid, so this stops that fallthrough dead.
+class _SwallowDirectionalFocus extends Action<DirectionalFocusIntent> {
+  @override
+  void invoke(DirectionalFocusIntent intent) {}
+}
+
 class _ProductCard extends StatefulWidget {
   final Product product;
   final VoidCallback onTap;
@@ -25651,7 +26886,12 @@ class _ProductCard extends StatefulWidget {
   /// Rate actually charged for this product — its own, or the store default.
   final double effectiveTaxRate;
   final String taxLabel;
+
+  /// Lit by the arrow-key cursor, drawn exactly like a mouse hover.
+  final bool highlighted;
   const _ProductCard({
+    super.key,
+    this.highlighted = false,
     required this.product,
     required this.onTap,
     required this.currencySymbol,
@@ -25667,6 +26907,7 @@ class _ProductCard extends StatefulWidget {
 
 class _ProductCardState extends State<_ProductCard> {
   bool _hovered = false;
+  bool get _active => _hovered || widget.highlighted;
 
   @override
   Widget build(BuildContext context) {
@@ -25684,9 +26925,9 @@ class _ProductCardState extends State<_ProductCard> {
             color: Colors.white,
             borderRadius: BorderRadius.circular(16),
             border: Border.all(
-              color: _hovered ? AppColors.accentBlue : AppColors.border,
+              color: _active ? AppColors.accentBlue : AppColors.border,
             ),
-            boxShadow: _hovered
+            boxShadow: _active
                 ? [
                     BoxShadow(
                       color: AppColors.primary.withValues(alpha: 0.12),
@@ -25787,7 +27028,7 @@ class _ProductCardState extends State<_ProductCard> {
                               right: 10,
                               child: AnimatedOpacity(
                                 duration: const Duration(milliseconds: 200),
-                                opacity: _hovered ? 1.0 : 0.0,
+                                opacity: _active ? 1.0 : 0.0,
                                 child: Container(
                                   width: 36,
                                   height: 36,
@@ -26014,7 +27255,11 @@ class _VariantCard extends StatefulWidget {
   final VoidCallback? onCollapse;
   final double effectiveTaxRate;
   final String taxLabel;
+  /// Lit by the arrow-key cursor, drawn exactly like a mouse hover.
+  final bool highlighted;
   const _VariantCard({
+    super.key,
+    this.highlighted = false,
     required this.product,
     required this.variant,
     required this.currencySymbol,
@@ -26028,6 +27273,7 @@ class _VariantCard extends StatefulWidget {
 
 class _VariantCardState extends State<_VariantCard> {
   bool _hovered = false;
+  bool get _active => _hovered || widget.highlighted;
 
   @override
   Widget build(BuildContext context) {
@@ -26068,9 +27314,9 @@ class _VariantCardState extends State<_VariantCard> {
               color: Colors.white,
               borderRadius: BorderRadius.circular(16),
               border: Border.all(
-                color: _hovered ? AppColors.accentBlue : AppColors.border,
+                color: _active ? AppColors.accentBlue : AppColors.border,
               ),
-              boxShadow: _hovered
+              boxShadow: _active
                   ? [
                       BoxShadow(
                         color: AppColors.primary.withValues(alpha: 0.12),
@@ -26170,7 +27416,7 @@ class _VariantCardState extends State<_VariantCard> {
                         right: 10,
                         child: AnimatedOpacity(
                           duration: const Duration(milliseconds: 200),
-                          opacity: _hovered ? 1.0 : 0.0,
+                          opacity: _active ? 1.0 : 0.0,
                           child: Container(
                             width: 36,
                             height: 36,
@@ -26747,15 +27993,41 @@ class _TaxSummaryRowState extends State<_TaxSummaryRow> {
 class _DiscountToggle extends StatefulWidget {
   final CartProvider cart;
   final String currencySymbol;
-  const _DiscountToggle({required this.cart, required this.currencySymbol});
+  const _DiscountToggle({
+    super.key,
+    required this.cart,
+    required this.currencySymbol,
+  });
   @override
   State<_DiscountToggle> createState() => _DiscountToggleState();
 }
 
 class _DiscountToggleState extends State<_DiscountToggle> {
   final _ctrl = TextEditingController();
+  final _focus = FocusNode();
   DiscountType _type = DiscountType.percent;
   bool _showInput = false;
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
+  /// Ctrl+D: opens the input with the cursor in it and any current value
+  /// selected, so the cashier can type straight over it. `autofocus` alone
+  /// is not enough — the product search field already holds focus.
+  void openInput() {
+    setState(() => _showInput = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _focus.requestFocus();
+      _ctrl.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: _ctrl.text.length,
+      );
+    });
+  }
 
   void _onTypeBtn(DiscountType type) {
     setState(() {
@@ -26810,6 +28082,7 @@ class _DiscountToggleState extends State<_DiscountToggle> {
                       height: 28,
                       child: TextField(
                         controller: _ctrl,
+                        focusNode: _focus,
                         autofocus: true,
                         keyboardType: TextInputType.number,
                         inputFormatters: [
@@ -27484,6 +28757,44 @@ class _ExchangeAdd {
   double get price => variant?.price ?? product.price;
 
   int get stock => variant?.stock ?? product.stock;
+}
+
+/// One in-progress line of the Bulk Add Products grid. Each row owns its
+/// controllers so it keeps whatever was typed while other rows are added or
+/// removed around it. Rows sharing a product name are saved as one product,
+/// with [variantCtrl] naming which variant each row is.
+class _BulkProductRow {
+  _BulkProductRow({required this.category});
+
+  final nameCtrl = TextEditingController();
+  final variantCtrl = TextEditingController();
+
+  /// Focused right after the "add a variant" button spawns this row, so the
+  /// only field still to fill is already waiting for typing.
+  final variantFocus = FocusNode();
+  final skuCtrl = TextEditingController();
+  final hsnCtrl = TextEditingController();
+  final priceCtrl = TextEditingController();
+  final stockCtrl = TextEditingController();
+  final buyingCtrl = TextEditingController();
+  String category;
+
+  /// False once the SKU cell is edited by hand, so typing a name stops
+  /// overwriting it.
+  bool skuAuto = true;
+
+  /// Why this row failed the last save attempt, shown beneath it.
+  String? error;
+
+  /// A spare row nobody has typed into. SKU is excluded because it is filled
+  /// in automatically from the name.
+  bool get isBlank =>
+      nameCtrl.text.trim().isEmpty &&
+      variantCtrl.text.trim().isEmpty &&
+      hsnCtrl.text.trim().isEmpty &&
+      priceCtrl.text.trim().isEmpty &&
+      stockCtrl.text.trim().isEmpty &&
+      buyingCtrl.text.trim().isEmpty;
 }
 
 /// Calendar picker for the Sales "Custom" period. From one calendar you can
