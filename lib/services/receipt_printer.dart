@@ -111,6 +111,7 @@ class ReceiptPrinter {
     String storePhone = '',
     String storeEmail = '',
     String storeGstin = '',
+    String storeState = '',
     required String receiptFooter,
     required String taxLabel,
     required String taxRate,
@@ -127,13 +128,14 @@ class ReceiptPrinter {
     final _sharedArgs = (
       storeName: storeName, storeAddress: storeAddress,
       storePhone: storePhone, storeEmail: storeEmail, storeGstin: storeGstin,
+      storeState: storeState,
       receiptFooter: receiptFooter, taxLabel: taxLabel, taxRate: taxRate,
       currencySymbol: currencySymbol, storeTerms: storeTerms, logoPath: logoPath,
     );
 
     switch (layout) {
       case 'Classic':
-        return _buildClassicInvoicePdf(tx, storeName: _sharedArgs.storeName, storeAddress: _sharedArgs.storeAddress, storePhone: _sharedArgs.storePhone, storeEmail: _sharedArgs.storeEmail, storeGstin: _sharedArgs.storeGstin, receiptFooter: _sharedArgs.receiptFooter, taxLabel: _sharedArgs.taxLabel, taxRate: _sharedArgs.taxRate, currencySymbol: _sharedArgs.currencySymbol, storeTerms: _sharedArgs.storeTerms, logoPath: _sharedArgs.logoPath);
+        return _buildClassicInvoicePdf(tx, storeName: _sharedArgs.storeName, storeAddress: _sharedArgs.storeAddress, storePhone: _sharedArgs.storePhone, storeEmail: _sharedArgs.storeEmail, storeGstin: _sharedArgs.storeGstin, storeState: _sharedArgs.storeState, receiptFooter: _sharedArgs.receiptFooter, taxLabel: _sharedArgs.taxLabel, taxRate: _sharedArgs.taxRate, currencySymbol: _sharedArgs.currencySymbol, storeTerms: _sharedArgs.storeTerms, logoPath: _sharedArgs.logoPath);
       case 'Modern':
         return _buildModern4Pdf(tx, storeName: _sharedArgs.storeName, storeAddress: _sharedArgs.storeAddress, storePhone: _sharedArgs.storePhone, storeEmail: _sharedArgs.storeEmail, storeGstin: _sharedArgs.storeGstin, receiptFooter: _sharedArgs.receiptFooter, taxLabel: _sharedArgs.taxLabel, taxRate: _sharedArgs.taxRate, currencySymbol: _sharedArgs.currencySymbol, storeTerms: _sharedArgs.storeTerms, logoPath: _sharedArgs.logoPath);
       case 'GST':
@@ -838,6 +840,7 @@ class ReceiptPrinter {
     String storePhone = '',
     String storeEmail = '',
     String storeGstin = '',
+    String storeState = '',
     required String receiptFooter,
     required String taxLabel,
     required String taxRate,
@@ -904,7 +907,6 @@ class ReceiptPrinter {
     final itemRows = tx.items.asMap().entries.map((e) {
       final itemTotal = e.value.price * e.value.quantity;
       final disc = itemTotal * (0.0 / 100);
-      final gstAmt = itemTotal * taxRateVal / (100 + taxRateVal);
       return pw.TableRow(children: [
         pd(tx_('${e.key + 1}', a: pw.TextAlign.center, s: fs - 1)),
         pd(tx_(e.value.displayName, f: b, s: fs - 1)),
@@ -912,7 +914,6 @@ class ReceiptPrinter {
         pd(tx_('${e.value.quantity}', a: pw.TextAlign.center, s: fs - 1)),
         pd(tx_(e.value.price.toStringAsFixed(2), a: pw.TextAlign.right, s: fs - 1)),
         pd(tx_('${disc.toStringAsFixed(2)} (0%)', a: pw.TextAlign.right, s: fs - 2)),
-        pd(tx_('${gstAmt.toStringAsFixed(2)} ($taxRate%)', a: pw.TextAlign.right, s: fs - 2)),
         pd(tx_(e.value.total.toStringAsFixed(2), f: b, a: pw.TextAlign.right, s: fs - 1)),
       ]);
     }).toList();
@@ -974,6 +975,10 @@ class ReceiptPrinter {
                     if (storeGstin.isNotEmpty) ...[
                       pw.SizedBox(height: 2),
                       tx_('GSTIN: $storeGstin', f: b, s: fs - 1),
+                    ],
+                    if (storeState.isNotEmpty) ...[
+                      pw.SizedBox(height: 2),
+                      tx_('State: $storeState', f: b, s: fs - 1),
                     ],
                   ])),
                 ]),
@@ -1038,8 +1043,7 @@ class ReceiptPrinter {
               3: pw.FixedColumnWidth(34),
               4: pw.FixedColumnWidth(50),
               5: pw.FixedColumnWidth(58),
-              6: pw.FixedColumnWidth(54),
-              7: pw.FixedColumnWidth(48),
+              6: pw.FixedColumnWidth(48),
             },
             children: [
               pw.TableRow(
@@ -1049,7 +1053,7 @@ class ReceiptPrinter {
                     ('#', pw.TextAlign.center), ('Item name', pw.TextAlign.left),
                     ('HSC/SAC', pw.TextAlign.center), ('Quantity', pw.TextAlign.center),
                     ('Price/unit', pw.TextAlign.right), ('Discount', pw.TextAlign.right),
-                    ('GST', pw.TextAlign.right), ('Amount', pw.TextAlign.right),
+                    ('Amount', pw.TextAlign.right),
                   ])
                     pw.Padding(
                       padding: const pw.EdgeInsets.symmetric(horizontal: 4, vertical: 5),
@@ -1068,8 +1072,6 @@ class ReceiptPrinter {
                   pd(tx_('$totalQty', f: b, a: pw.TextAlign.center, s: fs - 1)),
                   pw.SizedBox(),
                   pd(tx_(tx.discountAmount.toStringAsFixed(2),
-                      f: b, a: pw.TextAlign.right, s: fs - 1)),
-                  pd(tx_(tx.taxAmount.toStringAsFixed(2),
                       f: b, a: pw.TextAlign.right, s: fs - 1)),
                   pd(tx_(tx.total.toStringAsFixed(2),
                       f: b, a: pw.TextAlign.right, s: fs - 1)),

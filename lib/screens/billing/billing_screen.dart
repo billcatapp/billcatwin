@@ -295,6 +295,10 @@ class _BillingScreenState extends State<BillingScreen> {
   String _storePhone = '';
   String _storeEmail = '';
   String _storeGstin = '';
+
+  /// Shop's state. Half of "place of supply" — with the buyer's state it is
+  /// what decides CGST+SGST vs IGST. Stored, not yet used in any calculation.
+  String _storeState = '';
   String _logoPath = '';
   String _logoUrl = '';
   String _receiptFooter = 'Thank you for your purchase!';
@@ -373,8 +377,12 @@ class _BillingScreenState extends State<BillingScreen> {
   // of the card lit up as if the mouse were hovering it, null when the
   // keyboard isn't driving. Enter picks it, Esc lets go.
   int? _gridCursor;
+  // Same cursor, parked on the category chips above the grid instead.
+  // Only ever one of the two is set.
+  int? _categoryCursor;
   final _gridKey = GlobalKey();
   final _gridCursorKey = GlobalKey();
+  final _categoryCursorKey = GlobalKey();
   // Lets Ctrl+D open the discount input, which owns its own state.
   final _discountKey = GlobalKey<_DiscountToggleState>();
   final _customPriceFocus = FocusNode();
@@ -397,6 +405,7 @@ class _BillingScreenState extends State<BillingScreen> {
   String _editStorePhone = '';
   String _editStoreEmail = '';
   String _editStoreGstin = '';
+  String _editStoreState = '';
   String _editInvoiceLayout = 'Classic';
   String _editPrintOrientation = 'Portrait';
   String _editPrinterTab = 'Regular';
@@ -422,6 +431,13 @@ class _BillingScreenState extends State<BillingScreen> {
       return matchCat && matchSearch;
     }).toList();
   }
+
+  // Category chips above the grid: All, plus every user category that still
+  // has a product in it.
+  List<String> get _displayCategories => [
+    'All',
+    ..._userCategories.where((c) => _products.any((p) => p.category == c)),
+  ];
 
   // Grid entries: normally all products; while a product's variants are
   // expanded, the grid shows only that product followed by its variant cards.
@@ -510,6 +526,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _storePhone = s['store_phone'] ?? _storePhone;
       _storeEmail = s['store_email'] ?? _storeEmail;
       _storeGstin = s['store_gstin'] ?? _storeGstin;
+      _storeState = s['store_state'] ?? _storeState;
       _receiptFooter = s['receipt_footer'] ?? _receiptFooter;
       _taxLabel = s['tax_label'] ?? _taxLabel;
       _taxRateDisplay = s['tax_rate'] ?? _taxRateDisplay;
@@ -796,8 +813,11 @@ class _BillingScreenState extends State<BillingScreen> {
                   null);
       if (!inOtherField) {
         if (key == LogicalKeyboardKey.escape) {
-          if (_gridCursor == null) return false;
-          setState(() => _gridCursor = null);
+          if (_gridCursor == null && _categoryCursor == null) return false;
+          setState(() {
+            _gridCursor = null;
+            _categoryCursor = null;
+          });
           return true;
         }
         // Left/right belong to the search caret until the grid cursor is
@@ -807,8 +827,11 @@ class _BillingScreenState extends State<BillingScreen> {
             key == LogicalKeyboardKey.arrowRight;
         if (!(horizontal &&
             _gridCursor == null &&
+            _categoryCursor == null &&
             _searchController.text.isNotEmpty)) {
-          return _moveGridCursor(key);
+          return _categoryCursor != null
+              ? _moveCategoryCursor(key)
+              : _moveGridCursor(key);
         }
       }
     }
@@ -847,7 +870,19 @@ class _BillingScreenState extends State<BillingScreen> {
         _addScannedCodeToCart(code);
         return true; // consume the scanner's Enter so fields don't also submit
       }
-      // Not a scan: if the arrow keys have a card lit up, Enter picks it.
+      // Not a scan: Enter picks whatever the arrow keys have lit up.
+      final catCursor = _categoryCursor;
+      if (catCursor != null) {
+        final categories = _displayCategories;
+        if (catCursor < categories.length) {
+          setState(() {
+            _selectedCategory = categories[catCursor];
+            // The grid renumbers under the new filter.
+            _gridCursor = null;
+          });
+        }
+        return true;
+      }
       final cursor = _gridCursor;
       final items = _displayGridItems;
       if (cursor != null && cursor < items.length) {
@@ -2130,23 +2165,20 @@ class _BillingScreenState extends State<BillingScreen> {
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
-                children:
-                    [
-                      'All',
-                      ..._userCategories.where(
-                        (c) => _products.any((p) => p.category == c),
-                      ),
-                    ].map((cat) {
-                      final selected = _selectedCategory == cat;
-                      return Padding(
-                        padding: const EdgeInsets.only(right: 10),
-                        child: _CategoryChip(
-                          label: cat,
-                          selected: selected,
-                          onTap: () => setState(() => _selectedCategory = cat),
-                        ),
-                      );
-                    }).toList(),
+                children: _displayCategories.indexed.map((entry) {
+                  final (i, cat) = entry;
+                  final lit = _categoryCursor == i;
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 10),
+                    child: _CategoryChip(
+                      key: lit ? _categoryCursorKey : null,
+                      highlighted: lit,
+                      label: cat,
+                      selected: _selectedCategory == cat,
+                      onTap: () => setState(() => _selectedCategory = cat),
+                    ),
+                  );
+                }).toList(),
               ),
             ),
             const SizedBox(height: 20),
@@ -2189,12 +2221,7 @@ class _BillingScreenState extends State<BillingScreen> {
                             taxLabel: _taxLabel,
                             variantsExpanded:
                                 _expandedVariantProductId == item.id,
-                            onVariantArrowTap: () => setState(() {
-                              _expandedVariantProductId =
-                                  _expandedVariantProductId == item.id
-                                  ? null
-                                  : item.id;
-                            }),
+                            onVariantArrowTap: () => _toggleVariants(item),
                           );
                         }
                         final pair = item as (Product, ProductVariant);
@@ -2811,12 +2838,72 @@ class _BillingScreenState extends State<BillingScreen> {
     return columns < 1 ? 1 : columns;
   }
 
+  // Brings whichever card or chip the cursor just landed on into view.
+  void _revealCursor(GlobalKey key) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = key.currentContext;
+      if (ctx == null) return;
+      Scrollable.ensureVisible(
+        ctx,
+        alignment: 0.5,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  // Arrow keys along the category chips. Down drops back into the grid;
+  // there is nothing above the row, so up stays put.
+  bool _moveCategoryCursor(LogicalKeyboardKey key) {
+    final categories = _displayCategories;
+    if (categories.isEmpty) {
+      setState(() => _categoryCursor = null);
+      return true;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) return true;
+    if (key == LogicalKeyboardKey.arrowDown) {
+      setState(() {
+        _categoryCursor = null;
+        _gridCursor = _displayGridItems.isEmpty ? null : 0;
+      });
+      _revealCursor(_gridCursorKey);
+      return true;
+    }
+    final current = _categoryCursor!.clamp(0, categories.length - 1);
+    final next = key == LogicalKeyboardKey.arrowRight
+        ? current + 1
+        : current - 1;
+    if (next < 0 || next >= categories.length) return true;
+    setState(() => _categoryCursor = next);
+    _revealCursor(_categoryCursorKey);
+    return true;
+  }
+
   // Arrow keys walk the grid card by card. The first press just lights up
   // the first card; after that left/right step one and up/down step a row.
   bool _moveGridCursor(LogicalKeyboardKey key) {
     final items = _displayGridItems;
     if (items.isEmpty) return true;
-    final current = _gridCursor;
+    // The grid renumbers under a filter change or a variant expansion, so
+    // a cursor left pointing off the end starts over instead of sticking.
+    final stale = _gridCursor != null && _gridCursor! >= items.length;
+    final current = stale ? null : _gridCursor;
+    // Up from the top row hands the cursor to the category chips, landing
+    // on whichever category is currently filtering the grid.
+    if (key == LogicalKeyboardKey.arrowUp &&
+        current != null &&
+        current < _gridColumns) {
+      final categories = _displayCategories;
+      if (categories.isNotEmpty) {
+        final i = categories.indexOf(_selectedCategory);
+        setState(() {
+          _gridCursor = null;
+          _categoryCursor = i < 0 ? 0 : i;
+        });
+        _revealCursor(_categoryCursorKey);
+        return true;
+      }
+    }
     final int next;
     if (current == null) {
       next = 0;
@@ -2832,17 +2919,25 @@ class _BillingScreenState extends State<BillingScreen> {
     // At the edges, stay put rather than wrapping to the far side.
     if (next < 0 || next >= items.length) return true;
     setState(() => _gridCursor = next);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final ctx = _gridCursorKey.currentContext;
-      if (ctx == null) return;
-      Scrollable.ensureVisible(
-        ctx,
-        alignment: 0.5,
-        duration: const Duration(milliseconds: 180),
-        curve: Curves.easeOut,
-      );
-    });
+    _revealCursor(_gridCursorKey);
     return true;
+  }
+
+  // Slides a product's variant cards in or out. The grid renumbers around
+  // the expansion — only the parent and its variants are listed while it is
+  // open — so the keyboard cursor follows the product it was sitting on and
+  // the arrows can walk straight into the variants.
+  void _toggleVariants(Product product) {
+    setState(() {
+      _expandedVariantProductId =
+          _expandedVariantProductId == product.id ? null : product.id;
+      if (_gridCursor != null) {
+        final i = _displayGridItems.indexWhere(
+          (e) => e is Product && e.id == product.id,
+        );
+        _gridCursor = i < 0 ? null : i;
+      }
+    });
   }
 
   // One path for picking a grid card, whether by mouse or by Enter on the
@@ -2857,10 +2952,7 @@ class _BillingScreenState extends State<BillingScreen> {
       } else {
         // Has variants → slide the variant cards out inline (pick again to
         // collapse), same as the chevron arrow.
-        setState(() {
-          _expandedVariantProductId =
-              _expandedVariantProductId == item.id ? null : item.id;
-        });
+        _toggleVariants(item);
       }
       return;
     }
@@ -4267,6 +4359,7 @@ class _BillingScreenState extends State<BillingScreen> {
     _editStorePhone = _storePhone;
     _editStoreEmail = _storeEmail;
     _editStoreGstin = _storeGstin;
+    _editStoreState = _storeState;
     _editStoreUpiId = _storeUpiId;
     _editBranchNumber = _branchNumber;
     _editLogoPath = _logoPath;
@@ -4680,6 +4773,7 @@ class _BillingScreenState extends State<BillingScreen> {
                                   _storePhone = _editStorePhone.trim();
                                   _storeEmail = _editStoreEmail.trim();
                                   _storeGstin = _editStoreGstin.trim();
+                                  _storeState = _editStoreState.trim();
                                   _storeUpiId = _editStoreUpiId.trim();
                                   _branchNumber =
                                       _editBranchNumber.trim().isEmpty
@@ -4750,6 +4844,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _editStorePhone = _storePhone;
       _editStoreEmail = _storeEmail;
       _editStoreGstin = _storeGstin;
+      _editStoreState = _storeState;
       _editReceiptFooter = _receiptFooter;
       _editTaxLabel = _taxLabel;
       _editTaxRate = _taxRateDisplay;
@@ -4785,6 +4880,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _storePhone = _editStorePhone.trim();
       _storeEmail = _editStoreEmail.trim();
       _storeGstin = _editStoreGstin.trim();
+      _storeState = _editStoreState.trim();
       _receiptFooter = _editReceiptFooter.trim();
       _taxLabel = _editTaxLabel.trim().isEmpty ? 'GST' : _editTaxLabel.trim();
       _taxRateDisplay = _editTaxRate.trim().isEmpty ? '0' : _editTaxRate.trim();
@@ -4817,6 +4913,7 @@ class _BillingScreenState extends State<BillingScreen> {
       'store_phone': _storePhone,
       'store_email': _storeEmail,
       'store_gstin': _storeGstin,
+      'store_state': _storeState,
       'receipt_footer': _receiptFooter,
       'tax_label': _taxLabel,
       'tax_rate': _taxRateDisplay,
@@ -5779,6 +5876,12 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                   _settingsDivider(),
                   _settingsTextField(
+                    'State',
+                    _editStoreState,
+                    (v) => setState(() => _editStoreState = v),
+                  ),
+                  _settingsDivider(),
+                  _settingsTextField(
                     'UPI ID',
                     _editStoreUpiId,
                     (v) => setState(() => _editStoreUpiId = v),
@@ -6019,6 +6122,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       storePhone: _editStorePhone,
                       storeEmail: _editStoreEmail,
                       storeGstin: _editStoreGstin,
+                      storeState: _editStoreState,
                       receiptFooter: _editReceiptFooter,
                       taxLabel: _editTaxLabel,
                       taxRate: _editTaxRate,
@@ -11665,6 +11769,7 @@ class _BillingScreenState extends State<BillingScreen> {
         storePhone: _storePhone,
         storeEmail: _storeEmail,
         storeGstin: _storeGstin,
+        storeState: _storeState,
         receiptFooter: _receiptFooter,
         taxLabel: _taxLabel,
         taxRate: _taxRateDisplay,
@@ -12161,6 +12266,7 @@ class _BillingScreenState extends State<BillingScreen> {
         storePhone: _storePhone,
         storeEmail: _storeEmail,
         storeGstin: _storeGstin,
+        storeState: _storeState,
         receiptFooter: _receiptFooter,
         taxLabel: _taxLabel,
         taxRate: _taxRateDisplay,
@@ -12215,6 +12321,7 @@ class _BillingScreenState extends State<BillingScreen> {
           storePhone: _storePhone,
           storeEmail: _storeEmail,
           storeGstin: _storeGstin,
+          storeState: _storeState,
           receiptFooter: _receiptFooter,
           taxLabel: _taxLabel,
           taxRate: _taxRateDisplay,
@@ -21228,6 +21335,7 @@ end tell
             storePhone: _storePhone,
             storeEmail: _storeEmail,
             storeGstin: _storeGstin,
+            storeState: _storeState,
             receiptFooter: _receiptFooter,
             taxLabel: _taxLabel,
             taxRate: _taxRateDisplay,
@@ -26669,7 +26777,12 @@ class _CategoryChip extends StatefulWidget {
   final String label;
   final bool selected;
   final VoidCallback onTap;
+
+  /// Lit by the arrow-key cursor, drawn exactly like a mouse hover.
+  final bool highlighted;
   const _CategoryChip({
+    super.key,
+    this.highlighted = false,
     required this.label,
     required this.selected,
     required this.onTap,
@@ -26680,6 +26793,7 @@ class _CategoryChip extends StatefulWidget {
 
 class _CategoryChipState extends State<_CategoryChip> {
   bool _hovered = false;
+  bool get _active => _hovered || widget.highlighted;
   @override
   Widget build(BuildContext context) {
     return MouseRegion(
@@ -26694,12 +26808,21 @@ class _CategoryChipState extends State<_CategoryChip> {
           decoration: BoxDecoration(
             color: widget.selected
                 ? AppColors.primary
-                : _hovered
+                : _active
                 ? const Color(0xFFEEF2FF)
                 : Colors.white,
             borderRadius: BorderRadius.circular(100),
+            // The keyboard cursor gets a ring of its own: it has to stay
+            // visible on the selected chip too, whose solid fill would
+            // otherwise swallow the hover styling. Mouse hover is
+            // deliberately left as it was.
             border: Border.all(
-              color: widget.selected ? AppColors.primary : AppColors.border,
+              color: widget.highlighted
+                  ? AppColors.accentBlue
+                  : widget.selected
+                  ? AppColors.primary
+                  : AppColors.border,
+              width: widget.highlighted ? 2 : 1,
             ),
           ),
           child: Text(
@@ -26710,7 +26833,7 @@ class _CategoryChipState extends State<_CategoryChip> {
               letterSpacing: 0.8,
               color: widget.selected
                   ? Colors.white
-                  : _hovered
+                  : _active
                   ? AppColors.textDark
                   : AppColors.textMuted,
             ),

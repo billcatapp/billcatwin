@@ -82,6 +82,7 @@ class ConnectivityService extends ChangeNotifier {
     'store_phone',
     'store_email',
     'store_gstin',
+    'store_state',
     'receipt_footer',
     'tax_label',
     'tax_rate',
