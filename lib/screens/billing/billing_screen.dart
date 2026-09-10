@@ -804,14 +804,7 @@ class _BillingScreenState extends State<BillingScreen> {
         key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.arrowRight;
     if (isArrow || key == LogicalKeyboardKey.escape) {
-      final focusCtx = FocusManager.instance.primaryFocus?.context;
-      final inOtherField =
-          !_searchFocus.hasFocus &&
-          focusCtx != null &&
-          (focusCtx.widget is EditableText ||
-              focusCtx.findAncestorWidgetOfExactType<EditableText>() !=
-                  null);
-      if (!inOtherField) {
+      if (!_typingInAnotherField) {
         if (key == LogicalKeyboardKey.escape) {
           if (_gridCursor == null && _categoryCursor == null) return false;
           setState(() {
@@ -870,7 +863,10 @@ class _BillingScreenState extends State<BillingScreen> {
         _addScannedCodeToCart(code);
         return true; // consume the scanner's Enter so fields don't also submit
       }
-      // Not a scan: Enter picks whatever the arrow keys have lit up.
+      // Not a scan. Enter belongs to whatever field is being typed in —
+      // APPLY on the discount, the customer fields' own submit — so only
+      // claim it for the lit card when the cashier is not in one.
+      if (_typingInAnotherField) return false;
       final catCursor = _categoryCursor;
       if (catCursor != null) {
         final categories = _displayCategories;
@@ -2827,6 +2823,18 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
+  // True while the cursor sits in a text field other than the product
+  // search box — customer name, custom item, the discount amount. Those
+  // fields keep their own Enter and arrow keys; the search box does not,
+  // because it holds focus almost all the time.
+  bool get _typingInAnotherField {
+    if (_searchFocus.hasFocus) return false;
+    final ctx = FocusManager.instance.primaryFocus?.context;
+    if (ctx == null) return false;
+    return ctx.widget is EditableText ||
+        ctx.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
   // Columns the grid is currently showing — the same arithmetic Flutter's
   // SliverGridDelegateWithMaxCrossAxisExtent does, against the grid's own
   // measured width less its 8px right padding.
@@ -4114,7 +4122,7 @@ class _BillingScreenState extends State<BillingScreen> {
       ),
       child: Row(
         children: [
-          _bottomBarBtn(Icons.keyboard_outlined, 'SHORTCUTS'),
+          _shortcutsButton(),
           const SizedBox(width: 4),
           _bottomBarBtn(
             Icons.inventory_2_outlined,
@@ -4135,6 +4143,68 @@ class _BillingScreenState extends State<BillingScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  // Every billing shortcut, in the order a cashier meets them. Keep this in
+  // step with _handleGlobalKey — it is the only place they are written down.
+  static const List<(String, String)> _billingShortcuts = [
+    ('Ctrl + B', 'Print Bill'),
+    ('Ctrl + C', 'Paid - Close Bill'),
+    ('Ctrl + P', 'Next payment method'),
+    ('Ctrl + D', 'Discount'),
+    ('Ctrl + =', 'Custom item'),
+    ('Alt + X', 'Print, then close the bill'),
+    ('↑ ↓ ← →', 'Move over products and categories'),
+    ('Enter', 'Add the highlighted item'),
+    ('Esc', 'Drop the selection'),
+    ('+', 'Custom item (when not typing in a field)'),
+  ];
+
+  // Hovering the SHORTCUTS button lists them all. The shortcuts only fire on
+  // the Billing tab, so the panel says so.
+  Widget _shortcutsButton() {
+    TextStyle keyStyle() => GoogleFonts.inter(
+      fontSize: 11.5,
+      fontWeight: FontWeight.w700,
+      color: Colors.white,
+      height: 1.7,
+    );
+    TextStyle actionStyle() => GoogleFonts.inter(
+      fontSize: 11.5,
+      fontWeight: FontWeight.w400,
+      color: Colors.white.withValues(alpha: 0.72),
+      height: 1.7,
+    );
+    return Tooltip(
+      richMessage: TextSpan(
+        children: [
+          TextSpan(
+            text: 'BILLING SHORTCUTS',
+            style: GoogleFonts.inter(
+              fontSize: 9,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.4,
+              color: Colors.white.withValues(alpha: 0.5),
+              height: 2.2,
+            ),
+          ),
+          for (final (keys, action) in _billingShortcuts) ...[
+            TextSpan(text: '\n$keys   ', style: keyStyle()),
+            TextSpan(text: action, style: actionStyle()),
+          ],
+        ],
+      ),
+      decoration: BoxDecoration(
+        color: AppColors.primary,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
+      margin: const EdgeInsets.only(left: 16, bottom: 6),
+      preferBelow: false,
+      verticalOffset: 24,
+      waitDuration: const Duration(milliseconds: 200),
+      child: _bottomBarBtn(Icons.keyboard_outlined, 'SHORTCUTS'),
     );
   }
 
@@ -11755,6 +11825,7 @@ class _BillingScreenState extends State<BillingScreen> {
     String? paperSize,
     String docType = 'Invoice',
     bool toPrinter = false,
+    double? amountTendered,
   }) async {
     _clearPrintingState();
     if (!mounted) return;
@@ -11770,6 +11841,7 @@ class _BillingScreenState extends State<BillingScreen> {
         storeEmail: _storeEmail,
         storeGstin: _storeGstin,
         storeState: _storeState,
+        amountTendered: amountTendered,
         receiptFooter: _receiptFooter,
         taxLabel: _taxLabel,
         taxRate: _taxRateDisplay,
@@ -11892,6 +11964,7 @@ class _BillingScreenState extends State<BillingScreen> {
     final hasPhone = cart.customerPhone.isNotEmpty;
     final hasWa = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
     final paidCtrl = TextEditingController(text: cart.total.toStringAsFixed(2));
+    final paidFocus = FocusNode();
 
     showDialog(
       context: context,
@@ -11901,6 +11974,8 @@ class _BillingScreenState extends State<BillingScreen> {
           final paid = double.tryParse(paidCtrl.text.trim()) ?? total;
           final balanceDue = (total - paid) > 0.005 ? total - paid : 0.0;
           final isCredit = balanceDue > 0.005;
+          // Handed over more than the bill: what the cashier owes back.
+          final changeDue = (paid - total) > 0.005 ? paid - total : 0.0;
           final hasCustomer =
               cart.customerName.trim().isNotEmpty ||
               cart.customerPhone.trim().isNotEmpty;
@@ -11960,9 +12035,9 @@ class _BillingScreenState extends State<BillingScreen> {
             if (!context.mounted) return;
             _showToast('Payment successful!');
             if (_autoPrint) {
-              await _printRecord(snapshot);
+              await _printRecord(snapshot, amountTendered: paid);
             }
-            _autoSavePdf(snapshot);
+            _autoSavePdf(snapshot, amountTendered: paid);
             if (sendWaAfterClose) {
               _sendInvoiceViaWhatsApp(snapshot, phone);
             }
@@ -12024,6 +12099,8 @@ class _BillingScreenState extends State<BillingScreen> {
               const SizedBox(height: 6),
               TextField(
                 controller: paidCtrl,
+                focusNode: paidFocus,
+                autofocus: true,
                 onChanged: (_) => setLocal(() {}),
                 onSubmitted: (_) => confirm(),
                 keyboardType: const TextInputType.numberWithOptions(
@@ -12056,6 +12133,49 @@ class _BillingScreenState extends State<BillingScreen> {
                   color: AppColors.textMuted,
                 ),
               ),
+              if (changeDue > 0.005) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: AppColors.success.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: AppColors.success.withValues(alpha: 0.35),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.payments_outlined,
+                        size: 15,
+                        color: AppColors.success,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Change to give',
+                        style: GoogleFonts.inter(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.success,
+                        ),
+                      ),
+                      const Spacer(),
+                      Text(
+                        _fmt(changeDue),
+                        style: GoogleFonts.manrope(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w800,
+                          color: AppColors.success,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (isCredit) ...[
                 const SizedBox(height: 12),
                 Container(
@@ -12210,6 +12330,18 @@ class _BillingScreenState extends State<BillingScreen> {
     ).whenComplete(() {
       _dialogEnterAction = null;
       _disposeAfterDialog(paidCtrl);
+      _disposeAfterDialog(paidFocus);
+    });
+
+    // Cursor in the amount with the pre-filled total selected, so a cashier
+    // taking a different sum just types over it.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      paidFocus.requestFocus();
+      paidCtrl.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: paidCtrl.text.length,
+      );
     });
   }
 
@@ -12257,7 +12389,7 @@ class _BillingScreenState extends State<BillingScreen> {
     _autoSavePdf(snapshot);
   }
 
-  Future<void> _autoSavePdf(TransactionRecord tx) async {
+  Future<void> _autoSavePdf(TransactionRecord tx, {double? amountTendered}) async {
     try {
       final pdfBytes = await ReceiptPrinter.buildPdf(
         tx,
@@ -12267,6 +12399,7 @@ class _BillingScreenState extends State<BillingScreen> {
         storeEmail: _storeEmail,
         storeGstin: _storeGstin,
         storeState: _storeState,
+        amountTendered: amountTendered,
         receiptFooter: _receiptFooter,
         taxLabel: _taxLabel,
         taxRate: _taxRateDisplay,
@@ -18845,21 +18978,31 @@ end tell
             TextEditingController ctrl,
             String hint, {
             bool numeric = false,
+            bool muted = false,
             FocusNode? focusNode,
             List<TextInputFormatter>? formatters,
             ValueChanged<String>? onChanged,
+            VoidCallback? onEnter,
             TextAlign align = TextAlign.start,
           }) => TextField(
             controller: ctrl,
             focusNode: focusNode,
             onChanged: onChanged,
+            // Enter walks the row one cell at a time. Without this the key
+            // falls through to Flutter's default handling, which is not built
+            // for a grid and does not land on the next cell.
+            textInputAction: TextInputAction.next,
+            onSubmitted: onEnter == null ? null : (_) => onEnter(),
             textAlign: align,
             cursorColor: AppColors.primary,
             inputFormatters: formatters,
             keyboardType: numeric
                 ? const TextInputType.numberWithOptions(decimal: true)
                 : TextInputType.text,
-            style: GoogleFonts.inter(fontSize: 13, color: AppColors.textDark),
+            style: GoogleFonts.inter(
+              fontSize: 13,
+              color: muted ? AppColors.textMuted : AppColors.textDark,
+            ),
             decoration: InputDecoration(
               hintText: hint,
               hintStyle: GoogleFonts.inter(
@@ -18882,6 +19025,20 @@ end tell
               ),
             ),
           );
+
+          // What to print in the number column. Numbers count products, so a
+          // product and its variants share one number and the next product
+          // picks up straight after it rather than leaving a gap. Unnamed rows
+          // each still count as their own.
+          int productNumber(int index) {
+            var n = 0;
+            final seen = <String>{};
+            for (var j = 0; j <= index; j++) {
+              final k = groupKey(rows[j]);
+              if (k.isEmpty || seen.add(k)) n++;
+            }
+            return n;
+          }
 
           void recount() {
             final entered = rows.where((r) => !r.isBlank).toList();
@@ -18958,7 +19115,15 @@ end tell
             String? firstProblem;
             void fail(_BulkProductRow r, String msg) {
               r.error = msg;
-              firstProblem ??= 'Row ${rows.indexOf(r) + 1}: $msg';
+              // Named by product (and variant) rather than row number: with
+              // variants sharing a number, a row number no longer points at
+              // anything you can see in the grid.
+              final label = r.nameCtrl.text.trim();
+              final variant = r.variantCtrl.text.trim();
+              final who = label.isEmpty
+                  ? 'Row ${rows.indexOf(r) + 1}'
+                  : (variant.isEmpty ? label : '$label ($variant)');
+              firstProblem ??= '$who: $msg';
             }
 
             // Rows that repeat a product name are one product's variants, kept
@@ -19208,6 +19373,10 @@ end tell
             final grouped =
                 key.isNotEmpty &&
                 rows.where((o) => groupKey(o) == key).length > 1;
+            // A repeat of a product named further up: draw it as a sub-line of
+            // that product rather than restating the name on every row.
+            final groupChild =
+                key.isNotEmpty && rows.take(i).any((o) => groupKey(o) == key);
             return Container(
               decoration: BoxDecoration(
                 color: bad
@@ -19233,29 +19402,55 @@ end tell
                         SizedBox(
                           width: wNum,
                           child: Center(
-                            child: Text(
-                              '${i + 1}',
-                              style: GoogleFonts.inter(
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w600,
-                                color: bad
-                                    ? AppColors.error
-                                    : AppColors.textMuted.withValues(
-                                        alpha: 0.65,
-                                      ),
-                              ),
-                            ),
+                            // Sub-lines are variants of the product above, not
+                            // products of their own, so they carry no number.
+                            child: groupChild
+                                ? const SizedBox.shrink()
+                                : Text(
+                                    '${productNumber(i)}',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: bad
+                                          ? AppColors.error
+                                          : AppColors.textMuted.withValues(
+                                              alpha: 0.65,
+                                            ),
+                                    ),
+                                  ),
                           ),
                         ),
                         Expanded(
                           flex: 3,
-                          child: cellField(
-                            r.nameCtrl,
-                            'e.g. Wireless Mouse',
-                            onChanged: (_) {
-                              regenSkus();
-                              recount();
-                            },
+                          child: Row(
+                            children: [
+                              // Sub-lines sit indented under their product,
+                              // with the name muted so the eye reads the group
+                              // as one product and its variants.
+                              if (groupChild) ...[
+                                const SizedBox(width: 16),
+                                Icon(
+                                  Icons.subdirectory_arrow_right_rounded,
+                                  size: 14,
+                                  color: AppColors.textMuted.withValues(
+                                    alpha: 0.5,
+                                  ),
+                                ),
+                              ],
+                              Expanded(
+                                child: cellField(
+                                  r.nameCtrl,
+                                  'e.g. Wireless Mouse',
+                                  muted: groupChild,
+                                  focusNode: r.nameFocus,
+                                  onEnter: () => r.variantFocus.requestFocus(),
+                                  onChanged: (_) {
+                                    regenSkus();
+                                    recount();
+                                  },
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                         Expanded(
@@ -19264,6 +19459,7 @@ end tell
                             r.variantCtrl,
                             'e.g. Large',
                             focusNode: r.variantFocus,
+                            onEnter: () => r.skuFocus.requestFocus(),
                             onChanged: (_) => recount(),
                           ),
                         ),
@@ -19272,6 +19468,8 @@ end tell
                           child: cellField(
                             r.skuCtrl,
                             'auto',
+                            focusNode: r.skuFocus,
+                            onEnter: () => r.hsnFocus.requestFocus(),
                             onChanged: (_) {
                               r.skuAuto = false;
                               regenSkus();
@@ -19285,6 +19483,8 @@ end tell
                             r.hsnCtrl,
                             'e.g. 8517',
                             numeric: true,
+                            focusNode: r.hsnFocus,
+                            onEnter: () => r.priceFocus.requestFocus(),
                             // Same rule as the single product dialogs: up to
                             // 8 digits, and blank is allowed.
                             formatters: [
@@ -19303,6 +19503,8 @@ end tell
                             '0.00',
                             numeric: true,
                             align: TextAlign.end,
+                            focusNode: r.priceFocus,
+                            onEnter: () => r.stockFocus.requestFocus(),
                             onChanged: (_) => recount(),
                           ),
                         ),
@@ -19313,6 +19515,8 @@ end tell
                             '0',
                             numeric: true,
                             align: TextAlign.end,
+                            focusNode: r.stockFocus,
+                            onEnter: () => r.buyingFocus.requestFocus(),
                             onChanged: (_) => recount(),
                           ),
                         ),
@@ -19323,6 +19527,24 @@ end tell
                             '0.00',
                             numeric: true,
                             align: TextAlign.end,
+                            focusNode: r.buyingFocus,
+                            // End of the row: carry on to the next row's name,
+                            // adding a row first when this is the last one, so
+                            // Enter keeps the typing going down the grid.
+                            onEnter: () {
+                              if (i + 1 >= rows.length) {
+                                setLocal(
+                                  () => rows.add(
+                                    _BulkProductRow(category: defaultCategory),
+                                  ),
+                                );
+                              }
+                              WidgetsBinding.instance.addPostFrameCallback((_) {
+                                if (i + 1 < rows.length) {
+                                  rows[i + 1].nameFocus.requestFocus();
+                                }
+                              });
+                            },
                             onChanged: (_) => recount(),
                           ),
                         ),
@@ -21111,7 +21333,7 @@ end tell
   /// the sales table, the GST page and every export agree. Null when no line
   /// carried a rate above 0%, or the bill can't be attributed to a rate.
   ({double taxable, double tax})? _salesRowGst(TransactionRecord t) {
-    final split = _gstSplitBill(t, double.tryParse(_taxRateDisplay) ?? 0);
+    final split = _gstSplitBill(t, _gstFallbackRate(t));
     if (!split.split) return null;
     var taxable = 0.0;
     var tax = 0.0;
@@ -22278,6 +22500,29 @@ end tell
   ///    so the printer's guard misses it entirely.
   /// A bill that fails the check is reported as unsplittable rather than
   /// silently inflating a slab; the caller shows it as Unallocated.
+  /// Rate for lines that never recorded one (taxPercent 0 = "not recorded").
+  ///
+  /// Bills predating per-line rates carry real tax but no rate, so the rate has
+  /// to be inferred. Using the store-wide rate makes a historical bill report
+  /// whatever the shop happens to charge today — and if that is set to 0, a
+  /// bill holding real tax reads as untaxed and disappears from this page.
+  /// Deriving it from the bill's own stored tax is exact for a single-rate
+  /// bill, which is what every such bill is, and never changes afterwards.
+  ///
+  /// Only used when NO line on the bill carries a rate; a partly-rated bill
+  /// would over-state, so those keep the store-wide fallback.
+  double _gstFallbackRate(TransactionRecord t) {
+    final storeRate = double.tryParse(_taxRateDisplay) ?? 0;
+    if (t.items.any((i) => i.taxPercent > 0)) return storeRate;
+    final taxable = t.subtotal - t.discountAmount;
+    if (t.taxAmount.abs() < 0.005 || taxable.abs() < 0.005) return storeRate;
+    final derived = t.taxAmount / taxable * 100;
+    if (!derived.isFinite || derived <= 0 || derived > 100) return storeRate;
+    // Two decimals: rates are whole or half percentages in practice, and this
+    // keeps a rounding wobble from spawning a slab like 4.999999%.
+    return double.parse(derived.toStringAsFixed(2));
+  }
+
   ({Map<double, (double, double)> byRate, bool split}) _gstSplitBill(
     TransactionRecord tx,
     double fallbackRate,
@@ -22310,7 +22555,6 @@ end tell
     int bills,
   })
   _gstAggregate(List<TransactionRecord> txns) {
-    final fallback = double.tryParse(_taxRateDisplay) ?? 0;
     final byRate = <double, (double, double)>{};
     var unTaxable = 0.0;
     var unTax = 0.0;
@@ -22319,7 +22563,7 @@ end tell
     for (final t in txns) {
       recTaxable += t.subtotal - t.discountAmount;
       recTax += t.taxAmount;
-      final r = _gstSplitBill(t, fallback);
+      final r = _gstSplitBill(t, _gstFallbackRate(t));
       if (!r.split) {
         unTaxable += t.subtotal - t.discountAmount;
         unTax += t.taxAmount;
@@ -22551,7 +22795,6 @@ end tell
     double excludedTaxable,
   })
   _gstInvoiceRows(List<TransactionRecord> txns, {double? only}) {
-    final fallback = double.tryParse(_taxRateDisplay) ?? 0;
     final rows =
         <
           ({
@@ -22567,7 +22810,7 @@ end tell
     var excludedTaxable = 0.0;
 
     for (final t in txns) {
-      final split = _gstSplitBill(t, fallback);
+      final split = _gstSplitBill(t, _gstFallbackRate(t));
       // Unsplittable bills (see _gstSplitBill) can't be attributed to a rate,
       // so they belong with the excluded set rather than in a rate row.
       final taxed = split.split
@@ -28895,6 +29138,15 @@ class _BulkProductRow {
   /// Focused right after the "add a variant" button spawns this row, so the
   /// only field still to fill is already waiting for typing.
   final variantFocus = FocusNode();
+
+  /// The rest of the row's cells, so Enter can hand focus along one at a time.
+  /// Category has none: it is a dropdown, not something you type into.
+  final nameFocus = FocusNode();
+  final skuFocus = FocusNode();
+  final hsnFocus = FocusNode();
+  final priceFocus = FocusNode();
+  final stockFocus = FocusNode();
+  final buyingFocus = FocusNode();
   final skuCtrl = TextEditingController();
   final hsnCtrl = TextEditingController();
   final priceCtrl = TextEditingController();

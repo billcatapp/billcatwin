@@ -112,6 +112,10 @@ class ReceiptPrinter {
     String storeEmail = '',
     String storeGstin = '',
     String storeState = '',
+    /// Cash actually handed over, when the caller knows it (the receipt
+    /// printed right after payment). Null everywhere else: a reprint from
+    /// history has no record of it, since only the balance due is stored.
+    double? amountTendered,
     required String receiptFooter,
     required String taxLabel,
     required String taxRate,
@@ -135,7 +139,7 @@ class ReceiptPrinter {
 
     switch (layout) {
       case 'Classic':
-        return _buildClassicInvoicePdf(tx, storeName: _sharedArgs.storeName, storeAddress: _sharedArgs.storeAddress, storePhone: _sharedArgs.storePhone, storeEmail: _sharedArgs.storeEmail, storeGstin: _sharedArgs.storeGstin, storeState: _sharedArgs.storeState, receiptFooter: _sharedArgs.receiptFooter, taxLabel: _sharedArgs.taxLabel, taxRate: _sharedArgs.taxRate, currencySymbol: _sharedArgs.currencySymbol, storeTerms: _sharedArgs.storeTerms, logoPath: _sharedArgs.logoPath);
+        return _buildClassicInvoicePdf(tx, amountTendered: amountTendered, storeName: _sharedArgs.storeName, storeAddress: _sharedArgs.storeAddress, storePhone: _sharedArgs.storePhone, storeEmail: _sharedArgs.storeEmail, storeGstin: _sharedArgs.storeGstin, storeState: _sharedArgs.storeState, receiptFooter: _sharedArgs.receiptFooter, taxLabel: _sharedArgs.taxLabel, taxRate: _sharedArgs.taxRate, currencySymbol: _sharedArgs.currencySymbol, storeTerms: _sharedArgs.storeTerms, logoPath: _sharedArgs.logoPath);
       case 'Modern':
         return _buildModern4Pdf(tx, storeName: _sharedArgs.storeName, storeAddress: _sharedArgs.storeAddress, storePhone: _sharedArgs.storePhone, storeEmail: _sharedArgs.storeEmail, storeGstin: _sharedArgs.storeGstin, receiptFooter: _sharedArgs.receiptFooter, taxLabel: _sharedArgs.taxLabel, taxRate: _sharedArgs.taxRate, currencySymbol: _sharedArgs.currencySymbol, storeTerms: _sharedArgs.storeTerms, logoPath: _sharedArgs.logoPath);
       case 'GST':
@@ -841,6 +845,7 @@ class ReceiptPrinter {
     String storeEmail = '',
     String storeGstin = '',
     String storeState = '',
+    double? amountTendered,
     required String receiptFooter,
     required String taxLabel,
     required String taxRate,
@@ -865,6 +870,11 @@ class ReceiptPrinter {
     final sgst       = tx.taxAmount / 2;
     final totalQty   = tx.items.fold<int>(0, (s, i) => s + i.quantity);
     final invoiceNo = tx.displayInvoice;
+    // What was handed over, and what goes back. Unknown on a reprint, where
+    // the bill total is the best the record can offer.
+    final received = amountTendered ?? tx.total;
+    final changeGiven =
+        received - tx.total > 0.005 ? received - tx.total : 0.0;
 
     const grey4 = pw.BorderSide(color: PdfColors.grey400, width: 0.5);
     const grey6 = pw.BorderSide(color: PdfColors.grey600, width: 0.8);
@@ -1204,8 +1214,11 @@ class ReceiptPrinter {
                   pw.SizedBox(height: 2),
                   tx_(_numberToWords(tx.total), s: fs - 2.5, c: PdfColors.grey600),
                   pw.SizedBox(height: 4),
-                  totRow('Received', tx.total.toStringAsFixed(2)),
+                  totRow('Received', received.toStringAsFixed(2)),
                   totRow('Balance', '0.00'),
+                  if (changeGiven > 0.005)
+                    totRow('Change', changeGiven.toStringAsFixed(2),
+                        bold: true, vc: PdfColors.green800),
                   if (tx.discountAmount > 0)
                     totRow('You Saved', '$currencySymbol ${tx.discountAmount.toStringAsFixed(2)}',
                         bold: true, vc: PdfColors.green800),
