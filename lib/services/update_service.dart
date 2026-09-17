@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart';
 
 // version.json shape (host at feedUrl, update "version" to trigger update banner):
 // {
@@ -87,8 +88,17 @@ class UpdateService {
       if (tmp == null) return null;
       final f = File('$tmp\\billcat_update.log');
       if (!await f.exists()) return null;
-      final content = await f.readAsString();
+      // Add-Content writes the ANSI code page, so an accented user name in
+      // the log is not valid UTF-8; decode leniently so the message still shows.
+      final content = utf8.decode(await f.readAsBytes(), allowMalformed: true);
       await f.delete();
+      // The log is gone after this; remember the failure past a restart, but
+      // only if this version started the failed update. A log left by an
+      // older version (e.g. read by the version the user then installed by
+      // hand) must not mark this one as failed.
+      if (content.contains('from version ${await currentVersion()},')) {
+        await markUpdateFailed();
+      }
       // Last "failed" line carries the actual copy error, if any.
       final failLines =
           content.split('\n').where((l) => l.contains('failed')).toList();
@@ -96,6 +106,35 @@ class UpdateService {
     } catch (_) {
       return null;
     }
+  }
+
+  static Future<File> _failedMarker() async {
+    final dir = await getApplicationSupportDirectory();
+    return File('${dir.path}${Platform.pathSeparator}update_failed.txt');
+  }
+
+  /// Records that an in-place update failed on the version running now, so
+  /// the banner keeps offering the installer instead of retrying (see
+  /// [previousUpdateFailed]).
+  static Future<void> markUpdateFailed() async {
+    try {
+      await (await _failedMarker()).writeAsString(await currentVersion());
+    } catch (_) {}
+  }
+
+  /// True while the version whose in-place update failed is still installed.
+  /// Once a different version runs (e.g. after using the installer) the
+  /// marker is removed and normal updates resume.
+  static Future<bool> previousUpdateFailed() async {
+    try {
+      final marker = await _failedMarker();
+      if (!await marker.exists()) return false;
+      if ((await marker.readAsString()).trim() == await currentVersion()) {
+        return true;
+      }
+      await marker.delete();
+    } catch (_) {}
+    return false;
   }
 
   /// Downloads the zip, extracts it, replaces the running app, and relaunches.
@@ -120,24 +159,22 @@ class UpdateService {
     // install under WindowsApps) can never succeed the in-place file copy
     // below. Derive the GitHub release page so the fallback can send the
     // user to grab the installer manually instead of failing silently.
-    String releasePageUrl = url;
-    final releaseMatch =
-        RegExp(r'^(https://github\.com/[^/]+/[^/]+)/releases/download/([^/]+)/')
-            .firstMatch(url);
-    if (releaseMatch != null) {
-      releasePageUrl = '${releaseMatch.group(1)}/releases/tag/${releaseMatch.group(2)}';
-    }
+    final releasePageUrl = releasePageFor(url);
 
     final tmpDir = await Directory.systemTemp.createTemp('billcat_update_');
     final zipPath = '${tmpDir.path}\\update.zip';
 
     onProgress(0.05);
 
-    // Download using Dart's HttpClient (no curl dependency on Windows)
-    final client = HttpClient();
+    // Download using Dart's HttpClient (no curl dependency on Windows).
+    // Timeouts so a stalled connection ends in an error instead of a progress
+    // bar that never moves.
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
     try {
       final request = await client.getUrl(Uri.parse(url));
-      final response = await request.close();
+      final response =
+          await request.close().timeout(const Duration(seconds: 30));
       if (response.statusCode != 200) {
         throw UpdateCheckError('Download failed: HTTP ${response.statusCode}');
       }
@@ -147,30 +184,63 @@ class UpdateService {
       int received = 0;
 
       final sink = File(zipPath).openWrite();
-      await for (final chunk in response) {
-        sink.add(chunk);
-        received += chunk.length;
-        if (totalBytes > 0) {
-          onProgress(0.05 + (received / totalBytes) * 0.75);
+      try {
+        await for (final chunk
+            in response.timeout(const Duration(seconds: 30))) {
+          sink.add(chunk);
+          received += chunk.length;
+          if (totalBytes > 0) {
+            onProgress(0.05 + (received / totalBytes) * 0.75);
+          }
         }
+      } on TimeoutException {
+        throw const UpdateCheckError(
+          'Update download stopped responding. Check your internet connection and try again.',
+        );
+      } finally {
+        await sink.close();
       }
-      await sink.close();
+      if (totalBytes > 0 &&
+          received != totalBytes &&
+          response.compressionState !=
+              HttpClientResponseCompressionState.decompressed) {
+        throw const UpdateCheckError(
+          'Update download was interrupted. Check your internet connection and try again.',
+        );
+      }
+    } on TimeoutException {
+      throw const UpdateCheckError(
+        'Could not reach the update server. Check your internet connection and try again.',
+      );
     } finally {
       client.close();
     }
 
     onProgress(0.82);
 
-    // Extract using PowerShell's built-in Expand-Archive
+    // Extract using PowerShell's built-in Expand-Archive. Expand-Archive
+    // reports a bad zip as a non-terminating error and still exits 0, so make
+    // errors terminating. Paths are single-quoted so a '$' or backtick in the
+    // Windows user name is not expanded by PowerShell.
     final extractDir = '${tmpDir.path}\\extracted';
     await Directory(extractDir).create();
     final extract = await Process.run('powershell', [
       '-NoProfile',
       '-Command',
-      'Expand-Archive -LiteralPath "$zipPath" -DestinationPath "$extractDir" -Force',
+      "\$ErrorActionPreference = 'Stop'; "
+          'Expand-Archive -LiteralPath ${_psq(zipPath)} '
+          '-DestinationPath ${_psq(extractDir)} -Force',
     ]);
-    if (extract.exitCode != 0) {
-      throw UpdateCheckError('Failed to extract update: ${extract.stderr}');
+    // A Wi-Fi login page, proxy, or antivirus can hand back something that is
+    // not the zip (extract fails), or a zip with files stripped out (no
+    // billcat.exe). Retrying the same download won't help, and the raw
+    // PowerShell error is unreadable, so say what to do instead.
+    if (extract.exitCode != 0 ||
+        !File('$extractDir\\billcat.exe').existsSync()) {
+      throw const UpdatePackageError(
+        'The update download was damaged or blocked (Wi-Fi login page, proxy '
+        'or antivirus). Use "Download Installer" on the update banner.',
+      );
     }
 
     onProgress(0.92);
@@ -179,15 +249,26 @@ class UpdateService {
     final appDir = File(execPath).parent.path;
     final ts = DateTime.now().millisecondsSinceEpoch;
     final scriptPath = '${Directory.systemTemp.path}\\billcat_updater_$ts.ps1';
+    // Written into the log so a failure is only remembered by the version
+    // that started this update (see consumeFailedUpdateLog).
+    final fromVersion = await currentVersion();
 
     // PowerShell script: wait for the app process to exit, copy new files, relaunch.
     // Windows keeps the outgoing exe's image memory-mapped for a short window after
     // the process disappears from Get-Process, so the first Copy-Item attempt can
     // fail with "a user-mapped section open" even though the process is gone.
     // Retry with backoff instead of relaunching whatever happens to be on disk.
+    //
+    // The file starts with a UTF-8 BOM: Windows PowerShell 5.1 reads a .ps1
+    // without one as the ANSI code page, which garbles a Tamil, Hindi or
+    // accented user name in the paths below. Paths are single-quoted (_psq)
+    // so a '$' or backtick in them is not expanded.
     await File(scriptPath).writeAsString(
+      // Written as a char code, not an invisible literal, so it can't be
+      // stripped by accident. Must stay first.
+      '${String.fromCharCode(0xFEFF)}'
       r'$log = "$env:TEMP\billcat_update.log"' '\n'
-      r'Add-Content $log "[$(Get-Date)] Updater started, waiting for BillCat..."' '\n'
+      'Add-Content \$log "[\$(Get-Date)] Updater started from version $fromVersion, waiting for BillCat..."\n'
       r'$maxWait = 20; $waited = 0' '\n'
       r'while ((Get-Process -Name "billcat" -ErrorAction SilentlyContinue) -and ($waited -lt $maxWait)) {' '\n'
       r'    Start-Sleep -Milliseconds 500; $waited += 0.5' '\n'
@@ -204,7 +285,7 @@ class UpdateService {
       r'$copyAttempts = 0; $copyOk = $false' '\n'
       r'while (-not $copyOk -and $copyAttempts -lt 10) {' '\n'
       '    try {\n'
-      '        Copy-Item -Path "$extractDir\\*" -Destination "$appDir" -Recurse -Force -ErrorAction Stop\n'
+      '        Copy-Item -Path ${_psq('$extractDir\\*')} -Destination ${_psq(appDir)} -Recurse -Force -ErrorAction Stop\n'
       r'        $copyOk = $true' '\n'
       '    } catch {\n'
       r'        $copyAttempts++' '\n'
@@ -215,10 +296,10 @@ class UpdateService {
       r'if ($copyOk) {' '\n'
       r'    Add-Content $log "[$(Get-Date)] Copy succeeded. Launching updated app..."' '\n'
       r'} else {' '\n'
-      r'    Add-Content $log "[$(Get-Date)] Copy failed after $copyAttempts attempts (install location is likely read-only, e.g. a leftover MSIX install). Opening manual download page..."' '\n'
-      '    Start-Process "$releasePageUrl"\n'
+      r'    Add-Content $log "[$(Get-Date)] Copy failed after $copyAttempts attempts (BillCat files are locked or the install folder is read-only). Opening manual download page..."' '\n'
+      '    Start-Process ${_psq(releasePageUrl)}\n'
       r'}' '\n'
-      'Start-Process "$execPath"\n'
+      'Start-Process ${_psq(execPath)}\n'
       r'if ($copyOk) {' '\n'
       r'    Remove-Item -Path "$env:TEMP\billcat_update.log" -Force -ErrorAction SilentlyContinue' '\n'
       r'}' '\n'
@@ -235,9 +316,13 @@ class UpdateService {
     // that deadlock but on Windows the child can still be torn down along
     // with this process's tree once exit() runs. `cmd /c start` goes through
     // ShellExecute, which reliably survives the parent's exit.
+    // The script path is passed in an environment variable, not on the cmd
+    // command line: cmd treats '&' or '^' in a user name (e.g. "R&S") as
+    // syntax, and the script would never start.
     await Process.start(
       'cmd',
-      ['/c', 'start', '""', '/min', 'powershell', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      ['/c', 'start', '""', '/min', 'powershell', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', r'& $env:BC_UPDATER_SCRIPT'],
+      environment: {'BC_UPDATER_SCRIPT': scriptPath},
       mode: ProcessStartMode.detached,
     );
     exit(0);
@@ -331,6 +416,18 @@ class UpdateService {
   }
 
   static String _esc(String path) => "'${path.replaceAll("'", "'\\''")}'";
+
+  /// PowerShell single-quoted string literal: nothing inside is expanded.
+  static String _psq(String s) => "'${s.replaceAll("'", "''")}'";
+
+  /// GitHub release page for a release asset URL, where the installer can be
+  /// downloaded by hand. Returns [url] unchanged if it is not a GitHub asset.
+  static String releasePageFor(String url) {
+    final m =
+        RegExp(r'^(https://github\.com/[^/]+/[^/]+)/releases/download/([^/]+)/')
+            .firstMatch(url);
+    return m == null ? url : '${m.group(1)}/releases/tag/${m.group(2)}';
+  }
 }
 
 class UpdateInfo {
@@ -352,4 +449,10 @@ class UpdateCheckError implements Exception {
   const UpdateCheckError(this.message);
   @override
   String toString() => message;
+}
+
+/// The download finished but the package is unusable (blocked, replaced or
+/// corrupt). Retrying the same download will not help; use the installer.
+class UpdatePackageError extends UpdateCheckError {
+  const UpdatePackageError(super.message);
 }

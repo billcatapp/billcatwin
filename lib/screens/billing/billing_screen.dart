@@ -350,6 +350,14 @@ class _BillingScreenState extends State<BillingScreen> {
   // Update banner
   UpdateInfo? _updateInfo;
   bool _updateDismissed = false;
+  // The previous in-place update failed to apply; retrying it the same way
+  // would loop, so the banner sends the user to the installer instead.
+  bool _lastUpdateFailed = false;
+  // Download failures this session; after two, offer the installer too.
+  int _installFailures = 0;
+  // The package itself was blocked or damaged this session. Unlike network
+  // failures, a successful manual check does not clear this.
+  bool _packageBlocked = false;
   bool _isCheckingUpdate = false;
   String _currentVersion = '';
   double? _downloadProgress; // null=idle, 0–1=downloading, 1.0=done
@@ -650,7 +658,12 @@ class _BillingScreenState extends State<BillingScreen> {
     // "successfully" otherwise looks like the update simply didn't happen).
     try {
       final failReason = await UpdateService.consumeFailedUpdateLog();
-      if (failReason != null && mounted) {
+      // Only a failure started by this version is reported; a log left by an
+      // older version (e.g. before a manual install) is just cleared.
+      if (failReason != null &&
+          await UpdateService.previousUpdateFailed() &&
+          mounted) {
+        setState(() => _lastUpdateFailed = true);
         _showToast(
           'The last update could not be applied automatically. '
           'Please download the installer from the update banner. '
@@ -659,6 +672,11 @@ class _BillingScreenState extends State<BillingScreen> {
         );
       }
     } catch (_) {}
+    // Still on the version whose update failed before (possibly in an earlier
+    // session): keep offering the installer rather than the same retry.
+    if (!_lastUpdateFailed && await UpdateService.previousUpdateFailed()) {
+      if (mounted) setState(() => _lastUpdateFailed = true);
+    }
     try {
       final info = await UpdateService.checkForUpdate();
       if (mounted && info != null) setState(() => _updateInfo = info);
@@ -675,9 +693,15 @@ class _BillingScreenState extends State<BillingScreen> {
       final info = await UpdateService.checkForUpdate();
       if (!mounted) return;
       if (info != null) {
+        // A successful check means the connection is back: clear this
+        // session's download failures and fall back to the saved state.
+        final failedBefore = await UpdateService.previousUpdateFailed();
+        if (!mounted) return;
         setState(() {
           _updateInfo = info;
           _isCheckingUpdate = false;
+          _installFailures = 0;
+          _lastUpdateFailed = failedBefore || _packageBlocked;
         });
       } else {
         setState(() {
@@ -711,13 +735,44 @@ class _BillingScreenState extends State<BillingScreen> {
       await UpdateService.installUpdate(info.downloadUrl, (p) {
         if (mounted) setState(() => _downloadProgress = p);
       });
-    } on UpdateCheckError catch (e) {
+    } on UpdatePackageError catch (e) {
+      // Blocked or damaged package: offer the installer for the rest of this
+      // session. Not saved: antivirus or a bad release zip is often temporary
+      // or tied to one release, and must not disable later in-place updates.
       if (mounted) {
-        setState(() => _downloadProgress = null);
+        setState(() {
+          _downloadProgress = null;
+          _packageBlocked = true;
+          _lastUpdateFailed = true;
+        });
         _showToast(e.message, isError: true);
       }
+    } on UpdateCheckError catch (e) {
+      if (mounted) {
+        setState(() {
+          _downloadProgress = null;
+          if (++_installFailures >= 2) _lastUpdateFailed = true;
+        });
+        _showToast(
+          _lastUpdateFailed
+              ? 'The update could not be downloaded. Use "Download Installer" on the update banner.'
+              : e.message,
+          isError: true,
+        );
+      }
     } catch (_) {
-      if (mounted) setState(() => _downloadProgress = null);
+      if (mounted) {
+        setState(() {
+          _downloadProgress = null;
+          if (++_installFailures >= 2) _lastUpdateFailed = true;
+        });
+        _showToast(
+          _lastUpdateFailed
+              ? 'The update could not be downloaded. Use "Download Installer" on the update banner.'
+              : 'Update download failed. Check your internet connection and try again.',
+          isError: true,
+        );
+      }
     }
   }
 
@@ -1616,10 +1671,16 @@ class _BillingScreenState extends State<BillingScreen> {
                         borderRadius: BorderRadius.circular(6),
                       ),
                     ),
-                    onPressed: _installUpdate,
-                    child: const Text(
-                      'Install Update',
-                      style: TextStyle(fontSize: 12),
+                    onPressed: _lastUpdateFailed
+                        ? () => launchUrl(
+                            Uri.parse(
+                              UpdateService.releasePageFor(info.downloadUrl),
+                            ),
+                          )
+                        : _installUpdate,
+                    child: Text(
+                      _lastUpdateFailed ? 'Download Installer' : 'Install Update',
+                      style: const TextStyle(fontSize: 12),
                     ),
                   ),
                 if (!info.mandatory && !isDownloading) ...[
@@ -1936,7 +1997,9 @@ class _BillingScreenState extends State<BillingScreen> {
         // Outside setState: _loadGstPage calls setState itself.
         if (value == 'GST') _loadGstPage();
       },
-      itemBuilder: (_) => ['Delivery', 'Dealers', 'GST']
+      // No Dealers entry here: the dealer report is under Reports, and new
+      // dealers are added from the product form's dealer dropdown.
+      itemBuilder: (_) => ['Delivery', 'GST']
           .map(
             (v) => PopupMenuItem<String>(
               value: v,
@@ -20283,6 +20346,7 @@ end tell
   Future<Dealer?> _showAddDealerDialog() async {
     final nameCtrl = TextEditingController();
     final phoneCtrl = TextEditingController();
+    final gstinCtrl = TextEditingController();
     String? error;
     return showDialog<Dealer>(
       context: context,
@@ -20329,6 +20393,21 @@ end tell
                   ),
                   decoration: _dlgInputDecor('Phone number'),
                 ),
+                const SizedBox(height: 16),
+                _dlgLabel('GSTIN (OPTIONAL)'),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: gstinCtrl,
+                  maxLength: 15,
+                  textCapitalization: TextCapitalization.characters,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textDark,
+                  ),
+                  decoration: _dlgInputDecor(
+                    'e.g. 33ABCDE1234F1Z5',
+                  ).copyWith(counterText: ''),
+                ),
                 if (error != null) ...[
                   const SizedBox(height: 10),
                   Text(
@@ -20374,10 +20453,20 @@ end tell
                   setD(() => error = 'A dealer with this name already exists.');
                   return;
                 }
+                final gstin = gstinCtrl.text.replaceAll(' ', '').toUpperCase();
+                if (gstin.isNotEmpty &&
+                    !RegExp(r'^[0-9]{2}[A-Z0-9]{13}$').hasMatch(gstin)) {
+                  setD(
+                    () => error =
+                        'GSTIN must be 15 letters/numbers, starting with the 2-digit state code.',
+                  );
+                  return;
+                }
                 final dealer = Dealer(
                   id: const Uuid().v4(),
                   name: name,
                   phone: phoneCtrl.text.trim(),
+                  gstin: gstin,
                   createdAt: DateTime.now().toIso8601String(),
                 );
                 await LocalDbService.insertDealer(dealer);
@@ -21361,6 +21450,8 @@ end tell
       fileName: '$prefix-$slug.$ext',
       type: FileType.custom,
       allowedExtensions: [ext],
+      // Owned by the BillCat window, so the box opens in front of it.
+      lockParentWindow: true,
     );
     if (path == null) return null;
     return path.toLowerCase().endsWith('.$ext') ? path : '$path.$ext';
@@ -22179,6 +22270,14 @@ end tell
                           color: AppColors.textMuted,
                         ),
                       ),
+                    if (d.gstin.isNotEmpty)
+                      Text(
+                        'GSTIN ${d.gstin}',
+                        style: GoogleFonts.inter(
+                          fontSize: 11.5,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -22696,82 +22795,359 @@ end tell
   }
 
   /// Single entry point for getting the period out of the app. The three
-  /// destinations live in the menu rather than as separate buttons.
+  /// destinations are offered in a box that opens from this button.
   Widget _gstExportMenu() {
-    final items = <(String, IconData, String)>[
-      ('zip', Icons.folder_zip_outlined, 'ZIP — all bills'),
-      ('csv', Icons.table_chart_outlined, 'CSV report'),
-      ('pdf', Icons.picture_as_pdf_outlined, 'PDF report'),
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: _showGstExportDialog,
+        child: Container(
+          height: 36,
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          decoration: BoxDecoration(
+            color: AppColors.primary,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.file_download_outlined,
+                color: Colors.white,
+                size: 16,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Export $_taxLabel record',
+                style: GoogleFonts.inter(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showGstExportDialog() async {
+    final items = <(String, IconData, String, String)>[
+      (
+        'zip',
+        Icons.folder_zip_outlined,
+        'All bills as PDF (ZIP)',
+        'Every $_taxLabel bill in this period, one PDF each',
+      ),
+      (
+        'csv',
+        Icons.table_chart_outlined,
+        'CSV report',
+        'Invoice list for your accountant, opens in Excel',
+      ),
+      (
+        'pdf',
+        Icons.picture_as_pdf_outlined,
+        'PDF report',
+        '$_taxLabel summary to print or share',
+      ),
+    ];
+    // First step: sales bills (made in BillCat) or purchases (stock bought
+    // from dealers).
+    final sections = <(String, IconData, String, String)>[
+      (
+        'sales',
+        Icons.receipt_long_outlined,
+        'Sales bills',
+        'Bills you made in BillCat, with $_taxLabel',
+      ),
+      (
+        'purchase',
+        Icons.local_shipping_outlined,
+        'Purchase bills',
+        'All purchase records from dealers (CSV). $_taxLabel worked out from rates',
+      ),
     ];
     // Every bill in the period, not just the taxable ones the register lists.
     final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
-    return PopupMenuButton<String>(
-      tooltip: '',
-      offset: const Offset(0, 44),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      color: Colors.white,
-      elevation: 4,
-      onSelected: (v) {
-        if (v == 'zip') _zipAllInvoices(_gstTaxableBills().$1, periodLabel);
-        if (v == 'csv') _exportGstCsv();
-        if (v == 'pdf') _saveGstPdf();
-      },
-      itemBuilder: (_) => items
-          .map(
-            (e) => PopupMenuItem<String>(
-              value: e.$1,
-              height: 40,
-              child: Row(
+    String? section;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (dialogCtx, setLocal) {
+          Widget tile((String, IconData, String, String) e, VoidCallback onTap) =>
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    onTap: onTap,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                      decoration: BoxDecoration(
+                        color: AppColors.surfaceVariant,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: AppColors.border),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(e.$2, size: 22, color: AppColors.primary),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  e.$3,
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: AppColors.textDark,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  e.$4,
+                                  style: GoogleFonts.inter(
+                                    fontSize: 11.5,
+                                    color: AppColors.textMuted,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+
+          final onSales = section == 'sales';
+          return Dialog(
+            backgroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: SizedBox(
+              width: 380,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(e.$2, size: 16, color: AppColors.textMuted),
-                  const SizedBox(width: 10),
-                  Text(
-                    e.$3,
-                    style: GoogleFonts.inter(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                      color: AppColors.textDark,
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 18, 20, 4),
+                    child: Text(
+                      onSales ? 'Export sales bills' : 'Export $_taxLabel record',
+                      style: GoogleFonts.manrope(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.textDark,
+                      ),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 14),
+                    child: Text(
+                      periodLabel,
+                      style: GoogleFonts.inter(
+                        fontSize: 12.5,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ),
+                  const Divider(height: 1, color: AppColors.border),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+                    child: Column(
+                      children: [
+                        if (onSales)
+                          for (final e in items)
+                            tile(e, () => Navigator.pop(dialogCtx, e.$1))
+                        else
+                          for (final s in sections)
+                            tile(
+                              s,
+                              () => s.$1 == 'sales'
+                                  ? setLocal(() => section = 'sales')
+                                  : Navigator.pop(dialogCtx, 'purchase'),
+                            ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                    child: Row(
+                      children: [
+                        if (onSales)
+                          TextButton(
+                            onPressed: () => setLocal(() => section = null),
+                            child: const Text('Back'),
+                          ),
+                        const Spacer(),
+                        TextButton(
+                          onPressed: () => Navigator.pop(dialogCtx),
+                          child: const Text('Cancel'),
+                        ),
+                      ],
                     ),
                   ),
                 ],
               ),
             ),
-          )
-          .toList(),
-      child: Container(
-        height: 36,
-        padding: const EdgeInsets.symmetric(horizontal: 14),
-        decoration: BoxDecoration(
-          color: AppColors.primary,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(
-              Icons.file_download_outlined,
-              color: Colors.white,
-              size: 16,
-            ),
-            const SizedBox(width: 8),
-            Text(
-              'Export $_taxLabel record',
-              style: GoogleFonts.inter(
-                fontSize: 12.5,
-                fontWeight: FontWeight.w600,
-                color: Colors.white,
-              ),
-            ),
-            const SizedBox(width: 2),
-            const Icon(
-              Icons.keyboard_arrow_down_rounded,
-              color: Colors.white,
-              size: 16,
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
+    // Run the export after the box has closed, so the Save box opens over
+    // the BillCat window rather than this dialog.
+    if (!mounted || choice == null) return;
+    if (choice == 'zip') _zipAllInvoices(_gstTaxableBills().$1, periodLabel);
+    if (choice == 'csv') _exportGstCsv();
+    if (choice == 'pdf') _saveGstPdf();
+    if (choice == 'purchase') _exportPurchaseCsv();
+  }
+
+  /// Every purchase record, as a CSV in the same B2BINV layout as the sales
+  /// export: all products with a purchase date or a dealer, whatever period
+  /// the GST page shows. BillCat keeps only the last purchase date, dealer and
+  /// buying price per product (no supplier invoice number, quantity bought or
+  /// tax paid), so, as agreed with the owner:
+  /// - each dealer + purchase day is one invoice (INV_NO left blank);
+  /// - TAXABLE is buying price x current stock (as on the Dealers report);
+  /// - the rate is the product's own GST rate, else the store rate, and the
+  ///   tax is worked out from it;
+  /// - IGST when the dealer's GSTIN is from another state than the store's,
+  ///   otherwise CGST + SGST.
+  Future<void> _exportPurchaseCsv() async {
+    // Stored dates can be a plain yyyy-MM-dd or a full UTC timestamp, so
+    // order by the local calendar day.
+    String? localDay(String iso) {
+      final t = _parseDate(iso);
+      return t == null ? null : _isoDate(t.toLocal());
+    }
+
+    final bought = _products.where((p) {
+      return localDay(p.purchaseDate) != null ||
+          p.dealerName.trim().isNotEmpty;
+    }).toList()
+      ..sort((a, b) {
+        // Oldest first; products with no purchase date go last.
+        final da = localDay(a.purchaseDate);
+        final db = localDay(b.purchaseDate);
+        if (da != db) {
+          if (da == null) return 1;
+          if (db == null) return -1;
+          return da.compareTo(db);
+        }
+        return a.dealerName.compareTo(b.dealerName);
+      });
+    if (bought.isEmpty) {
+      _showToast('No purchase records found', isError: true);
+      return;
+    }
+
+    String n(double v) {
+      final s = v.toStringAsFixed(2);
+      final t = s.replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
+      return t == '-0' ? '0' : t;
+    }
+
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    String d(String iso) {
+      final t = _parseDate(iso)?.toLocal();
+      if (t == null) return '';
+      return '${t.day.toString().padLeft(2, '0')}-${months[t.month - 1]}-'
+          '${(t.year % 100).toString().padLeft(2, '0')}';
+    }
+
+    // Products carry only the dealer's name; the GSTIN lives in the dealer
+    // directory.
+    final gstinByDealer = {
+      for (final dl in await LocalDbService.getDealers())
+        dl.name.trim().toLowerCase(): dl.gstin,
+    };
+    final storeRate = double.tryParse(_taxRateDisplay) ?? 0;
+    final storeState = _gstStateCode(_storeGstin);
+    final pos = _storePlaceOfSupply();
+
+    // One invoice per dealer + purchase day, in the (already sorted) order of
+    // [bought]; within it, taxable value per GST rate.
+    final invoices = <String, ({Product first, Map<double, double> byRate})>{};
+    for (final p in bought) {
+      final key =
+          '${p.dealerName.trim().toLowerCase()}|${localDay(p.purchaseDate) ?? ''}';
+      final rate = p.taxPercent > 0 ? p.taxPercent : storeRate;
+      final inv = invoices.putIfAbsent(
+        key,
+        () => (first: p, byRate: <double, double>{}),
+      );
+      inv.byRate[rate] = (inv.byRate[rate] ?? 0) + p.buyingPrice * p.stock;
+    }
+
+    final b = StringBuffer();
+    b.writeln(
+      'GST,NAME,INV_NO,INV_DATE,NET_AMT,POS,RC,APP_TAX,ITYPE,EC,TAX,TAXABLE,'
+      'TAX_AMT,IGST,CGST,SGST',
+    );
+    var rows = 0;
+    for (final inv in invoices.values) {
+      final dealer = inv.first.dealerName.trim();
+      final gstin = gstinByDealer[dealer.toLowerCase()] ?? '';
+      final dealerState = _gstStateCode(gstin);
+      final interState = dealerState.isNotEmpty &&
+          storeState.isNotEmpty &&
+          dealerState != storeState;
+      // Rate slabs worth nothing (zero stock or no buying price) are skipped.
+      final slabs = inv.byRate.entries
+          .where((e) => e.value.abs() >= 0.005)
+          .toList()
+        ..sort((a, b) => a.key.compareTo(b.key));
+      final net = slabs.fold<double>(
+        0,
+        (s, e) => s + e.value + e.value * e.key / 100,
+      );
+      for (final e in slabs) {
+        final tax = e.value * e.key / 100;
+        b.writeln(
+          '${_csvCell(gstin)},${_csvCell(dealer)},,'
+          '${d(inv.first.purchaseDate)},${n(net)},${_csvCell(pos)},N,,Regular,,'
+          '${_formatRate(e.key)},${n(e.value)},${n(tax)},'
+          '${interState ? n(tax) : '0'},'
+          '${interState ? '0' : n(tax / 2)},${interState ? '0' : n(tax / 2)}',
+        );
+        rows++;
+      }
+    }
+    if (rows == 0) {
+      if (mounted) {
+        _showToast('No purchase records with a value found', isError: true);
+      }
+      return;
+    }
+
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: 'Save purchase list',
+      fileName: 'purchases-all.csv',
+      type: FileType.custom,
+      allowedExtensions: ['csv'],
+      lockParentWindow: true,
+    );
+    if (path == null) return;
+    try {
+      final withExt = path.toLowerCase().endsWith('.csv') ? path : '$path.csv';
+      await File(withExt).writeAsString(b.toString());
+      if (mounted) _showToast('Saved $withExt');
+    } catch (e) {
+      if (mounted) _showToast('Could not save: $e', isError: true);
+    }
   }
 
   /// One row per invoice, with CGST/SGST derived from the rate each line
@@ -23490,6 +23866,7 @@ end tell
       fileName: 'gst-$slug.pdf',
       type: FileType.custom,
       allowedExtensions: ['pdf'],
+      lockParentWindow: true,
     );
     if (path == null) return;
     try {
@@ -23501,93 +23878,107 @@ end tell
     }
   }
 
+  /// GST state codes (first two digits of a GSTIN) to state names.
+  static const Map<String, String> _gstStates = {
+    '01': 'Jammu and Kashmir', '02': 'Himachal Pradesh', '03': 'Punjab',
+    '04': 'Chandigarh', '05': 'Uttarakhand', '06': 'Haryana', '07': 'Delhi',
+    '08': 'Rajasthan', '09': 'Uttar Pradesh', '10': 'Bihar', '11': 'Sikkim',
+    '12': 'Arunachal Pradesh', '13': 'Nagaland', '14': 'Manipur',
+    '15': 'Mizoram', '16': 'Tripura', '17': 'Meghalaya', '18': 'Assam',
+    '19': 'West Bengal', '20': 'Jharkhand', '21': 'Odisha',
+    '22': 'Chhattisgarh', '23': 'Madhya Pradesh', '24': 'Gujarat',
+    '26': 'Dadra and Nagar Haveli and Daman and Diu', '27': 'Maharashtra',
+    '29': 'Karnataka', '30': 'Goa', '31': 'Lakshadweep', '32': 'Kerala',
+    '33': 'Tamil Nadu', '34': 'Puducherry', '35': 'Andaman and Nicobar Islands',
+    '36': 'Telangana', '37': 'Andhra Pradesh', '38': 'Ladakh',
+    '97': 'Other Territory',
+  };
+
+  /// State code of a GSTIN, or '' when it does not start with a known code.
+  static String _gstStateCode(String gstin) {
+    final g = gstin.trim();
+    final code = g.length >= 2 ? g.substring(0, 2) : '';
+    return _gstStates.containsKey(code) ? code : '';
+  }
+
+  /// "33-Tamil Nadu" style place of supply from the store GSTIN, or ''.
+  String _storePlaceOfSupply() {
+    final code = _gstStateCode(_storeGstin);
+    return code.isEmpty ? '' : '$code-${_gstStates[code]}';
+  }
+
   static String _csvCell(String v) => v.contains(RegExp(r'[",\n]'))
       ? '"${v.replaceAll('"', '""')}"'
       : v;
 
   Future<void> _exportGstCsv() async {
-    final (txns, excludedBills) = _gstTaxableBills();
+    final (taxable, _) = _gstTaxableBills();
+    // A bill sold with GST switched off stores no rate on any line and no tax.
+    // _gstFallbackRate would price it at today's store rate, so leave it out
+    // rather than report tax the customer never paid. Bills from before
+    // per-line rates still carry stored tax and stay in.
+    final txns = taxable
+        .where(
+          (t) =>
+              t.items.any((i) => i.taxPercent > 0) ||
+              t.taxAmount.abs() >= 0.005,
+        )
+        .toList();
     if (txns.isEmpty) {
       _showToast('No bills in this period', isError: true);
       return;
     }
     final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
-    final agg = _gstAggregate(txns);
-    final rates = agg.byRate.keys.toList()..sort();
-    final computedTax =
-        agg.byRate.values.fold<double>(0, (s, v) => s + v.$2) +
-        agg.unallocatedTax;
-    final computedTaxable =
-        agg.byRate.values.fold<double>(0, (s, v) => s + v.$1) +
-        agg.unallocatedTaxable;
-    final hasUnallocated =
-        agg.unallocatedTax.abs() >= 0.005 ||
-        agg.unallocatedTaxable.abs() >= 0.005;
 
-    String n(double v) => v.toStringAsFixed(2);
+    // Numbers without trailing zeros (1734.5, 86.73), as in the B2BINV sheet.
+    String n(double v) {
+      final s = v.toStringAsFixed(2);
+      final t = s.contains('.')
+          ? s.replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '')
+          : s;
+      return t == '-0' ? '0' : t;
+    }
+
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    String d(DateTime t) =>
+        '${t.day.toString().padLeft(2, '0')}-${months[t.month - 1]}-'
+        '${(t.year % 100).toString().padLeft(2, '0')}';
+
+    // Place of supply is not recorded per bill, so it is taken from the state
+    // code at the start of the store GSTIN.
+    final pos = _storePlaceOfSupply();
+
+    final sorted = [...txns]..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
     final b = StringBuffer();
-    b.writeln('${_csvCell('$_taxLabel Summary')},${_csvCell(periodLabel)}');
-    if (_storeGstin.trim().isNotEmpty) {
-      b.writeln('GSTIN,${_csvCell(_storeGstin.trim())}');
-    }
-    b.writeln('Bills,${agg.bills}');
-    b.writeln('Taxable value on bills,${n(agg.recordedTaxable)}');
-    b.writeln('Tax recorded on bills,${n(agg.recordedTax)}');
-    b.writeln();
-    b.writeln('Rate %,Taxable Value,CGST,SGST,Total Tax');
-    for (final r in rates) {
-      final v = agg.byRate[r]!;
+    b.writeln(
+      'GST,NAME,INV_NO,INV_DATE,NET_AMT,POS,RC,APP_TAX,ITYPE,EC,TAX,TAXABLE,'
+      'TAX_AMT,IGST,CGST,SGST',
+    );
+    void row(TransactionRecord t, double rate, double taxable, double tax) {
       b.writeln(
-        '${_formatRate(r)},${n(v.$1)},${n(v.$2 / 2)},${n(v.$2 / 2)},${n(v.$2)}',
+        ',${_csvCell(t.customerName ?? '')},${_csvCell(t.displayInvoice)},'
+        '${d(t.createdAt)},${n(t.total)},${_csvCell(pos)},N,,Regular,,'
+        '${_formatRate(rate)},${n(taxable)},${n(tax)},0,'
+        '${n(tax / 2)},${n(tax / 2)}',
       );
     }
-    if (hasUnallocated) {
-      b.writeln(
-        'Unallocated,${n(agg.unallocatedTaxable)},,,${n(agg.unallocatedTax)}',
-      );
-    }
-    b.writeln(
-      'Total,${n(computedTaxable)},${n(computedTax / 2)},${n(computedTax / 2)},'
-      '${n(computedTax)}',
-    );
-    b.writeln();
-    b.writeln(
-      _csvCell(
-        'CGST and SGST are an equal half of the tax, the same split the '
-        'invoices print. Place of supply is not recorded. HSN codes are not '
-        'stored. Bills made before per-item rates existed are counted at the '
-        'current store rate of $_taxRateDisplay%.',
-      ),
-    );
 
-    // Invoice-wise register. Every taxable bill in the period, so the summary
-    // above can be traced back to the bills it came from.
-    final reg = _gstInvoiceRows(txns);
-    b.writeln();
-    b.writeln('Invoices,${reg.rows.length}');
-    b.writeln('Date,Invoice,Customer,Rate %,Taxable Value,CGST,SGST,Total Tax');
-    for (final r in reg.rows) {
-      b.writeln(
-        '${r.date.toIso8601String().substring(0, 16).replaceFirst('T', ' ')},'
-        '${_csvCell(r.invoice)},${_csvCell(r.customer)},'
-        '${_csvCell(r.rates.map(_formatRate).join(' + '))},'
-        '${n(r.taxable)},${n(r.tax / 2)},${n(r.tax / 2)},${n(r.tax)}',
-      );
-    }
-    // reg.excluded is 0 by construction now — the untaxed bills were dropped
-    // before the aggregate was built — so report the count from the source
-    // filter instead, and keep it to a single line rather than listing them.
-    if (excludedBills > 0) {
-      b.writeln();
-      b.writeln(
-        _csvCell(
-          '$excludedBills bill(s) in this period carried no $_taxLabel and are '
-          'excluded from every figure above. They are not taxable supplies, '
-          'but exempt or nil-rated sales among them still belong in '
-          'GSTR-3B 3.1(c).',
-        ),
-      );
+    // One row per tax rate per bill, like the B2BINV sheet. Every bill here
+    // already splits by rate (_gstTaxableBills drops the ones that don't), so
+    // the CSV covers the same bills as the GST page.
+    for (final t in sorted) {
+      final split = _gstSplitBill(t, _gstFallbackRate(t));
+      final rates = split.byRate.keys.where((r) => r > 0).toList()..sort();
+      for (final r in rates) {
+        final v = split.byRate[r]!;
+        // A free item at a different rate leaves a slab worth nothing.
+        if (v.$1.abs() < 0.005 && v.$2.abs() < 0.005) continue;
+        row(t, r, v.$1, v.$2);
+      }
     }
 
     final slug = periodLabel
@@ -23598,6 +23989,7 @@ end tell
       fileName: 'gst-$slug.csv',
       type: FileType.custom,
       allowedExtensions: ['csv'],
+      lockParentWindow: true,
     );
     if (path == null) return;
     try {

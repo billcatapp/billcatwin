@@ -86,6 +86,10 @@ class LocalDbService {
       'deleted': 'INTEGER NOT NULL DEFAULT 0',
       'rev': 'INTEGER NOT NULL DEFAULT 0',
     },
+    // Local-only table; added to existing installs by _healSchema.
+    'dealers': {
+      'gstin': "TEXT NOT NULL DEFAULT ''",
+    },
   };
 
   static Future<void> _healSchema(Database db) async {
@@ -316,6 +320,7 @@ class LocalDbService {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       phone TEXT NOT NULL DEFAULT '',
+      gstin TEXT NOT NULL DEFAULT '',
       notes TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT '',
       deleted INTEGER NOT NULL DEFAULT 0
