@@ -110,10 +110,24 @@ class TransactionRecord {
   static const String returnPrefix = 'RTN-';
   static const String exchangePrefix = 'EXC-';
 
+  /// Series heads for the `INV/<fy>/<seq>` numbering. A reversal carries the
+  /// original bill's financial year and sequence under its own head, so
+  /// 'RTN/26-27/0042' reverses 'INV/26-27/0042'. That keeps the link to the
+  /// original without a column of its own, and keeps the number inside the
+  /// GST 16-character limit that 'RTN-INV/26-27/0042' would break.
+  /// Bills issued under the older 8-character format still carry the
+  /// [returnPrefix]/[exchangePrefix] form and are read below unchanged.
+  static const String salesSeries = 'INV/';
+  static const String returnSeries = 'RTN/';
+  static const String exchangeSeries = 'EXC/';
+
   /// The invoice this record reverses, or null for an ordinary sale.
   String? get returnOfInvoice {
     final n = invoiceNumber;
     if (n == null) return null;
+    if (n.startsWith(returnSeries) || n.startsWith(exchangeSeries)) {
+      return '$salesSeries${n.substring(returnSeries.length)}';
+    }
     if (n.startsWith(returnPrefix)) return n.substring(returnPrefix.length);
     if (n.startsWith(exchangePrefix)) return n.substring(exchangePrefix.length);
     return null;
@@ -123,7 +137,9 @@ class TransactionRecord {
   /// carries a negative total, and must not be mistaken for a return.
   bool get isReturn => returnOfInvoice != null;
 
-  bool get isExchange => invoiceNumber?.startsWith(exchangePrefix) ?? false;
+  bool get isExchange =>
+      (invoiceNumber?.startsWith(exchangePrefix) ?? false) ||
+      (invoiceNumber?.startsWith(exchangeSeries) ?? false);
 
   /// 'EXCHANGE' / 'RETURN' for reversing records, null for a normal sale.
   String? get reversalLabel =>

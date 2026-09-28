@@ -18,6 +18,8 @@ class _SignupScreenState extends State<SignupScreen> {
   final _emailCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
   final _confirmCtrl = TextEditingController();
+  final _passwordFocus = FocusNode();
+  final _confirmFocus = FocusNode();
   bool _obscurePassword = true;
   bool _obscureConfirm = true;
   bool _agreedToTerms = false;
@@ -32,6 +34,8 @@ class _SignupScreenState extends State<SignupScreen> {
     _emailCtrl.dispose();
     _passwordCtrl.dispose();
     _confirmCtrl.dispose();
+    _passwordFocus.dispose();
+    _confirmFocus.dispose();
     super.dispose();
   }
 
@@ -270,6 +274,9 @@ class _SignupScreenState extends State<SignupScreen> {
                           controller: _emailCtrl,
                           hint: 'name@company.com',
                           icon: Icons.alternate_email_rounded,
+                          textInputAction: TextInputAction.next,
+                          onFieldSubmitted: (_) =>
+                              _passwordFocus.requestFocus(),
                           validator: (v) =>
                               v != null && v.contains('@')
                                   ? null
@@ -283,6 +290,9 @@ class _SignupScreenState extends State<SignupScreen> {
                           hint: 'Min. 6 characters',
                           icon: Icons.lock_outline_rounded,
                           obscure: _obscurePassword,
+                          focusNode: _passwordFocus,
+                          textInputAction: TextInputAction.next,
+                          onFieldSubmitted: (_) => _confirmFocus.requestFocus(),
                           suffixIcon: IconButton(
                             icon: Icon(
                               _obscurePassword
@@ -307,6 +317,11 @@ class _SignupScreenState extends State<SignupScreen> {
                           hint: 'Re-enter your password',
                           icon: Icons.lock_outline_rounded,
                           obscure: _obscureConfirm,
+                          focusNode: _confirmFocus,
+                          textInputAction: TextInputAction.done,
+                          onFieldSubmitted: (_) {
+                            if (!_isLoading) _signup();
+                          },
                           suffixIcon: IconButton(
                             icon: Icon(
                               _obscureConfirm
@@ -560,9 +575,15 @@ class _SignupScreenState extends State<SignupScreen> {
     bool obscure = false,
     Widget? suffixIcon,
     String? Function(String?)? validator,
+    FocusNode? focusNode,
+    TextInputAction? textInputAction,
+    void Function(String)? onFieldSubmitted,
   }) {
     return TextFormField(
       controller: controller,
+      focusNode: focusNode,
+      textInputAction: textInputAction,
+      onFieldSubmitted: onFieldSubmitted,
       obscureText: obscure,
       validator: validator,
       style: GoogleFonts.inter(fontSize: 13, color: const Color(0xFF0F172A)),

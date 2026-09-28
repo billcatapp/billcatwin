@@ -10279,6 +10279,26 @@ class _BillingScreenState extends State<BillingScreen> {
   /// ('RTN-<number>') points back at exactly the bill it reverses.
   String _reversalBaseRef(TransactionRecord t) => t.displayInvoice;
 
+  /// The number a reversal of [original] carries. A bill numbered
+  /// 'INV/26-27/0042' is reversed by 'RTN/26-27/0042' (or 'EXC/...'): the
+  /// original's financial year and sequence under the reversal's own head,
+  /// which keeps the number GST-legal at 14 characters. A bill issued under
+  /// the older 8-character format keeps the original `RTN-<number>` form, so
+  /// every reversal already on file still points where it always did.
+  String _reversalInvoice(TransactionRecord original, {required bool exchange}) {
+    final base = _reversalBaseRef(original);
+    if (base.startsWith(TransactionRecord.salesSeries)) {
+      final head = exchange
+          ? TransactionRecord.exchangeSeries
+          : TransactionRecord.returnSeries;
+      return '$head${base.substring(TransactionRecord.salesSeries.length)}';
+    }
+    final prefix = exchange
+        ? TransactionRecord.exchangePrefix
+        : TransactionRecord.returnPrefix;
+    return '$prefix$base';
+  }
+
   /// Quantity of each line of [original] that earlier returns already took
   /// back, keyed the same way the cart keys lines. Stops the same item being
   /// returned twice and inflating stock.
@@ -10360,12 +10380,9 @@ class _BillingScreenState extends State<BillingScreen> {
     final discount = origSub > 0
         ? original.discountAmount * (sub / origSub)
         : 0.0;
-    final prefix = exchange
-        ? TransactionRecord.exchangePrefix
-        : TransactionRecord.returnPrefix;
     return TransactionRecord(
       id: const Uuid().v4(),
-      invoiceNumber: '$prefix${_reversalBaseRef(original)}',
+      invoiceNumber: _reversalInvoice(original, exchange: exchange),
       customerName: original.customerName,
       customerPhone: original.customerPhone,
       items: items,
@@ -10484,7 +10501,7 @@ class _BillingScreenState extends State<BillingScreen> {
     TransactionRecord? picked;
     // Fixed id for the exchange's new-sale row, so its #XXXXXX number is the
     // same whether the receipt is printed before or after completing.
-    final exchangeSaleInvoice = LocalDbService.generateInvoiceId();
+    final exchangeSaleInvoice = await LocalDbService.nextInvoiceNumber();
     // Line index -> 'return' or 'exchange'. Absent means "keeping it".
     var mode = <int, String>{};
     var cap = <int, int>{};
@@ -10614,8 +10631,7 @@ class _BillingScreenState extends State<BillingScreen> {
             if (rev == null) return sale; // adding only, nothing returned
             return TransactionRecord(
               id: const Uuid().v4(),
-              invoiceNumber:
-                  '${TransactionRecord.exchangePrefix}${_reversalBaseRef(picked!)}',
+              invoiceNumber: _reversalInvoice(picked!, exchange: true),
               customerName: picked!.customerName,
               customerPhone: picked!.customerPhone,
               items: [...rev.items, ...sale.items],
@@ -11502,12 +11518,12 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  void _printCurrentBill(
+  Future<void> _printCurrentBill(
     CartProvider cart, {
     String docType = 'Invoice',
     bool toPrinter = false,
-  }) {
-    _pendingInvoiceNumber ??= LocalDbService.generateInvoiceId();
+  }) async {
+    _pendingInvoiceNumber ??= await LocalDbService.nextInvoiceNumber();
     _printRecord(
       _snapshotCart(cart, invoiceNumber: _pendingInvoiceNumber),
       docType: docType,
@@ -12059,7 +12075,7 @@ class _BillingScreenState extends State<BillingScreen> {
             // the receipt and the saved sale share one invoice number.
             final invNum =
                 _pendingInvoiceNumber ??
-                LocalDbService.generateInvoiceId();
+                await LocalDbService.nextInvoiceNumber();
             _pendingInvoiceNumber = null;
             final snapshot = _snapshotCart(
               cart,
@@ -12422,7 +12438,8 @@ class _BillingScreenState extends State<BillingScreen> {
       return;
     }
     // Same invoice-number reuse and failure recovery as the confirm dialog.
-    final invNum = _pendingInvoiceNumber ?? LocalDbService.generateInvoiceId();
+    final invNum =
+        _pendingInvoiceNumber ?? await LocalDbService.nextInvoiceNumber();
     _pendingInvoiceNumber = null;
     final snapshot = _snapshotCart(cart, invoiceNumber: invNum);
     final phone = cart.customerPhone;
@@ -22711,33 +22728,6 @@ end tell
     );
   }
 
-  /// Rate-slab selector. Display only — nothing is dropped from the totals
-  /// line or from the export.
-  Widget _gstRateChip(String label, double? rate) {
-    final active = _gstRateFilter == rate;
-    return GestureDetector(
-      onTap: () => setState(() => _gstRateFilter = rate),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        decoration: BoxDecoration(
-          color: active ? AppColors.accentBlue : Colors.white,
-          borderRadius: BorderRadius.circular(7),
-          border: Border.all(
-            color: active ? AppColors.accentBlue : AppColors.border,
-          ),
-        ),
-        child: Text(
-          label,
-          style: GoogleFonts.inter(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w600,
-            color: active ? Colors.white : AppColors.textMuted,
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _gstCustomBtn() {
     final active = _gstPeriod == 'Custom';
     return GestureDetector(
@@ -23526,7 +23516,6 @@ end tell
     List<TransactionRecord> txns,
     int excludedBills,
   ) {
-    final rates = agg.byRate.keys.toList()..sort();
     final computedTax =
         agg.byRate.values.fold<double>(0, (s, v) => s + v.$2) +
         agg.unallocatedTax;
@@ -23551,28 +23540,6 @@ end tell
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (rates.length > 1) ...[
-            Row(
-              children: [
-                Text(
-                  'SHOW',
-                  style: GoogleFonts.inter(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w600,
-                    color: AppColors.textMuted,
-                    letterSpacing: 0.8,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                _gstRateChip('All rates', null),
-                for (final r in rates) ...[
-                  const SizedBox(width: 8),
-                  _gstRateChip('${_formatRate(r)}%', r),
-                ],
-              ],
-            ),
-            const SizedBox(height: 18),
-          ],
           Row(
             children: [
               _reportSummaryCard(

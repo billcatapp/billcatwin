@@ -20,6 +20,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
+  final _passwordFocus = FocusNode();
   bool _obscurePassword = true;
   bool _isLoading = false;
   bool _googleLoading = false;
@@ -46,6 +47,7 @@ class _LoginScreenState extends State<LoginScreen> {
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
+    _passwordFocus.dispose();
     super.dispose();
   }
 
@@ -338,6 +340,9 @@ class _LoginScreenState extends State<LoginScreen> {
                               _buildField(
                                 controller: _emailController,
                                 hint: 'manager@business.com',
+                                textInputAction: TextInputAction.next,
+                                onFieldSubmitted: (_) =>
+                                    _passwordFocus.requestFocus(),
                                 validator: (v) => v != null && v.contains('@')
                                     ? null
                                     : 'Enter a valid email',
@@ -372,6 +377,11 @@ class _LoginScreenState extends State<LoginScreen> {
                                 controller: _passwordController,
                                 hint: '••••••••',
                                 obscure: _obscurePassword,
+                                focusNode: _passwordFocus,
+                                textInputAction: TextInputAction.done,
+                                onFieldSubmitted: (_) {
+                                  if (!_isLoading) _login();
+                                },
                                 suffixIcon: IconButton(
                                   icon: Icon(
                                     _obscurePassword
@@ -576,9 +586,15 @@ class _LoginScreenState extends State<LoginScreen> {
     bool obscure = false,
     Widget? suffixIcon,
     String? Function(String?)? validator,
+    FocusNode? focusNode,
+    TextInputAction? textInputAction,
+    void Function(String)? onFieldSubmitted,
   }) {
     return TextFormField(
       controller: controller,
+      focusNode: focusNode,
+      textInputAction: textInputAction,
+      onFieldSubmitted: onFieldSubmitted,
       obscureText: obscure,
       validator: validator,
       style: GoogleFonts.inter(fontSize: 14, color: const Color(0xFF0F172A)),

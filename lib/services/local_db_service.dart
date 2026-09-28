@@ -1,3 +1,4 @@
+import 'dart:convert' show jsonEncode;
 import 'dart:io';
 import 'dart:math' show Random;
 import 'package:path_provider/path_provider.dart';
@@ -8,6 +9,7 @@ import '../models/customer.dart';
 import '../models/dealer.dart';
 import '../models/product.dart';
 import '../models/product_variant.dart';
+import '../models/purchase.dart';
 import '../models/transaction_record.dart';
 
 class LocalDbService {
@@ -90,6 +92,14 @@ class LocalDbService {
     'dealers': {
       'gstin': "TEXT NOT NULL DEFAULT ''",
     },
+    'purchases': {
+      'dealer_gstin': "TEXT NOT NULL DEFAULT ''",
+      'place_of_supply': "TEXT NOT NULL DEFAULT ''",
+      'reverse_charge': 'INTEGER NOT NULL DEFAULT 0',
+      'notes': "TEXT NOT NULL DEFAULT ''",
+      'deleted': 'INTEGER NOT NULL DEFAULT 0',
+      'rev': 'INTEGER NOT NULL DEFAULT 0',
+    },
   };
 
   static Future<void> _healSchema(Database db) async {
@@ -100,6 +110,9 @@ class LocalDbService {
     try {
       await db.execute(_dealersTableSql);
       await _seedDealersFromProducts(db);
+    } catch (_) {}
+    try {
+      await db.execute(_purchasesTableSql);
     } catch (_) {}
     for (final table in _expectedColumns.entries) {
       final Set<String> present;
@@ -128,7 +141,7 @@ class LocalDbService {
   static Future<Database> _openVersioned(String dbPath, String userId) async {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 18,
+      version: 19,
       // Hardening against "database is locked" (SQLITE_BUSY) when another
       // process briefly holds the file (leftover instance, antivirus scan):
       // WAL lets readers and writers coexist, and busy_timeout makes a write
@@ -307,6 +320,15 @@ class LocalDbService {
             );
           } catch (_) {}
         }
+        if (oldVersion < 19) {
+          // Supplier bills, so a GST purchase register can be reported with
+          // the supplier's own invoice number and per-line HSN. Nothing
+          // existing is read or rewritten; _healSchema re-creates the table
+          // if this ALTER is ever swallowed.
+          try {
+            await db.execute(_purchasesTableSql);
+          } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -324,6 +346,28 @@ class LocalDbService {
       notes TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT '',
       deleted INTEGER NOT NULL DEFAULT 0
+    )
+  ''';
+
+  /// Supplier bills, one row per invoice with the lines as JSON — the same
+  /// shape `transactions` uses, so purchases need one table and one sync
+  /// binding rather than a parent/child pair.
+  static const String _purchasesTableSql = '''
+    CREATE TABLE IF NOT EXISTS purchases (
+      id TEXT PRIMARY KEY,
+      dealer_id TEXT NOT NULL DEFAULT '',
+      dealer_name TEXT NOT NULL DEFAULT '',
+      dealer_gstin TEXT NOT NULL DEFAULT '',
+      invoice_no TEXT NOT NULL DEFAULT '',
+      invoice_date TEXT NOT NULL DEFAULT '',
+      place_of_supply TEXT NOT NULL DEFAULT '',
+      reverse_charge INTEGER NOT NULL DEFAULT 0,
+      notes TEXT NOT NULL DEFAULT '',
+      items TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT '',
+      synced INTEGER NOT NULL DEFAULT 0,
+      deleted INTEGER NOT NULL DEFAULT 0,
+      rev INTEGER NOT NULL DEFAULT 0
     )
   ''';
 
@@ -413,6 +457,7 @@ class LocalDbService {
       )
     ''');
     await db.execute(_productVariantsTableSql);
+    await db.execute(_purchasesTableSql);
   }
 
   // ── Invoice ID ───────────────────────────────────────────────────────────
@@ -423,6 +468,74 @@ class LocalDbService {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     final rng = Random.secure();
     return List.generate(8, (_) => chars[rng.nextInt(chars.length)]).join();
+  }
+
+  /// Series head for an ordinary sale under the `INV/<fy>/<seq>` numbering.
+  static const String invoicePrefix = 'INV';
+
+  /// The Indian financial year [on] falls in, as '26-27' for
+  /// 1 Apr 2026 – 31 Mar 2027. April opens the year, so January to March
+  /// belong to the year that started the previous April.
+  static String financialYear(DateTime on) {
+    final startYear = on.month >= 4 ? on.year : on.year - 1;
+    final from = (startYear % 100).toString().padLeft(2, '0');
+    final to = ((startYear + 1) % 100).toString().padLeft(2, '0');
+    return '$from-$to';
+  }
+
+  /// The next sequential invoice number, e.g. 'INV/26-27/0001'.
+  ///
+  /// The sequence is read back from the bills already stored rather than from
+  /// a stored counter, so a bill that arrives from the cloud raises the
+  /// ceiling on its own. Soft-deleted rows are counted deliberately: a
+  /// deleted bill leaves a permanent gap rather than handing its number to
+  /// the next sale. Past 9999 the sequence widens to five digits instead of
+  /// wrapping back to 0001.
+  static Future<String> nextInvoiceNumber([DateTime? on]) async {
+    final when = on ?? DateTime.now();
+    final head = '$invoicePrefix/${financialYear(when)}/';
+    final database = await db;
+    final rows = await database.query(
+      'transactions',
+      columns: ['invoice_number'],
+      where: 'invoice_number LIKE ?',
+      whereArgs: ['$head%'],
+    );
+    var highest = 0;
+    for (final r in rows) {
+      final number = r['invoice_number'] as String?;
+      if (number == null) continue;
+      final seq = int.tryParse(number.substring(head.length));
+      if (seq != null && seq > highest) highest = seq;
+    }
+    // Nothing in this series yet on a till that already has history: carry on
+    // from the bills already raised this financial year instead of restarting
+    // at 0001, so an existing shop's books show no mid-year reset.
+    if (highest == 0) highest = await _billsThisFinancialYear(when);
+    return '$head${(highest + 1).toString().padLeft(4, '0')}';
+  }
+
+  /// How many bills were already raised in [on]'s financial year, under any
+  /// numbering. Used once, to seed the sequence on a till that is meeting the
+  /// INV series for the first time.
+  ///
+  /// Reversals are left out: a return is not itself a fresh sale invoice.
+  /// Soft-deleted rows are counted, for the same reason the sequence is taken
+  /// from the highest issued rather than a live count — a number that has
+  /// been used must not be handed out again.
+  static Future<int> _billsThisFinancialYear(DateTime on) async {
+    final startYear = on.month >= 4 ? on.year : on.year - 1;
+    final database = await db;
+    final rows = await database.rawQuery(
+      'SELECT COUNT(*) AS c FROM transactions '
+      'WHERE substr(created_at, 1, 10) >= ? AND substr(created_at, 1, 10) <= ? '
+      "AND COALESCE(invoice_number, '') NOT LIKE 'RTN-%' "
+      "AND COALESCE(invoice_number, '') NOT LIKE 'EXC-%' "
+      "AND COALESCE(invoice_number, '') NOT LIKE 'RTN/%' "
+      "AND COALESCE(invoice_number, '') NOT LIKE 'EXC/%'",
+      ['$startYear-04-01', '${startYear + 1}-03-31'],
+    );
+    return (rows.first['c'] as int?) ?? 0;
   }
 
   // ── Settings ──────────────────────────────────────────────────────────────
@@ -1462,6 +1575,152 @@ class LocalDbService {
       where: 'id = ? AND deleted = 1',
       whereArgs: [id],
     );
+  }
+
+  // ── Purchases ─────────────────────────────────────────────────────────────
+  // Supplier bills. Every write marks the row dirty (synced = 0, rev + 1) the
+  // moment it happens, exactly as products and transactions do, so the
+  // existing push picks them up without any change to the sync loop.
+
+  static Future<void> insertPurchase(Purchase p) async {
+    final database = await db;
+    final map = p.toMap();
+    map['synced'] = 0;
+    map['deleted'] = 0;
+    map['rev'] = 0;
+    await database.insert(
+      'purchases',
+      map,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  static Future<void> updatePurchase(Purchase p) async {
+    final database = await db;
+    await database.rawUpdate(
+      'UPDATE purchases SET dealer_id = ?, dealer_name = ?, dealer_gstin = ?, '
+      'invoice_no = ?, invoice_date = ?, place_of_supply = ?, '
+      'reverse_charge = ?, notes = ?, items = ?, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [
+        p.dealerId,
+        p.dealerName,
+        p.dealerGstin,
+        p.invoiceNo,
+        p.invoiceDate,
+        p.placeOfSupply,
+        p.reverseCharge ? 1 : 0,
+        jsonEncode(p.items.map((i) => i.toMap()).toList()),
+        p.id,
+      ],
+    );
+  }
+
+  /// Newest supplier bill first, by the date printed on the invoice.
+  static Future<List<Purchase>> getPurchases() async {
+    final database = await db;
+    final rows = await database.query(
+      'purchases',
+      where: 'deleted = 0',
+      orderBy: 'invoice_date DESC, created_at DESC',
+    );
+    return rows.map(Purchase.fromMap).toList();
+  }
+
+  /// Bills whose INVOICE date falls in the range — the date the register
+  /// reports, not the day the row was keyed in.
+  static Future<List<Purchase>> getPurchasesForRange(
+    DateTime from,
+    DateTime to,
+  ) async {
+    final database = await db;
+    final f = from.toIso8601String().substring(0, 10);
+    final t = to.toIso8601String().substring(0, 10);
+    final rows = await database.rawQuery(
+      'SELECT * FROM purchases WHERE substr(invoice_date,1,10) >= ? '
+      'AND substr(invoice_date,1,10) <= ? AND deleted = 0 '
+      'ORDER BY invoice_date DESC, created_at DESC',
+      [f, t],
+    );
+    return rows.map(Purchase.fromMap).toList();
+  }
+
+  /// Soft delete — the tombstone is what tells the cloud to drop the row.
+  static Future<void> softDeletePurchase(String id) async {
+    final database = await db;
+    await database.rawUpdate(
+      'UPDATE purchases SET deleted = 1, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [id],
+    );
+  }
+
+  static Future<(List<Purchase>, Map<String, int>)>
+  getUnsyncedPurchasesWithRev() async {
+    final database = await db;
+    final rows = await database.query(
+      'purchases',
+      where: 'synced = 0 AND deleted = 0',
+      orderBy: 'created_at ASC',
+    );
+    return (
+      rows.map(Purchase.fromMap).toList(),
+      {for (final r in rows) r['id'] as String: (r['rev'] as int?) ?? 0},
+    );
+  }
+
+  static Future<List<String>> getPendingDeletePurchaseIds() async {
+    final database = await db;
+    final rows = await database.query(
+      'purchases',
+      columns: ['id'],
+      where: 'deleted = 1 AND synced = 0',
+    );
+    return rows.map((r) => r['id'] as String).toList();
+  }
+
+  // Call after confirming Supabase deletion — hard-removes the local row.
+  static Future<void> purgeDeletedPurchase(String id) async {
+    final database = await db;
+    await database.delete(
+      'purchases',
+      where: 'id = ? AND deleted = 1',
+      whereArgs: [id],
+    );
+  }
+
+  /// Merge cloud rows in. Mirrors [insertTransactionsSynced]: a row the user
+  /// just deleted locally is not resurrected while its deletion is still
+  /// pending upload.
+  static Future<void> insertPurchasesSynced(List<Purchase> purchases) async {
+    final database = await db;
+    await database.transaction((txn) async {
+      final pendingDeletes = {
+        for (final r in await txn.query(
+          'purchases',
+          columns: ['id'],
+          where: 'deleted = 1',
+        ))
+          r['id'] as String,
+      };
+      final batch = txn.batch();
+      for (final p in purchases) {
+        if (pendingDeletes.contains(p.id)) continue;
+        final map = p.toMap();
+        map['synced'] = 1;
+        map['deleted'] = 0;
+        batch.insert(
+          'purchases',
+          map,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  static Future<void> reconcilePurchasesWithCloud(Set<String> cloudIds) async {
+    await reconcileTableWithCloud('purchases', cloudIds);
   }
 
   // Removes synced transactions that no longer exist in Supabase (cloud is source of truth for deletes)
