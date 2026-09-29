@@ -54,13 +54,37 @@ jobs:
             installer_output/*.exe
             billcat-windows.zip
 
+      # The zip is served from Supabase, not from the GitHub release asset.
+      # github.com redirects asset downloads to release-assets.githubusercontent.com,
+      # a separate domain that some ISPs and office firewalls block while
+      # leaving github.com reachable. Shops on such a network saw the update
+      # banner (the feed read fine), then "check your internet connection" on
+      # every download. Every client already reaches this Supabase bucket -
+      # that is where it just read the feed from - so serving the zip beside
+      # the feed removes the second domain from the path entirely.
+      # The GitHub release asset stays published, as the manual fallback.
+      - name: Upload release zip to Supabase
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}" -replace '^v', ''
+          $headers = @{
+            "Authorization" = "Bearer $env:SUPABASE_SERVICE_KEY"
+            "Content-Type"  = "application/zip"
+            "x-upsert"      = "true"
+          }
+          # Versioned name, so a client that is mid-download when the next
+          # release lands keeps pulling the build it started on.
+          Invoke-WebRequest -Uri "https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/billcat-updates/billcat-windows-$version.zip" `
+            -Method POST -Headers $headers -InFile "billcat-windows.zip" -UseBasicParsing
+
       - name: Update Supabase update feed
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           $version = "${{ steps.version.outputs.VERSION }}" -replace '^v', ''
           $tag = "${{ steps.version.outputs.VERSION }}"
-          $downloadUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/billcat-windows.zip"
+          $downloadUrl = "https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/public/billcat-updates/billcat-windows-$version.zip"
           $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/$tag"
 
           $body = @{

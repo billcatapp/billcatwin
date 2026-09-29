@@ -516,11 +516,20 @@ class UpdateService {
 
   /// GitHub release page for a release asset URL, where the installer can be
   /// downloaded by hand. Returns [url] unchanged if it is not a GitHub asset.
+  /// Where to send someone whose in-place update cannot be used, when the
+  /// download URL carries no repository to derive it from. The zip is served
+  /// from Supabase now, so the old behaviour — returning the download URL
+  /// unchanged — would have offered the raw zip instead of the installer.
+  static const String releasesPageUrl =
+      'https://github.com/billcatapp/billcatwin/releases/latest';
+
   static String releasePageFor(String url) {
     final m =
         RegExp(r'^(https://github\.com/[^/]+/[^/]+)/releases/download/([^/]+)/')
             .firstMatch(url);
-    return m == null ? url : '${m.group(1)}/releases/tag/${m.group(2)}';
+    return m == null
+        ? releasesPageUrl
+        : '${m.group(1)}/releases/tag/${m.group(2)}';
   }
 }
 
