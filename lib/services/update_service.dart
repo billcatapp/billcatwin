@@ -151,6 +151,24 @@ class UpdateService {
   }
 
   // ── Windows updater ────────────────────────────────────────────────────────
+  /// Whether files in [dir] can actually be replaced, tested by writing a
+  /// probe file rather than inspecting permissions — the awkward cases
+  /// (a read-only MSIX install under WindowsApps, a folder needing admin,
+  /// antivirus holding the directory) only show themselves on a real write.
+  static Future<bool> _canWriteTo(String dir) async {
+    final probe = File('$dir\\.billcat_update_probe');
+    try {
+      await probe.writeAsString('probe', flush: true);
+      return true;
+    } catch (_) {
+      return false;
+    } finally {
+      try {
+        if (probe.existsSync()) await probe.delete();
+      } catch (_) {}
+    }
+  }
+
   static Future<void> _installUpdateWindows(
     String url,
     void Function(double progress) onProgress,
@@ -160,6 +178,20 @@ class UpdateService {
     // below. Derive the GitHub release page so the fallback can send the
     // user to grab the installer manually instead of failing silently.
     final releasePageUrl = releasePageFor(url);
+
+    // Checked BEFORE downloading ~19 MB. The copy happens in a detached
+    // script after this process has already exited, so a folder that cannot
+    // be written to ends with the OLD version relaunching and the update
+    // banner returning — the update appears to do nothing at all, over and
+    // over. Failing here turns that silent loop into one clear message.
+    if (!await _canWriteTo(File(Platform.resolvedExecutable).parent.path)) {
+      throw UpdatePackageError(
+        'BillCat cannot update itself where it is installed '
+        '(${File(Platform.resolvedExecutable).parent.path}). '
+        'Download the installer and run it once — after that, updates will '
+        'apply automatically.',
+      );
+    }
 
     final tmpDir = await Directory.systemTemp.createTemp('billcat_update_');
     final zipPath = '${tmpDir.path}\\update.zip';

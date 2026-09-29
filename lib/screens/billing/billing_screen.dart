@@ -350,6 +350,20 @@ class _BillingScreenState extends State<BillingScreen> {
   // Update banner
   UpdateInfo? _updateInfo;
   bool _updateDismissed = false;
+
+  /// Re-checks for a new release while the app stays open. A till is often
+  /// left running for days, and the startup check alone meant such a shop
+  /// never learned a release existed — and a check that failed because the
+  /// connection was not up yet was never retried.
+  Timer? _updateCheckTimer;
+
+  /// How often that re-check runs. Long enough to be invisible, short enough
+  /// that a shop which dismissed the banner is offered it again the same day.
+  static const Duration _updateCheckEvery = Duration(hours: 1);
+
+  /// Whether the online state seen last time the sync service reported in,
+  /// so a shop that starts offline can be re-checked the moment it connects.
+  bool _wasOnlineForUpdateCheck = true;
   // The previous in-place update failed to apply; retrying it the same way
   // would loop, so the banner sends the user to the installer instead.
   bool _lastUpdateFailed = false;
@@ -476,6 +490,11 @@ class _BillingScreenState extends State<BillingScreen> {
     _loadSavedCustomers();
     ConnectivityService.instance.addListener(_onSyncComplete);
     _checkForUpdate();
+    _wasOnlineForUpdateCheck = ConnectivityService.instance.isOnline;
+    _updateCheckTimer = Timer.periodic(
+      _updateCheckEvery,
+      (_) => _checkForUpdate(recheck: true),
+    );
     _loadCurrentVersion();
     ReceiptPrinter.preWarm();
     WidgetsBinding.instance.addPostFrameCallback((_) => _syncTaxRate());
@@ -653,7 +672,10 @@ class _BillingScreenState extends State<BillingScreen> {
     if (mounted) setState(() => _currentVersion = v);
   }
 
-  Future<void> _checkForUpdate() async {
+  /// [recheck] marks a later look rather than the one at startup: it brings
+  /// the banner back if it was dismissed, so dismissing hides the prompt for
+  /// an hour instead of for as long as the till stays switched on.
+  Future<void> _checkForUpdate({bool recheck = false}) async {
     // Surface a previous failed self-update (the old version relaunching
     // "successfully" otherwise looks like the update simply didn't happen).
     try {
@@ -679,8 +701,18 @@ class _BillingScreenState extends State<BillingScreen> {
     }
     try {
       final info = await UpdateService.checkForUpdate();
-      if (mounted && info != null) setState(() => _updateInfo = info);
-    } catch (_) {}
+      if (mounted && info != null) {
+        setState(() {
+          _updateInfo = info;
+          if (recheck) _updateDismissed = false;
+        });
+      }
+    } catch (_) {
+      // Left silent on purpose: a failed check must not interrupt billing.
+      // The timer and the reconnect hook are what make it recoverable — this
+      // used to be the end of the road, and a shop that opened BillCat before
+      // its connection was up never saw an update again.
+    }
   }
 
   Future<void> _manualCheckForUpdate() async {
@@ -1425,6 +1457,13 @@ class _BillingScreenState extends State<BillingScreen> {
   void _onSyncComplete() {
     _loadProducts();
     _loadDashboardData();
+    // Connection just came back: retry the check that failed while the shop
+    // was offline, rather than waiting out the hour.
+    final online = ConnectivityService.instance.isOnline;
+    if (online && !_wasOnlineForUpdateCheck) {
+      _checkForUpdate(recheck: true);
+    }
+    _wasOnlineForUpdateCheck = online;
   }
 
   @override
@@ -1432,6 +1471,7 @@ class _BillingScreenState extends State<BillingScreen> {
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     _printSafetyTimer?.cancel();
     _scanDebounce?.cancel();
+    _updateCheckTimer?.cancel();
     ConnectivityService.instance.removeListener(_onSyncComplete);
     _searchController.dispose();
     _searchFocus.dispose();
