@@ -108,6 +108,43 @@ class UpdateService {
     }
   }
 
+  static Future<File> _pendingMarker() async {
+    final dir = await getApplicationSupportDirectory();
+    return File('${dir.path}${Platform.pathSeparator}update_pending.txt');
+  }
+
+  /// Records the version an in-place update is reaching for, written just
+  /// before this process exits and hands over to the detached script.
+  static Future<void> markUpdateAttempt(String toVersion) async {
+    try {
+      await (await _pendingMarker()).writeAsString(toVersion);
+    } catch (_) {}
+  }
+
+  /// The version an update was reaching for but did not arrive at, or null
+  /// when the last update either worked or never ran. Clears the marker
+  /// either way, so one failure is reported once.
+  ///
+  /// This checks the OUTCOME rather than trusting the updater's own log, and
+  /// that is the point: a copy that throws is caught by the log, but a copy
+  /// that quietly lands somewhere other than the folder being launched — two
+  /// installs on one machine is the usual way — reports nothing at all. The
+  /// old version simply starts again and the banner returns, with the shop
+  /// given no reason. Comparing the running version against the intended one
+  /// catches every such case, whatever caused it.
+  static Future<String?> consumeUnappliedUpdate() async {
+    try {
+      final marker = await _pendingMarker();
+      if (!await marker.exists()) return null;
+      final target = (await marker.readAsString()).trim();
+      await marker.delete();
+      if (target.isEmpty) return null;
+      return target == await currentVersion() ? null : target;
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<File> _failedMarker() async {
     final dir = await getApplicationSupportDirectory();
     return File('${dir.path}${Platform.pathSeparator}update_failed.txt');
@@ -139,15 +176,40 @@ class UpdateService {
 
   /// Downloads the zip, extracts it, replaces the running app, and relaunches.
   /// [onProgress] is called with 0.0–1.0. The app exits at 1.0 and relaunches.
+  /// [toVersion] is the release being installed. Recorded before this process
+  /// exits so the next launch can tell whether the update actually landed —
+  /// see [consumeUnappliedUpdate]. Optional so existing callers are unchanged;
+  /// without it a silent failure stays silent.
   static Future<void> installUpdate(
     String url,
-    void Function(double progress) onProgress,
-  ) async {
-    if (Platform.isWindows) {
-      await _installUpdateWindows(url, onProgress);
-    } else {
-      await _installUpdateMacOS(url, onProgress);
+    void Function(double progress) onProgress, {
+    String? toVersion,
+  }) async {
+    if (toVersion != null && toVersion.isNotEmpty) {
+      await markUpdateAttempt(toVersion);
     }
+    try {
+      if (Platform.isWindows) {
+        await _installUpdateWindows(url, onProgress);
+      } else {
+        await _installUpdateMacOS(url, onProgress);
+      }
+    } catch (_) {
+      // The hand-over never happened (download or extract failed), so there
+      // is no pending update for the next launch to judge. Leaving the marker
+      // would report a failure the shop was already told about, on a version
+      // that never changed.
+      await clearPendingUpdate();
+      rethrow;
+    }
+  }
+
+  /// Drops the pending-update marker without judging it.
+  static Future<void> clearPendingUpdate() async {
+    try {
+      final marker = await _pendingMarker();
+      if (await marker.exists()) await marker.delete();
+    } catch (_) {}
   }
 
   // ── Windows updater ────────────────────────────────────────────────────────

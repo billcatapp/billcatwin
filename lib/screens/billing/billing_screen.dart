@@ -694,6 +694,29 @@ class _BillingScreenState extends State<BillingScreen> {
         );
       }
     } catch (_) {}
+    // The decisive check: an update was started and this is the version that
+    // came back, so it did not land. Catches the cases the updater's own log
+    // cannot — a copy that succeeded into a folder other than the one being
+    // launched reports nothing, and the shop just watches the banner return
+    // after every download with no reason given.
+    try {
+      final missed = await UpdateService.consumeUnappliedUpdate();
+      if (missed != null) {
+        await UpdateService.markUpdateFailed();
+        // Read directly: _currentVersion is loaded after this runs, so the
+        // field is still empty here.
+        final running = await UpdateService.currentVersion();
+        if (mounted) {
+          setState(() => _lastUpdateFailed = true);
+          _showToast(
+            'The update to $missed did not apply — BillCat is still '
+            'version $running. Use "Download Installer" on the update banner '
+            'and run it once.',
+            isError: true,
+          );
+        }
+      }
+    } catch (_) {}
     // Still on the version whose update failed before (possibly in an earlier
     // session): keep offering the installer rather than the same retry.
     if (!_lastUpdateFailed && await UpdateService.previousUpdateFailed()) {
@@ -764,9 +787,13 @@ class _BillingScreenState extends State<BillingScreen> {
       _downloadedPath = '';
     });
     try {
-      await UpdateService.installUpdate(info.downloadUrl, (p) {
-        if (mounted) setState(() => _downloadProgress = p);
-      });
+      await UpdateService.installUpdate(
+        info.downloadUrl,
+        (p) {
+          if (mounted) setState(() => _downloadProgress = p);
+        },
+        toVersion: info.version,
+      );
     } on UpdatePackageError catch (e) {
       // Blocked or damaged package: offer the installer for the rest of this
       // session. Not saved: antivirus or a bad release zip is often temporary
