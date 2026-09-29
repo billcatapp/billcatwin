@@ -1274,7 +1274,11 @@ class _BillingScreenState extends State<BillingScreen> {
         for (final i in t.items) {
           cogs += (buyingPriceMap[i.productId] ?? 0.0) * i.quantity;
         }
-        profit += t.total - cogs;
+        // GST is collected for the government, not earned: the bill total is
+        // subtotal - discount + tax, so tax has to come back out before the
+        // cost of goods is taken off. Round-off stays in, since the shop was
+        // actually paid the rounded amount.
+        profit += (t.total - t.taxAmount) - cogs;
       }
       return profit;
     }
@@ -18992,9 +18996,11 @@ end tell
   }
 
   /// Spreadsheet-style entry for adding several products in one pass. Each row
-  /// is one line of stock; rows that repeat a product name are saved as a
-  /// single product carrying those variants, each keeping its own price and
-  /// stock. Dealer and purchase date are typed once and stamped on every row.
+  /// is one line of stock. A row's "add a variant" button spawns a linked row,
+  /// and those linked rows save as a single product carrying those variants,
+  /// each keeping its own price and stock. Typing a name that repeats one
+  /// above does NOT group: two products may share a name.
+  /// Dealer and purchase date are typed once and stamped on every row.
   /// Rows left completely blank are ignored, so trailing spares never block a
   /// save.
   void _showBulkAddProductDialog() {
@@ -19026,7 +19032,20 @@ end tell
 
     /// Rows are one product per *name*, so every row repeating a name is one
     /// of its variants.
-    String groupKey(_BulkProductRow r) => r.nameCtrl.text.trim().toLowerCase();
+    /// Rows become one product carrying variants only when they say WHICH
+    /// variant they are. A row that repeats a name but leaves the variant box
+    /// empty is a product in its own right, so it keys on itself and stands
+    /// alone — two rows named the same with no variant save as two products.
+    /// Rows group into one product ONLY when the "add a variant" button linked
+    /// them. Typing a name that repeats one above never groups: a shop can
+    /// stock two different products under the same name, and forcing them
+    /// together made the second one impossible to add.
+    String groupKey(_BulkProductRow r) {
+      // An unnamed row still keys as empty: callers read that as "nothing
+      // typed here yet" to clear its auto-SKU and keep it out of the count.
+      if (r.nameCtrl.text.trim().isEmpty) return '';
+      return 'row${r.variantOf ?? r.id}';
+    }
 
     showDialog(
       context: context,
@@ -19171,6 +19190,9 @@ end tell
           void addVariantRow(int i) {
             final src = rows[i];
             final row = _BulkProductRow(category: src.category);
+            // Joins the source row's group explicitly. Adding a variant to a
+            // row that is itself a variant attaches both to the same product.
+            row.variantOf = src.variantOf ?? src.id;
             row.nameCtrl.text = src.nameCtrl.text;
             row.hsnCtrl.text = src.hsnCtrl.text;
             rows.insert(i + 1, row);
@@ -19206,8 +19228,8 @@ end tell
               firstProblem ??= '$who: $msg';
             }
 
-            // Rows that repeat a product name are one product's variants, kept
-            // in the order they appear in the grid.
+            // Rows linked by the "add a variant" button are one product's
+            // variants, kept in the order they appear in the grid.
             final groups = <String, List<_BulkProductRow>>{};
             for (final r in entered) {
               (groups[groupKey(r)] ??= []).add(r);
@@ -19250,7 +19272,7 @@ end tell
                   if (labels[i].isEmpty) {
                     fail(
                       group[i],
-                      'Repeats a product name above — give this row a variant',
+                      'Name this variant, or remove the row',
                     );
                     missing = true;
                   }
@@ -19763,7 +19785,7 @@ end tell
                               ),
                               const SizedBox(height: 2),
                               Text(
-                                'One row per line of stock · repeat a product name to add its variants',
+                                'One row per line of stock · use + on a row to add its variants',
                                 style: GoogleFonts.inter(
                                   fontSize: 12,
                                   color: AppColors.textMuted,
@@ -24065,7 +24087,8 @@ end tell
           0.0,
           (a, i) => a + (buying[i.productId] ?? 0) * i.quantity,
         );
-        return s + (t.total - cogs);
+        // Same rule as the dashboard: GST out before cost of goods.
+        return s + ((t.total - t.taxAmount) - cogs);
       });
     } else {
       revenue = isToday
@@ -29490,6 +29513,16 @@ class _ExchangeAdd {
 /// with [variantCtrl] naming which variant each row is.
 class _BulkProductRow {
   _BulkProductRow({required this.category});
+
+  /// Tells one row apart from another that happens to carry the same name.
+  static int _nextId = 0;
+  final int id = _nextId++;
+
+  /// The [id] of the row this one is a variant of, set only by the row's
+  /// "add a variant" button. Null means the row is a product in its own
+  /// right. Grouping follows this and NOT the product name: two rows may
+  /// legitimately carry the same name and still be separate products.
+  int? variantOf;
 
   final nameCtrl = TextEditingController();
   final variantCtrl = TextEditingController();

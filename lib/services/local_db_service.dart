@@ -538,6 +538,110 @@ class LocalDbService {
     return (rows.first['c'] as int?) ?? 0;
   }
 
+  /// Renumbers every stored bill into the `INV/<fy>/<seq>` series, oldest
+  /// first, with a separate series per financial year. Returns the number of
+  /// (sales, reversals) rewritten.
+  ///
+  /// Deliberately NOT automatic. Two tills renumbering at the same time would
+  /// assign different numbers to the same bill and then overwrite each other,
+  /// so this runs only when a shopkeeper asks for it, on one machine, and the
+  /// caller pulls first so the numbering is decided from the full picture.
+  ///
+  /// Reversals are rewritten through the same map inside the same
+  /// transaction. A return stores its link to the original bill inside its
+  /// own number, so moving an original without moving its return would break
+  /// the check that stops an item being returned twice.
+  ///
+  /// Soft-deleted bills are left alone: they are absent from every report, so
+  /// numbering them would only punch holes in the series.
+  /// [into] lets a test drive this against its own database; the app always
+  /// leaves it null and the service's own database is used.
+  static Future<(int, int)> renumberExistingInvoices({Database? into}) async {
+    final database = into ?? await db;
+    var sales = 0;
+    var reversals = 0;
+
+    bool isReversal(String n) =>
+        n.startsWith(TransactionRecord.returnPrefix) ||
+        n.startsWith(TransactionRecord.exchangePrefix) ||
+        n.startsWith(TransactionRecord.returnSeries) ||
+        n.startsWith(TransactionRecord.exchangeSeries);
+
+    await database.transaction((txn) async {
+      final rows = await txn.query(
+        'transactions',
+        columns: ['id', 'invoice_number', 'created_at'],
+        where: 'deleted = 0',
+        orderBy: 'created_at ASC',
+      );
+
+      final perYear = <String, int>{};
+      final renamed = <String, String>{};
+      final updates = <(String, String)>[];
+
+      // Sales first, so a reversal can be pointed at its original's new
+      // number in the second pass.
+      for (final r in rows) {
+        final old = (r['invoice_number'] as String?) ?? '';
+        if (old.isNotEmpty && isReversal(old)) continue;
+        final created = DateTime.tryParse((r['created_at'] as String?) ?? '');
+        if (created == null) continue;
+        final fy = financialYear(created);
+        final seq = (perYear[fy] ?? 0) + 1;
+        perYear[fy] = seq;
+        final number =
+            '$invoicePrefix/$fy/${seq.toString().padLeft(4, '0')}';
+        if (old.isNotEmpty) renamed[old] = number;
+        // A bill already carrying its correct number is left alone, so a
+        // second run writes nothing at all. That is what makes this safe to
+        // call on every launch: once a shop is converted it costs one read.
+        if (old == number) continue;
+        updates.add((r['id'] as String, number));
+        sales++;
+      }
+
+      for (final r in rows) {
+        final old = (r['invoice_number'] as String?) ?? '';
+        if (old.isEmpty || !isReversal(old)) continue;
+        final isExchange =
+            old.startsWith(TransactionRecord.exchangePrefix) ||
+            old.startsWith(TransactionRecord.exchangeSeries);
+        // Recover the original's number: 'RTN-ABC12345' points at 'ABC12345',
+        // 'RTN/26-27/0042' at 'INV/26-27/0042'.
+        final base =
+            old.startsWith(TransactionRecord.returnSeries) ||
+                old.startsWith(TransactionRecord.exchangeSeries)
+            ? '${TransactionRecord.salesSeries}'
+                  '${old.substring(TransactionRecord.returnSeries.length)}'
+            : old.substring(TransactionRecord.returnPrefix.length);
+        final mapped = renamed[base];
+        // The original is missing or was never renumbered — leaving the
+        // reversal untouched keeps it pointing where it always did.
+        if (mapped == null) continue;
+        final head = isExchange
+            ? TransactionRecord.exchangeSeries
+            : TransactionRecord.returnSeries;
+        final number =
+            '$head${mapped.substring(TransactionRecord.salesSeries.length)}';
+        if (old == number) continue;
+        updates.add((r['id'] as String, number));
+        reversals++;
+      }
+
+      final batch = txn.batch();
+      for (final (id, number) in updates) {
+        batch.rawUpdate(
+          'UPDATE transactions SET invoice_number = ?, synced = 0, '
+          'rev = rev + 1 WHERE id = ?',
+          [number, id],
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+
+    return (sales, reversals);
+  }
+
   // ── Settings ──────────────────────────────────────────────────────────────
 
   /// Local-only dirty marker for settings. Holds an increasing counter so a
@@ -1760,6 +1864,11 @@ class LocalDbService {
   static Future<void> removeLocalTransaction(String id) async {
     final database = await db;
     await database.delete('transactions', where: 'id = ?', whereArgs: [id]);
+  }
+
+  static Future<void> removeLocalPurchase(String id) async {
+    final database = await db;
+    await database.delete('purchases', where: 'id = ?', whereArgs: [id]);
   }
 
   static Future<void> removeLocalProduct(String id) async {

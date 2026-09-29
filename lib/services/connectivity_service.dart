@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/customer.dart';
 import '../models/product.dart';
 import '../models/product_variant.dart';
+import '../models/purchase.dart';
 import '../models/transaction_record.dart';
 import 'local_db_service.dart';
 
@@ -244,6 +245,22 @@ class ConnectivityService extends ChangeNotifier {
         final id = old['id'] as String?;
         if (id == null) return;
         await LocalDbService.removeLocalTransaction(id);
+        notifyListeners();
+      },
+    );
+
+    bind(
+      'purchases',
+      onUpsert: (row) async {
+        final p = _purchaseFromRow(row);
+        await LocalDbService.insertPurchasesSynced([p]);
+        _noteLiveRow('purchases', p.id);
+        notifyListeners();
+      },
+      onDelete: (old) async {
+        final id = old['id'] as String?;
+        if (id == null) return;
+        await LocalDbService.removeLocalPurchase(id);
         notifyListeners();
       },
     );
@@ -601,6 +618,69 @@ class ConnectivityService extends ChangeNotifier {
         }
       }
 
+      // ── Push purchase deletions ──────────────────────────────────────────
+      if (_staleUser(userId)) return;
+      final pendingPurchaseDeletes =
+          await LocalDbService.getPendingDeletePurchaseIds();
+      if (pendingPurchaseDeletes.isNotEmpty) {
+        try {
+          final removed = await client
+              .from('purchases')
+              .delete()
+              .inFilter('id', pendingPurchaseDeletes)
+              .eq('user_id', userId)
+              .select('id');
+          for (final row in removed) {
+            final id = row['id'] as String?;
+            if (id != null) await LocalDbService.purgeDeletedPurchase(id);
+          }
+        } catch (e) {
+          debugPrint('Purchase delete sync error: $e');
+        }
+      }
+
+      // ── Push purchases ───────────────────────────────────────────────────
+      if (_staleUser(userId)) return;
+      final (unsyncedPurchases, purchaseRevs) =
+          await LocalDbService.getUnsyncedPurchasesWithRev();
+      if (unsyncedPurchases.isNotEmpty) {
+        try {
+          await client
+              .from('purchases')
+              .upsert(
+                unsyncedPurchases
+                    .map(
+                      (p) => {
+                        'id': p.id,
+                        'user_id': userId,
+                        'dealer_id': p.dealerId,
+                        'dealer_name': p.dealerName,
+                        'dealer_gstin': p.dealerGstin,
+                        'invoice_no': p.invoiceNo,
+                        'invoice_date': p.invoiceDate,
+                        'place_of_supply': p.placeOfSupply,
+                        'reverse_charge': p.reverseCharge,
+                        'notes': p.notes,
+                        'items': p.items.map((i) => i.toMap()).toList(),
+                        'created_at': p.createdAt.toIso8601String(),
+                      },
+                    )
+                    .toList(),
+              );
+          for (final p in unsyncedPurchases) {
+            await LocalDbService.markSyncedIfRev(
+              'purchases',
+              'id',
+              p.id,
+              purchaseRevs[p.id] ?? 0,
+            );
+          }
+          debugPrint('PUSH: purchases ok (${unsyncedPurchases.length} rows)');
+        } catch (e) {
+          debugPrint('Purchase sync error: $e');
+        }
+      }
+
       // ── Push customer deletions ──────────────────────────────────────────
       if (_staleUser(userId)) return;
       final pendingCustomerDeletes =
@@ -822,6 +902,28 @@ class ConnectivityService extends ChangeNotifier {
       try {
         if (_staleUser(userId)) return;
         final rows = await client
+            .from('purchases')
+            .select()
+            .eq('user_id', userId);
+        final purchases = (rows as List)
+            .map((r) => _purchaseFromRow(Map<String, dynamic>.from(r as Map)))
+            .toList();
+        if (_staleUser(userId)) return;
+        await LocalDbService.insertPurchasesSynced(purchases);
+        await LocalDbService.reconcilePurchasesWithCloud(
+          purchases.map((p) => p.id).toSet()
+            ..addAll(_liveIdsDuringPull['purchases'] ?? const <String>{}),
+        );
+        debugPrint('PULL: purchases ok (${purchases.length} rows)');
+      } catch (e) {
+        // Expected until add_purchases.sql has been run on the project; the
+        // rest of the pull is unaffected because each table has its own try.
+        debugPrint('PULL: purchases FAILED: $e');
+      }
+
+      try {
+        if (_staleUser(userId)) return;
+        final rows = await client
             .from('customers')
             .select()
             .eq('user_id', userId);
@@ -958,6 +1060,30 @@ class ConnectivityService extends ChangeNotifier {
         'sku': (r['sku'] as String?) ?? '',
         'barcode_no': (r['barcode_no'] as String?) ?? '',
       });
+
+  /// Missing columns read as empty so a pull still succeeds against a project
+  /// that has not run the purchases migration yet, exactly as hsn_code does.
+  Purchase _purchaseFromRow(Map<String, dynamic> r) {
+    var items = r['items'];
+    if (items is String) items = jsonDecode(items);
+    return Purchase(
+      id: r['id'] as String,
+      dealerId: (r['dealer_id'] as String?) ?? '',
+      dealerName: (r['dealer_name'] as String?) ?? '',
+      dealerGstin: (r['dealer_gstin'] as String?) ?? '',
+      invoiceNo: (r['invoice_no'] as String?) ?? '',
+      invoiceDate: (r['invoice_date'] as String?) ?? '',
+      placeOfSupply: (r['place_of_supply'] as String?) ?? '',
+      reverseCharge: r['reverse_charge'] == true,
+      notes: (r['notes'] as String?) ?? '',
+      items: (items as List? ?? const [])
+          .map((i) => PurchaseItem.fromMap(Map<String, dynamic>.from(i as Map)))
+          .toList(),
+      createdAt:
+          DateTime.tryParse((r['created_at'] as String?) ?? '') ??
+          DateTime.now(),
+    );
+  }
 
   TransactionRecord _txFromRow(Map<String, dynamic> r) {
     var items = r['items'];

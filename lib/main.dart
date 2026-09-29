@@ -94,8 +94,12 @@ void main() {
     if (currentUser != null) {
       // Pull cloud data, then push anything still unsynced locally so the
       // two sides re-converge even if a previous push was lost cloud-side.
+      // The renumber sits between the two on purpose: it needs the full
+      // history to number correctly, and its rewrites must go up in the push
+      // that follows, before any later pull can restore the old numbers.
       ConnectivityService.instance
           .pullFromCloud()
+          .then((_) => _renumberLegacyInvoices())
           .then((_) => ConnectivityService.instance.syncNow());
     }
     runApp(const BillCatApp());
@@ -103,6 +107,28 @@ void main() {
     // Supabase fires AuthRetryableFetchException in background when offline;
     // catching here prevents it from killing the Windows process.
   });
+}
+
+/// Brings a shop's older bills into the GST invoice series, oldest first,
+/// with a separate series per financial year.
+///
+/// Runs after every pull and before the push that follows, so the numbering
+/// is decided from the shop's complete history and the rewrites reach the
+/// cloud immediately. It is self-limiting: a bill already carrying its
+/// correct number is skipped, so once a shop is converted this costs one
+/// read and writes nothing.
+///
+/// Never allowed to block startup. A shop whose renumber fails keeps its old
+/// numbers and simply tries again next launch.
+Future<void> _renumberLegacyInvoices() async {
+  try {
+    final (sales, reversals) = await LocalDbService.renumberExistingInvoices();
+    if (sales > 0 || reversals > 0) {
+      debugPrint('RENUMBER: $sales bills, $reversals reversals');
+    }
+  } catch (e) {
+    debugPrint('RENUMBER failed: $e');
+  }
 }
 
 class BillCatApp extends StatefulWidget {
@@ -146,6 +172,7 @@ class _BillCatAppState extends State<BillCatApp> {
         // work up.
         await LocalDbService.initForUser(user.id);
         await ConnectivityService.instance.pullFromCloud();
+        await _renumberLegacyInvoices();
         await ConnectivityService.instance.syncNow();
         // Open the live sync channel for this user.
         await ConnectivityService.instance.onUserChanged();
