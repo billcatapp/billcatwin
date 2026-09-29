@@ -155,10 +155,10 @@ class LabelPrinter {
             : ((barcodeVal.length + 2) * 11 + 13) * 2;
         final barcodeH = (labelHmm * _dpmm * 0.38).round();
         final bx = cellX + ((cellW - barcodeW) / 2).round().clamp(0, cellW);
-        // With a store name the barcode drops just below it (font 1 is 12
+        // With a store name the barcode drops just below it (font 2 is 20
         // dots tall); without one it keeps its original top margin, so an
         // existing label roll prints exactly as it always did.
-        final barcodeY = store.isEmpty ? 2 * _dpmm : 2 + 12 + 4;
+        final barcodeY = store.isEmpty ? 2 * _dpmm : 2 + 20 + 4;
         buf.write(
           'BARCODE $bx,$barcodeY,"$symbology",$barcodeH,0,0,2,2,"$barcodeVal"\r\n',
         );
@@ -175,18 +175,30 @@ class LabelPrinter {
 
         // Centred text helpers. Font 2 = 12x20 dots, font 1 = 8x12 dots.
         // TSPL doesn't wrap, so truncate each line to the cell width.
-        void writeCentred(String text, int y, String font, int charW) {
+        void writeCentred(
+          String text,
+          int y,
+          String font,
+          int charW, {
+          bool bold = false,
+        }) {
           final maxChars = (cellW / charW).floor().clamp(1, 1000);
           var t = text;
           if (t.length > maxChars) t = t.substring(0, maxChars);
           final w = t.length * charW;
           final x = cellX + ((cellW - w) / 2).round().clamp(0, cellW);
           buf.write('TEXT $x,$y,"$font",0,1,1,"$t"\r\n');
+          // TSPL has no bold attribute. Overprinting the same text one dot to
+          // the right thickens every stroke without changing the character
+          // size, so nothing below has to move.
+          if (bold) buf.write('TEXT ${x + 1},$y,"$font",0,1,1,"$t"\r\n');
         }
 
         // TSPL positions every element absolutely, so the store name can be
         // emitted here even though it prints above the barcode.
-        if (store.isNotEmpty) writeCentred(store, 2, '1', 8);
+        // Font 2 (12x20) rather than font 1, overprinted for weight, so the
+        // shop name reads as the heading of the sticker.
+        if (store.isNotEmpty) writeCentred(store, 2, '2', 12, bold: true);
 
         // Font 2 is 20 dots tall, font 1 is 12 dots tall; add generous gaps
         // between the barcode, name, variant and price so they don't crowd.

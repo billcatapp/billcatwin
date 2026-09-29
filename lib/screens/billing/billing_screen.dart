@@ -13821,7 +13821,7 @@ end tell
             if (_storeName.trim().isNotEmpty)
               pw.Text(
                 _storeName.trim(),
-                style: pw.TextStyle(font: bold, fontSize: 4),
+                style: pw.TextStyle(font: bold, fontSize: 6),
                 textAlign: pw.TextAlign.center,
                 maxLines: 1,
                 overflow: pw.TextOverflow.clip,
@@ -15452,7 +15452,7 @@ end tell
           if (_storeName.trim().isNotEmpty)
             pw.Text(
               _storeName.trim(),
-              style: pw.TextStyle(font: bold, fontSize: 4),
+              style: pw.TextStyle(font: bold, fontSize: 6),
               textAlign: pw.TextAlign.center,
               maxLines: 1,
               overflow: pw.TextOverflow.clip,
