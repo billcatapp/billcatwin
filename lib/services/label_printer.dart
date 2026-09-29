@@ -113,10 +113,14 @@ class LabelPrinter {
     required int perRow,
     double rowGapMm = 3.0,
     String currencySymbol = '',
+    String storeName = '',
   }) {
     if (labels.isEmpty) return true;
     final webWmm = labelWmm * perRow + _colGapMm * (perRow - 1);
     final currency = _ascii(currencySymbol);
+    // Printed across the top of every sticker, so a label on a shelf says
+    // whose shop it came from. Empty keeps the old layout untouched.
+    final store = _tsplSafe(storeName.trim());
     final buf = StringBuffer();
 
     for (var start = 0; start < labels.length; start += perRow) {
@@ -151,8 +155,12 @@ class LabelPrinter {
             : ((barcodeVal.length + 2) * 11 + 13) * 2;
         final barcodeH = (labelHmm * _dpmm * 0.38).round();
         final bx = cellX + ((cellW - barcodeW) / 2).round().clamp(0, cellW);
+        // With a store name the barcode drops just below it (font 1 is 12
+        // dots tall); without one it keeps its original top margin, so an
+        // existing label roll prints exactly as it always did.
+        final barcodeY = store.isEmpty ? 2 * _dpmm : 2 + 12 + 4;
         buf.write(
-          'BARCODE $bx,${2 * _dpmm},"$symbology",$barcodeH,0,0,2,2,"$barcodeVal"\r\n',
+          'BARCODE $bx,$barcodeY,"$symbology",$barcodeH,0,0,2,2,"$barcodeVal"\r\n',
         );
 
         // Split "Product Name (Variant)" so the variant prints on its own line
@@ -176,9 +184,13 @@ class LabelPrinter {
           buf.write('TEXT $x,$y,"$font",0,1,1,"$t"\r\n');
         }
 
+        // TSPL positions every element absolutely, so the store name can be
+        // emitted here even though it prints above the barcode.
+        if (store.isNotEmpty) writeCentred(store, 2, '1', 8);
+
         // Font 2 is 20 dots tall, font 1 is 12 dots tall; add generous gaps
         // between the barcode, name, variant and price so they don't crowd.
-        var y = 2 * _dpmm + barcodeH + 12;
+        var y = barcodeY + barcodeH + 12;
         writeCentred(mainName, y, '2', 12); // product name
         y += 20 + 10;
         if (variant != null && variant.isNotEmpty) {

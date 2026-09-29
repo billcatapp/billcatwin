@@ -13815,6 +13815,17 @@ end tell
         child: pw.Column(
           mainAxisAlignment: pw.MainAxisAlignment.center,
           children: [
+            // Store name across the top, so a sticker on a shelf says whose
+            // shop it came from. Omitted entirely when unset, leaving the
+            // label exactly as it printed before.
+            if (_storeName.trim().isNotEmpty)
+              pw.Text(
+                _storeName.trim(),
+                style: pw.TextStyle(font: bold, fontSize: 4),
+                textAlign: pw.TextAlign.center,
+                maxLines: 1,
+                overflow: pw.TextOverflow.clip,
+              ),
             pw.SvgImage(
               svg: svgStr,
               width: (cellW - innerPad * 2),
@@ -13994,6 +14005,7 @@ end tell
                                 labelHmm: labelH,
                                 perRow: labelsPerRow,
                                 currencySymbol: _currencySymbol,
+                                storeName: _storeName,
                               );
                             } else {
                               ok = await Printing.directPrintPdf(
@@ -15436,6 +15448,15 @@ end tell
       child: pw.Column(
         mainAxisAlignment: pw.MainAxisAlignment.center,
         children: [
+          // Store name on top, matching the bulk Print Barcodes label.
+          if (_storeName.trim().isNotEmpty)
+            pw.Text(
+              _storeName.trim(),
+              style: pw.TextStyle(font: bold, fontSize: 4),
+              textAlign: pw.TextAlign.center,
+              maxLines: 1,
+              overflow: pw.TextOverflow.clip,
+            ),
           pw.SvgImage(
             svg: svgStr,
             width: cellW - pad * 2,
@@ -15621,6 +15642,7 @@ end tell
                                 labelHmm: labelH,
                                 perRow: labelsPerRow,
                                 currencySymbol: _currencySymbol,
+                                storeName: _storeName,
                               );
                             } else {
                               ok = await Printing.directPrintPdf(
