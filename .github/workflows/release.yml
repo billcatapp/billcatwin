@@ -78,6 +78,18 @@ jobs:
           Invoke-WebRequest -Uri "https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/billcat-updates/billcat-windows-$version.zip" `
             -Method POST -Headers $headers -InFile "billcat-windows.zip" -UseBasicParsing
 
+          # The .exe installer too: the website's download button sends people
+          # to the GitHub asset, which redirects to the same blocked domain.
+          # A shop that cannot self-update could not download the manual
+          # installer either - both routes out were shut.
+          $exeHeaders = @{
+            "Authorization" = "Bearer $env:SUPABASE_SERVICE_KEY"
+            "Content-Type"  = "application/vnd.microsoft.portable-executable"
+            "x-upsert"      = "true"
+          }
+          Invoke-WebRequest -Uri "https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/billcat-updates/BillCat-Setup-$version.exe" `
+            -Method POST -Headers $exeHeaders -InFile "installer_output/BillCat-Setup-$version.exe" -UseBasicParsing
+
       - name: Update Supabase update feed
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -87,9 +99,15 @@ jobs:
           $downloadUrl = "https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/public/billcat-updates/billcat-windows-$version.zip"
           $releaseUrl = "https://github.com/${{ github.repository }}/releases/tag/$tag"
 
+          # installer_url is what the website's download button uses, so a
+          # visitor on a network that blocks the GitHub asset domain can still
+          # get the installer.
+          $installerUrl = "https://xawpxbhglzhaibmcpwho.supabase.co/storage/v1/object/public/billcat-updates/BillCat-Setup-$version.exe"
+
           $body = @{
             version        = $version
             download_url   = $downloadUrl
+            installer_url  = $installerUrl
             release_notes  = "See the release notes: $releaseUrl"
             mandatory      = $false
           } | ConvertTo-Json -Compress
