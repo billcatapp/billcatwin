@@ -17969,6 +17969,22 @@ end tell
     String sharedPriceText = '';
     String? sharedPricedBy;
     final customPriced = <String>{};
+    // Buying price gets the same treatment the selling price already had:
+    // variants of one product are almost always bought at one rate, so the
+    // figure typed on the first carries to the rest until one is given its
+    // own. Without this every variant after the first was created with a
+    // buying price of zero, which silently wrecked the profit figures.
+    String sharedBuyingText = '';
+    String? sharedBuyingBy;
+    final customBuying = <String>{};
+    // The shared figure is a ONE-TIME fill. It carries the first price typed
+    // onto every variant, and then stops: once the user has moved to another
+    // variant, a price typed anywhere belongs to that variant alone and
+    // nothing else moves. Set when the variant dropdown is used, NOT when a
+    // variant is created — a newly added variant still inherits the figure at
+    // construction, which is a different path.
+    bool priceFillDone = false;
+    bool buyingFillDone = false;
 
     // Which variant the price/stock fields currently edit (null = base product).
     String? selectedVariantId;
@@ -18360,13 +18376,15 @@ end tell
                                                                   ) ??
                                                                   0.0,
                                                               buyingPrice:
-                                                                  isFirst
-                                                                  ? double.tryParse(
-                                                                          buyingPriceCtrl
-                                                                              .text,
-                                                                        ) ??
-                                                                        0.0
-                                                                  : 0.0,
+                                                                  double.tryParse(
+                                                                    isFirst ||
+                                                                            sharedBuyingText
+                                                                                .isEmpty
+                                                                        ? buyingPriceCtrl
+                                                                              .text
+                                                                        : sharedBuyingText,
+                                                                  ) ??
+                                                                  0.0,
                                                               stock: isFirst
                                                                   ? int.tryParse(
                                                                           stockCtrl
@@ -18376,12 +18394,45 @@ end tell
                                                                   : 0,
                                                             );
                                                             variants.add(v);
+                                                            // Only claim the
+                                                            // shared figure
+                                                            // once one exists.
+                                                            // The Variant box
+                                                            // sits on the name
+                                                            // row, the prices
+                                                            // far below it, so
+                                                            // variants are
+                                                            // routinely added
+                                                            // before either is
+                                                            // typed. Claiming
+                                                            // an empty latch
+                                                            // there bound it
+                                                            // to variant 1
+                                                            // forever, and no
+                                                            // price typed
+                                                            // afterwards ever
+                                                            // reached the
+                                                            // others.
                                                             if (isFirst) {
-                                                              sharedPriceText =
-                                                                  priceCtrl
-                                                                      .text;
-                                                              sharedPricedBy =
-                                                                  v.id;
+                                                              if (priceCtrl.text
+                                                                  .trim()
+                                                                  .isNotEmpty) {
+                                                                sharedPriceText =
+                                                                    priceCtrl
+                                                                        .text;
+                                                                sharedPricedBy =
+                                                                    v.id;
+                                                              }
+                                                              if (buyingPriceCtrl
+                                                                  .text
+                                                                  .trim()
+                                                                  .isNotEmpty) {
+                                                                sharedBuyingText =
+                                                                    buyingPriceCtrl
+                                                                        .text;
+                                                                sharedBuyingBy =
+                                                                    v.id;
+                                                              }
                                                             }
                                                             selectedVariantId =
                                                                 v.id;
@@ -18415,6 +18466,20 @@ end tell
                                                         onSelect: (id) =>
                                                             setLocal(() {
                                                               commitFields();
+                                                              // Moving to
+                                                              // another
+                                                              // variant ends
+                                                              // the one-time
+                                                              // fill: from
+                                                              // here a price
+                                                              // changes only
+                                                              // the variant
+                                                              // it is typed
+                                                              // into.
+                                                              priceFillDone =
+                                                                  true;
+                                                              buyingFillDone =
+                                                                  true;
                                                               selectedVariantId =
                                                                   id;
                                                               loadFields();
@@ -18661,14 +18726,34 @@ end tell
                                               if (selectedVariantId == null) {
                                                 return;
                                               }
-                                              if (sharedPricedBy == null ||
-                                                  sharedPricedBy ==
-                                                      selectedVariantId) {
-                                                sharedPricedBy =
-                                                    selectedVariantId;
-                                                sharedPriceText = v;
+                                              // The first real price typed
+                                              // claims the shared slot and
+                                              // carries to every variant. Once
+                                              // claimed, typing in a DIFFERENT
+                                              // variant falls to the else
+                                              // branch, which marks that one
+                                              // custom so only it changes and
+                                              // it stops following. An empty
+                                              // slot counts as unclaimed, so
+                                              // variants added before any
+                                              // price still get filled.
+                                              if (!priceFillDone &&
+                                                  (sharedPricedBy == null ||
+                                                      sharedPriceText.isEmpty ||
+                                                      sharedPricedBy ==
+                                                          selectedVariantId)) {
                                                 final p = double.tryParse(v);
+                                                // Only a real figure claims
+                                                // the shared slot. Assigning
+                                                // the raw text first meant
+                                                // clearing the box emptied the
+                                                // slot, and the next keystroke
+                                                // re-claimed it and rewrote
+                                                // every variant.
                                                 if (p != null) {
+                                                  sharedPricedBy =
+                                                      selectedVariantId;
+                                                  sharedPriceText = v;
                                                   for (
                                                     var i = 0;
                                                     i < variants.length;
@@ -18771,6 +18856,55 @@ end tell
                                                 TextInputAction.next,
                                             onFieldSubmitted: (_) =>
                                                 hsnFocus.requestFocus(),
+                                            // Mirrors the selling price
+                                            // above: the first buying price
+                                            // typed becomes the shared one,
+                                            // and typing on a different
+                                            // variant afterwards overrides
+                                            // just that variant.
+                                            onChanged: (v) {
+                                              if (selectedVariantId == null) {
+                                                return;
+                                              }
+                                              // Same rule as the selling price.
+                                              if (!buyingFillDone &&
+                                                  (sharedBuyingBy == null ||
+                                                      sharedBuyingText
+                                                          .isEmpty ||
+                                                      sharedBuyingBy ==
+                                                          selectedVariantId)) {
+                                                final b = double.tryParse(v);
+                                                // Same rules as the selling
+                                                // price above: only a real
+                                                // figure claims the slot, and
+                                                // it fills blanks rather than
+                                                // rewriting what is set.
+                                                if (b != null) {
+                                                  sharedBuyingBy =
+                                                      selectedVariantId;
+                                                  sharedBuyingText = v;
+                                                  for (
+                                                    var i = 0;
+                                                    i < variants.length;
+                                                    i++
+                                                  ) {
+                                                    if (customBuying.contains(
+                                                      variants[i].id,
+                                                    )) {
+                                                      continue;
+                                                    }
+                                                    variants[i] = variants[i]
+                                                        .copyWith(
+                                                          buyingPrice: b,
+                                                        );
+                                                  }
+                                                }
+                                              } else {
+                                                customBuying.add(
+                                                  selectedVariantId!,
+                                                );
+                                              }
+                                            },
                                             keyboardType:
                                                 const TextInputType.numberWithOptions(
                                                   decimal: true,
@@ -19276,6 +19410,18 @@ end tell
           // Drops a sibling row directly under [i] carrying the same product
           // identity, so it joins that product's group and only the variant's
           // own name, price and stock are left to type.
+          /// Pushes a product row's prices onto the variants that are still
+          /// following it, so correcting the price once corrects the whole
+          /// group. A variant whose own cell has been typed into is skipped.
+          void syncVariantPrices(_BulkProductRow head) {
+            if (head.variantOf != null) return; // only a product row leads
+            for (final r in rows) {
+              if (r.variantOf != head.id) continue;
+              if (r.priceAuto) r.priceCtrl.text = head.priceCtrl.text;
+              if (r.buyingAuto) r.buyingCtrl.text = head.buyingCtrl.text;
+            }
+          }
+
           void addVariantRow(int i) {
             final src = rows[i];
             final row = _BulkProductRow(category: src.category);
@@ -19284,6 +19430,12 @@ end tell
             row.variantOf = src.variantOf ?? src.id;
             row.nameCtrl.text = src.nameCtrl.text;
             row.hsnCtrl.text = src.hsnCtrl.text;
+            // A variant starts on the product's prices: a size or colour is
+            // usually sold and bought at the same rate, so the cashier types
+            // them once. Editing either cell on the variant sets it apart and
+            // it stops following.
+            row.priceCtrl.text = src.priceCtrl.text;
+            row.buyingCtrl.text = src.buyingCtrl.text;
             rows.insert(i + 1, row);
             regenSkus();
             recount();
@@ -19696,7 +19848,17 @@ end tell
                             align: TextAlign.end,
                             focusNode: r.priceFocus,
                             onEnter: () => r.stockFocus.requestFocus(),
-                            onChanged: (_) => recount(),
+                            onChanged: (_) {
+                              // Typing here sets a variant apart from its
+                              // product; on a product row it carries the new
+                              // price down to the variants still following.
+                              if (r.variantOf != null) {
+                                r.priceAuto = false;
+                              } else {
+                                setLocal(() => syncVariantPrices(r));
+                              }
+                              recount();
+                            },
                           ),
                         ),
                         SizedBox(
@@ -19736,7 +19898,14 @@ end tell
                                 }
                               });
                             },
-                            onChanged: (_) => recount(),
+                            onChanged: (_) {
+                              if (r.variantOf != null) {
+                                r.buyingAuto = false;
+                              } else {
+                                setLocal(() => syncVariantPrices(r));
+                              }
+                              recount();
+                            },
                           ),
                         ),
                         SizedBox(
@@ -29638,6 +29807,14 @@ class _BulkProductRow {
   /// False once the SKU cell is edited by hand, so typing a name stops
   /// overwriting it.
   bool skuAuto = true;
+
+  /// False once this variant row's own price / buying price is typed into.
+  /// Variants of one product almost always share both, so a variant row
+  /// follows the row it was added from until someone sets it apart — the
+  /// same "automatic until you touch it" rule [skuAuto] uses. Only ever
+  /// consulted on a variant row; a product row carries its own figures.
+  bool priceAuto = true;
+  bool buyingAuto = true;
 
   /// Why this row failed the last save attempt, shown beneath it.
   String? error;
