@@ -1,4 +1,4 @@
-import 'dart:convert' show jsonEncode;
+import 'dart:convert' show jsonEncode, jsonDecode;
 import 'dart:io';
 import 'dart:math' show Random;
 import 'package:path_provider/path_provider.dart';
@@ -114,6 +114,10 @@ class LocalDbService {
     try {
       await db.execute(_purchasesTableSql);
     } catch (_) {}
+    try {
+      await db.execute(_recycleBinTableSql);
+      await purgeExpiredBinEntries(db);
+    } catch (_) {}
     for (final table in _expectedColumns.entries) {
       final Set<String> present;
       try {
@@ -141,7 +145,7 @@ class LocalDbService {
   static Future<Database> _openVersioned(String dbPath, String userId) async {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 19,
+      version: 20,
       // Hardening against "database is locked" (SQLITE_BUSY) when another
       // process briefly holds the file (leftover instance, antivirus scan):
       // WAL lets readers and writers coexist, and busy_timeout makes a write
@@ -329,6 +333,13 @@ class LocalDbService {
             await db.execute(_purchasesTableSql);
           } catch (_) {}
         }
+        if (oldVersion < 20) {
+          // Recycle bin: recoverable copies of deleted rows. Local-only, so
+          // nothing about sync changes.
+          try {
+            await db.execute(_recycleBinTableSql);
+          } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -346,6 +357,27 @@ class LocalDbService {
       notes TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT '',
       deleted INTEGER NOT NULL DEFAULT 0
+    )
+  ''';
+
+  /// Recoverable copies of deleted rows.
+  ///
+  /// Deliberately a SEPARATE table rather than un-purged tombstones: a row is
+  /// archived here BEFORE the existing delete runs, so the delete and the
+  /// sync engine behind it are left exactly as they were. The sync system is
+  /// finalized, and a recycle bin is not worth reopening it for.
+  ///
+  /// Local-only and never synced, so the bin belongs to the till that did the
+  /// deleting. [payload] is the whole original row as JSON, which is what
+  /// makes a restore an exact re-insert rather than a reconstruction.
+  static const String _recycleBinTableSql = '''
+    CREATE TABLE IF NOT EXISTS recycle_bin (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      row_id TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL,
+      deleted_at TEXT NOT NULL
     )
   ''';
 
@@ -458,6 +490,7 @@ class LocalDbService {
     ''');
     await db.execute(_productVariantsTableSql);
     await db.execute(_purchasesTableSql);
+    await db.execute(_recycleBinTableSql);
   }
 
   // ── Invoice ID ───────────────────────────────────────────────────────────
@@ -640,6 +673,143 @@ class LocalDbService {
     });
 
     return (sales, reversals);
+  }
+
+  // ── Recycle bin ───────────────────────────────────────────────────────────
+
+  /// How long a deleted row stays recoverable.
+  static const Duration binRetention = Duration(days: 30);
+
+  /// Which live table each archived kind came from. Restoring puts the row
+  /// straight back into it.
+  static const Map<String, String> _binTables = {
+    'transaction': 'transactions',
+    'customer': 'customers',
+    'product': 'products',
+    'variant': 'product_variants',
+    'category': 'categories',
+    'purchase': 'purchases',
+  };
+
+  /// Copies [rows] into the bin before their table rows are deleted. Takes the
+  /// caller's [txn] so the archive and the delete commit together: a copy
+  /// without a delete would show a phantom entry in the bin, and a delete
+  /// without a copy loses the data this feature exists to keep.
+  static Future<void> archiveRows(
+    DatabaseExecutor txn,
+    String kind,
+    List<Map<String, Object?>> rows,
+    String Function(Map<String, Object?> row) labelOf,
+  ) async {
+    if (rows.isEmpty) return;
+    final now = DateTime.now().toIso8601String();
+    final batch = txn.batch();
+    for (final row in rows) {
+      // Categories key on name; everything else on id.
+      final rowId = (row['id'] ?? row['name'] ?? '').toString();
+      if (rowId.isEmpty) continue;
+      batch.insert('recycle_bin', {
+        'id': const Uuid().v4(),
+        'kind': kind,
+        'row_id': rowId,
+        'label': labelOf(row),
+        'payload': jsonEncode(row),
+        'deleted_at': now,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  /// Convenience for the common case: read the rows about to be deleted, then
+  /// archive them.
+  static Future<void> archiveByQuery(
+    DatabaseExecutor txn,
+    String kind,
+    String table,
+    String where,
+    List<Object?> whereArgs,
+    String Function(Map<String, Object?> row) labelOf,
+  ) async {
+    final rows = await txn.query(table, where: where, whereArgs: whereArgs);
+    await archiveRows(txn, kind, rows, labelOf);
+  }
+
+  /// Bin contents, newest first.
+  static Future<List<Map<String, Object?>>> getRecycleBin() async {
+    final database = await db;
+    return database.query('recycle_bin', orderBy: 'deleted_at DESC');
+  }
+
+  static Future<int> recycleBinCount() async {
+    final database = await db;
+    final rows = await database.rawQuery(
+      'SELECT COUNT(*) AS c FROM recycle_bin',
+    );
+    return (rows.first['c'] as int?) ?? 0;
+  }
+
+  /// Puts an archived row back into its table and drops the bin entry.
+  ///
+  /// The row goes back marked unsynced so the existing push re-creates it in
+  /// the cloud, where the original delete removed it for good. `deleted` is
+  /// forced to 0: the archived copy was taken BEFORE the delete, but a reset
+  /// archives rows that may already carry a tombstone.
+  static Future<bool> restoreFromBin(String entryId) async {
+    final database = await db;
+    return database.transaction((txn) async {
+      final rows = await txn.query(
+        'recycle_bin',
+        where: 'id = ?',
+        whereArgs: [entryId],
+        limit: 1,
+      );
+      if (rows.isEmpty) return false;
+      final kind = rows.first['kind'] as String;
+      final table = _binTables[kind];
+      if (table == null) return false;
+      final Map<String, Object?> payload;
+      try {
+        payload = Map<String, Object?>.from(
+          jsonDecode(rows.first['payload'] as String) as Map,
+        );
+      } catch (_) {
+        return false;
+      }
+      payload['deleted'] = 0;
+      payload['synced'] = 0;
+      if (payload.containsKey('rev')) {
+        payload['rev'] = ((payload['rev'] as num?)?.toInt() ?? 0) + 1;
+      }
+      await txn.insert(
+        table,
+        payload,
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await txn.delete('recycle_bin', where: 'id = ?', whereArgs: [entryId]);
+      return true;
+    });
+  }
+
+  static Future<void> deleteBinEntry(String entryId) async {
+    final database = await db;
+    await database.delete('recycle_bin', where: 'id = ?', whereArgs: [entryId]);
+  }
+
+  static Future<void> emptyRecycleBin() async {
+    final database = await db;
+    await database.delete('recycle_bin');
+  }
+
+  /// Drops entries past [binRetention]. Runs on every open, so the bin cannot
+  /// grow without bound on a till that is never looked at.
+  static Future<void> purgeExpiredBinEntries([DatabaseExecutor? into]) async {
+    final database = into ?? await db;
+    final cutoff = DateTime.now().subtract(binRetention).toIso8601String();
+    await database.delete(
+      'recycle_bin',
+      where: 'deleted_at < ?',
+      whereArgs: [cutoff],
+    );
   }
 
   // ── Settings ──────────────────────────────────────────────────────────────
@@ -904,11 +1074,35 @@ class LocalDbService {
   /// purge) turns each into a real cloud deletion. Works offline: the
   /// tombstones simply wait for reconnect. Reuses the exact per-row mechanism
   /// as single deletes — no direct cloud calls and no change to the sync engine.
+  /// Which archive kind each resettable table maps to, so a full reset lands
+  /// in the bin under the same kinds an individual delete would use.
+  static const Map<String, String> _resetKinds = {
+    'transactions': 'transaction',
+    'customers': 'customer',
+    'products': 'product',
+    'product_variants': 'variant',
+    'categories': 'category',
+  };
+
   static Future<void> softDeleteAllInTables(List<String> tables) async {
     final database = await db;
     await database.transaction((txn) async {
       for (final t in tables) {
         if (!resettableTables.contains(t)) continue;
+        // A reset archives every row it is about to hide, so "Reset All Data"
+        // is recoverable too. On a large shop this copies a lot of rows; the
+        // 30-day sweep in purgeExpiredBinEntries is what keeps it bounded.
+        final kind = _resetKinds[t];
+        if (kind != null) {
+          await archiveByQuery(txn, kind, t, 'deleted = 0', const [], (r) {
+            return (r['name'] ??
+                    r['invoice_number'] ??
+                    r['label'] ??
+                    r['id'] ??
+                    '')
+                .toString();
+          });
+        }
         await txn.rawUpdate(
           'UPDATE $t SET deleted = 1, synced = 0, rev = rev + 1 '
           'WHERE deleted = 0',
@@ -1145,17 +1339,38 @@ class LocalDbService {
 
   static Future<void> deleteProduct(String id) async {
     final database = await db;
-    // Soft-delete: mark for cloud removal, hidden from UI immediately
-    await database.rawUpdate(
-      'UPDATE products SET deleted = 1, synced = 0, rev = rev + 1 '
-      'WHERE id = ?',
-      [id],
-    );
-    await database.rawUpdate(
-      'UPDATE product_variants SET deleted = 1, synced = 0, rev = rev + 1 '
-      'WHERE product_id = ?',
-      [id],
-    );
+    await database.transaction((txn) async {
+      // Product and its variants are archived separately, so restoring the
+      // product brings back the thing you can sell and each variant can be
+      // recovered on its own.
+      await archiveByQuery(
+        txn,
+        'product',
+        'products',
+        'id = ?',
+        [id],
+        (r) => (r['name'] ?? '').toString(),
+      );
+      await archiveByQuery(
+        txn,
+        'variant',
+        'product_variants',
+        'product_id = ?',
+        [id],
+        (r) => (r['label'] ?? '').toString(),
+      );
+      // Soft-delete: mark for cloud removal, hidden from UI immediately
+      await txn.rawUpdate(
+        'UPDATE products SET deleted = 1, synced = 0, rev = rev + 1 '
+        'WHERE id = ?',
+        [id],
+      );
+      await txn.rawUpdate(
+        'UPDATE product_variants SET deleted = 1, synced = 0, rev = rev + 1 '
+        'WHERE product_id = ?',
+        [id],
+      );
+    });
   }
 
   static Future<List<Product>> getUnsyncedProducts() async {
@@ -1649,15 +1864,111 @@ class LocalDbService {
     );
   }
 
-  static Future<void> deleteTransaction(String id) async {
+  /// Soft-deletes a bill. With [restoreStock], the units it moved are put
+  /// back first — the exact inverse of the deduction [_writeTransactionRow]
+  /// made when the sale was saved, variant rows included.
+  ///
+  /// Both happen inside ONE SQLite transaction, so stock can never be
+  /// restored against a bill that then fails to delete. The restore is
+  /// guarded on the row not already being deleted: adding stock is not
+  /// idempotent, and a second delete of the same bill would otherwise put
+  /// the units back twice.
+  ///
+  /// A return or exchange carries NEGATIVE quantities, so the same arithmetic
+  /// correctly takes stock back off when one is deleted.
+  static Future<void> deleteTransaction(
+    String id, {
+    bool restoreStock = false,
+  }) async {
     final database = await db;
-    // Soft-delete: hide it now, mark for cloud removal. A hard delete alone
-    // would be undone by the next pull, which re-downloads it from Supabase.
-    await database.rawUpdate(
-      'UPDATE transactions SET deleted = 1, synced = 0, rev = rev + 1 '
-      'WHERE id = ?',
-      [id],
-    );
+    await database.transaction((txn) async {
+      // Archived before the delete, so it can be recovered from the bin.
+      await archiveByQuery(txn, 'transaction', 'transactions', 'id = ?', [id], (
+        r,
+      ) {
+        final inv = (r['invoice_number'] ?? '').toString();
+        final total = (r['total'] as num?)?.toDouble() ?? 0;
+        return inv.isEmpty
+            ? 'Bill ${total.toStringAsFixed(2)}'
+            : '$inv · ${total.toStringAsFixed(2)}';
+      });
+      if (restoreStock) {
+        final rows = await txn.query(
+          'transactions',
+          where: 'id = ? AND deleted = 0',
+          whereArgs: [id],
+          limit: 1,
+        );
+        // Absent or already deleted: nothing to give back.
+        if (rows.isNotEmpty) {
+          await _restoreStockForTransaction(
+            txn,
+            TransactionRecord.fromMap(rows.first),
+          );
+        }
+      }
+      // Soft-delete: hide it now, mark for cloud removal. A hard delete alone
+      // would be undone by the next pull, which re-downloads it from Supabase.
+      await txn.rawUpdate(
+        'UPDATE transactions SET deleted = 1, synced = 0, rev = rev + 1 '
+        'WHERE id = ?',
+        [id],
+      );
+    });
+  }
+
+  /// Adds each sold line's quantity back to its product or variant, mirroring
+  /// the deduction in [_writeTransactionRow] line for line — same
+  /// variant-before-product branch, same `synced = 0, rev = rev + 1` so the
+  /// corrected stock reaches the cloud.
+  ///
+  /// Note this cannot always be an exact inverse: [_stockAfterSale] clamps at
+  /// zero, so selling 5 of a product that had 3 recorded 0 rather than -2,
+  /// and giving 5 back leaves 5. That is a pre-existing property of the
+  /// deduction, not something the restore can recover.
+  static Future<void> _restoreStockForTransaction(
+    DatabaseExecutor txn,
+    TransactionRecord t,
+  ) async {
+    for (final item in t.items) {
+      if (item.variantId != null) {
+        final rows = await txn.query(
+          'product_variants',
+          where: 'id = ?',
+          whereArgs: [item.variantId],
+          limit: 1,
+        );
+        if (rows.isNotEmpty) {
+          final current = (rows.first['stock'] is num)
+              ? (rows.first['stock'] as num).toInt()
+              : 0;
+          final restored = current + item.quantity;
+          await txn.rawUpdate(
+            'UPDATE product_variants SET stock = ?, synced = 0, '
+            'rev = rev + 1 WHERE id = ?',
+            [restored < 0 ? 0 : restored, item.variantId],
+          );
+        }
+        continue;
+      }
+      final rows = await txn.query(
+        'products',
+        where: 'id = ?',
+        whereArgs: [item.productId],
+        limit: 1,
+      );
+      if (rows.isNotEmpty) {
+        final current = (rows.first['stock'] is num)
+            ? (rows.first['stock'] as num).toInt()
+            : 0;
+        final restored = current + item.quantity;
+        await txn.rawUpdate(
+          'UPDATE products SET stock = ?, synced = 0, rev = rev + 1 '
+          'WHERE id = ?',
+          [restored < 0 ? 0 : restored, item.productId],
+        );
+      }
+    }
   }
 
   // Transactions deleted locally but not yet removed from Supabase.
@@ -1752,11 +2063,18 @@ class LocalDbService {
   /// Soft delete — the tombstone is what tells the cloud to drop the row.
   static Future<void> softDeletePurchase(String id) async {
     final database = await db;
-    await database.rawUpdate(
-      'UPDATE purchases SET deleted = 1, synced = 0, rev = rev + 1 '
-      'WHERE id = ?',
-      [id],
-    );
+    await database.transaction((txn) async {
+      await archiveByQuery(txn, 'purchase', 'purchases', 'id = ?', [id], (r) {
+        final inv = (r['invoice_no'] ?? '').toString();
+        final dealer = (r['dealer_name'] ?? '').toString();
+        return [dealer, inv].where((s) => s.isNotEmpty).join(' · ');
+      });
+      await txn.rawUpdate(
+        'UPDATE purchases SET deleted = 1, synced = 0, rev = rev + 1 '
+        'WHERE id = ?',
+        [id],
+      );
+    });
   }
 
   static Future<(List<Purchase>, Map<String, int>)>
@@ -2030,13 +2348,23 @@ class LocalDbService {
 
   static Future<void> deleteCustomer(String id) async {
     final database = await db;
-    // Soft-delete: hidden immediately, pushed as a cloud deletion. A hard
-    // delete alone would be undone by the next pull.
-    await database.rawUpdate(
-      'UPDATE customers SET deleted = 1, synced = 0, rev = rev + 1 '
-      'WHERE id = ?',
-      [id],
-    );
+    await database.transaction((txn) async {
+      await archiveByQuery(
+        txn,
+        'customer',
+        'customers',
+        'id = ?',
+        [id],
+        (r) => (r['name'] ?? '').toString(),
+      );
+      // Soft-delete: hidden immediately, pushed as a cloud deletion. A hard
+      // delete alone would be undone by the next pull.
+      await txn.rawUpdate(
+        'UPDATE customers SET deleted = 1, synced = 0, rev = rev + 1 '
+        'WHERE id = ?',
+        [id],
+      );
+    });
   }
 
   // Customers deleted locally but not yet removed from Supabase.

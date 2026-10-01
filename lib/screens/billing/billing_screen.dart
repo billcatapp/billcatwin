@@ -38,22 +38,45 @@ const _defaultProducts = <Product>[];
 
 // ── Money formatting ─────────────────────────────────────────────────────────
 
-/// Groups integer digits with thousands separators: '12345' -> '12,345'.
-String _groupDigits(String intStr) {
+/// Groups integer digits with separators: '12345' -> '12,345'.
+///
+/// With [indian], the lakh/crore system Indian retail reads in: the last
+/// three digits stay together and everything above them is grouped in twos,
+/// so '255776248' -> '25,57,76,248' rather than '255,776,248'.
+///
+/// The sign is stripped before grouping and re-attached afterwards. Running
+/// the loop over the signed string instead yields '-,25,57,76,248'.
+String _groupDigits(String intStr, {bool indian = false}) {
   final neg = intStr.startsWith('-');
   final s = neg ? intStr.substring(1) : intStr;
   final buf = StringBuffer();
-  for (var i = 0; i < s.length; i++) {
-    if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
-    buf.write(s[i]);
+  if (indian && s.length > 3) {
+    // Up to three digits the two systems agree, so only longer values split.
+    final head = s.substring(0, s.length - 3);
+    for (var i = 0; i < head.length; i++) {
+      if (i > 0 && (head.length - i) % 2 == 0) buf.write(',');
+      buf.write(head[i]);
+    }
+    buf.write(',');
+    buf.write(s.substring(s.length - 3));
+  } else {
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
+      buf.write(s[i]);
+    }
   }
   return '${neg ? '-' : ''}$buf';
 }
 
-/// Formats [v] as money with comma-grouped digits, e.g. ₹1,234.50.
+/// True for currencies written in the Indian lakh/crore grouping. Keyed on
+/// the symbol because that is the only currency signal the sub-widgets carry.
+bool _indianGrouping(String symbol) => symbol == '₹';
+
+/// Formats [v] as money with grouped digits, e.g. ₹1,234.50.
 String _moneyFmt(String symbol, double v) {
   final parts = v.toStringAsFixed(2).split('.');
-  return '$symbol${_groupDigits(parts[0])}.${parts[1]}';
+  final grouped = _groupDigits(parts[0], indian: _indianGrouping(symbol));
+  return '$symbol$grouped.${parts[1]}';
 }
 
 // ── Currency data ────────────────────────────────────────────────────────────
@@ -5330,6 +5353,17 @@ class _BillingScreenState extends State<BillingScreen> {
           style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
         ),
         const SizedBox(height: 24),
+        _settingsSectionHeader('RECYCLE BIN'),
+        const SizedBox(height: 4),
+        _dataResetCard(
+          icon: Icons.restore_from_trash_outlined,
+          title: 'Recycle Bin',
+          subtitle:
+              'Recover deleted bills, customers, products and purchases · '
+              'kept ${LocalDbService.binRetention.inDays} days',
+          onTap: _showRecycleBin,
+        ),
+        const SizedBox(height: 24),
         _settingsSectionHeader('RESET OPTIONS'),
         const SizedBox(height: 4),
         _dataResetCard(
@@ -5458,6 +5492,181 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Runs a reset after a type-DELETE confirmation. Soft-deletes locally (so it
   /// works offline and disappears at once), then lets the ordinary sync push
   /// remove the rows from the cloud.
+  /// Lists what the bin holds, newest first, with a Restore on each row.
+  ///
+  /// Restoring re-inserts the archived row marked unsynced, so the existing
+  /// push re-creates it in the cloud — the original delete removed it there
+  /// for good, which is why a plain un-delete would not have been enough.
+  Future<void> _showRecycleBin() async {
+    var entries = await LocalDbService.getRecycleBin();
+    if (!mounted) return;
+    const kindLabels = {
+      'transaction': 'Bill',
+      'customer': 'Customer',
+      'product': 'Product',
+      'variant': 'Variant',
+      'category': 'Category',
+      'purchase': 'Purchase',
+    };
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => Dialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: SizedBox(
+            width: 560,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 20, 12, 8),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Recycle Bin',
+                              style: GoogleFonts.manrope(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                                color: AppColors.primary,
+                              ),
+                            ),
+                            Text(
+                              entries.isEmpty
+                                  ? 'Nothing deleted recently'
+                                  : '${entries.length} item'
+                                        '${entries.length == 1 ? '' : 's'} · '
+                                        'removed after '
+                                        '${LocalDbService.binRetention.inDays} days',
+                              style: GoogleFonts.inter(
+                                fontSize: 12,
+                                color: AppColors.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (entries.isNotEmpty)
+                        TextButton(
+                          onPressed: () async {
+                            await LocalDbService.emptyRecycleBin();
+                            final fresh = await LocalDbService.getRecycleBin();
+                            setLocal(() => entries = fresh);
+                          },
+                          child: Text(
+                            'Empty',
+                            style: GoogleFonts.inter(
+                              fontSize: 12.5,
+                              color: AppColors.error,
+                            ),
+                          ),
+                        ),
+                      IconButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        icon: const Icon(Icons.close_rounded, size: 18),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1, color: AppColors.border),
+                if (entries.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 40),
+                    child: Center(
+                      child: Text(
+                        'Deleted items appear here',
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 420),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: entries.length,
+                      separatorBuilder: (_, _) =>
+                          const Divider(height: 1, color: AppColors.border),
+                      itemBuilder: (_, i) {
+                        final e = entries[i];
+                        final kind = (e['kind'] ?? '').toString();
+                        final label = (e['label'] ?? '').toString();
+                        final when =
+                            DateTime.tryParse(
+                              (e['deleted_at'] ?? '').toString(),
+                            ) ??
+                            DateTime.now();
+                        return ListTile(
+                          dense: true,
+                          title: Text(
+                            label.isEmpty ? '(no name)' : label,
+                            style: GoogleFonts.inter(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.textDark,
+                            ),
+                          ),
+                          subtitle: Text(
+                            '${kindLabels[kind] ?? kind} · ${_fmtDMY(when)}',
+                            style: GoogleFonts.inter(
+                              fontSize: 11.5,
+                              color: AppColors.textMuted,
+                            ),
+                          ),
+                          trailing: TextButton(
+                            onPressed: () async {
+                              final ok = await LocalDbService.restoreFromBin(
+                                (e['id'] ?? '').toString(),
+                              );
+                              final fresh =
+                                  await LocalDbService.getRecycleBin();
+                              if (!ctx.mounted) return;
+                              setLocal(() => entries = fresh);
+                              _loadProducts();
+                              _loadDashboardData();
+                              _loadSavedCustomers();
+                              if (ConnectivityService.instance.isOnline) {
+                                ConnectivityService.instance.syncNow();
+                              }
+                              _showToast(
+                                ok
+                                    ? 'Restored'
+                                    : 'Could not restore this item',
+                                isError: !ok,
+                              );
+                            },
+                            child: Text(
+                              'Restore',
+                              style: GoogleFonts.inter(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.accentBlue,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                const SizedBox(height: 8),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> _resetData(String label, List<String> tables) async {
     final confirmed = await _confirmTypeToDelete(label);
     if (confirmed != true || !mounted) return;
@@ -14466,7 +14675,7 @@ end tell
     if (prices.first == prices.last) {
       return '${_fmt(prices.first)}';
     }
-    return '$_currencySymbol${_groupDigits(prices.first.toStringAsFixed(0))}–${_groupDigits(prices.last.toStringAsFixed(0))}';
+    return '$_currencySymbol${_groupDigits(prices.first.toStringAsFixed(0), indian: _indianGrouping(_currencySymbol))}–${_groupDigits(prices.last.toStringAsFixed(0), indian: _indianGrouping(_currencySymbol))}';
   }
 
   Widget _inventoryCard(Product p) {
@@ -19985,8 +20194,175 @@ end tell
             );
           }
 
+          // Ctrl + '+' adds a variant to the row being typed in, so a product
+          // with several sizes is entered without leaving the keyboard. The
+          // row comes from whichever of its cells holds focus; with focus
+          // outside the grid it falls back to the last named row, which is
+          // the one just typed.
+          void addVariantToFocusedRow() {
+            var target = -1;
+            for (var i = 0; i < rows.length; i++) {
+              final r = rows[i];
+              if (r.nameFocus.hasFocus ||
+                  r.variantFocus.hasFocus ||
+                  r.skuFocus.hasFocus ||
+                  r.hsnFocus.hasFocus ||
+                  r.priceFocus.hasFocus ||
+                  r.stockFocus.hasFocus ||
+                  r.buyingFocus.hasFocus) {
+                target = i;
+                break;
+              }
+            }
+            if (target < 0) {
+              for (var i = rows.length - 1; i >= 0; i--) {
+                if (rows[i].nameCtrl.text.trim().isNotEmpty) {
+                  target = i;
+                  break;
+                }
+              }
+            }
+            // Same guard the row's own + button uses: a variant of an unnamed
+            // product has nothing to attach to.
+            if (target < 0 || rows[target].nameCtrl.text.trim().isEmpty) return;
+            setLocal(() => addVariantRow(target));
+          }
+
+          // The row's cells in the order they appear. Category is a dropdown
+          // rather than something you type into, so it carries no focus node
+          // and is stepped over.
+          List<FocusNode> cellsOf(_BulkProductRow r) => [
+            r.nameFocus,
+            r.variantFocus,
+            r.skuFocus,
+            r.hsnFocus,
+            r.priceFocus,
+            r.stockFocus,
+            r.buyingFocus,
+          ];
+
+          /// Moves focus [delta] rows while staying in the same column, so the
+          /// grid walks like a spreadsheet. Only up and down are bound: left
+          /// and right have to keep moving the text cursor inside a cell, and
+          /// Enter already steps along the row.
+          void moveFocusRow(int delta) {
+            for (var i = 0; i < rows.length; i++) {
+              final cells = cellsOf(rows[i]);
+              for (var c = 0; c < cells.length; c++) {
+                if (!cells[c].hasFocus) continue;
+                final target = i + delta;
+                if (target < 0 || target >= rows.length) return;
+                cellsOf(rows[target])[c].requestFocus();
+                return;
+              }
+            }
+          }
+
+          // Handled on the cell's OWN focus node, not by the Shortcuts widget
+          // wrapping the dialog. A focus node sees the key before any
+          // ancestor, which is what it takes to beat Flutter's built-in text
+          // editing: inside a field, up and down otherwise jump the caret to
+          // the start or end of the value and the event never bubbles out.
+          // The text behind each cell, in the same order as [cellsOf].
+          List<TextEditingController> ctrlsOf(_BulkProductRow r) => [
+            r.nameCtrl,
+            r.variantCtrl,
+            r.skuCtrl,
+            r.hsnCtrl,
+            r.priceCtrl,
+            r.stockCtrl,
+            r.buyingCtrl,
+          ];
+
+          /// Which (row, column) a focus node belongs to, or null.
+          (int, int)? locate(FocusNode node) {
+            for (var i = 0; i < rows.length; i++) {
+              final cells = cellsOf(rows[i]);
+              for (var c = 0; c < cells.length; c++) {
+                if (identical(cells[c], node)) return (i, c);
+              }
+            }
+            return null;
+          }
+
+          void focusCell(int row, int col) {
+            if (row < 0 || row >= rows.length) return;
+            final cells = cellsOf(rows[row]);
+            if (col < 0 || col >= cells.length) return;
+            cells[col].requestFocus();
+            // Caret to the end, so typing appends instead of landing wherever
+            // the caret happened to sit last time that cell was visited.
+            final ctrl = ctrlsOf(rows[row])[col];
+            ctrl.selection = TextSelection.collapsed(offset: ctrl.text.length);
+          }
+
+          KeyEventResult onCellKey(FocusNode node, KeyEvent event) {
+            if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+              return KeyEventResult.ignored;
+            }
+            final at = locate(node);
+            if (at == null) return KeyEventResult.ignored;
+            final (row, col) = at;
+            final key = event.logicalKey;
+
+            if (key == LogicalKeyboardKey.arrowDown) {
+              focusCell(row + 1, col);
+              return KeyEventResult.handled;
+            }
+            if (key == LogicalKeyboardKey.arrowUp) {
+              focusCell(row - 1, col);
+              return KeyEventResult.handled;
+            }
+
+            // Left and right step OUT of a cell from its edge, and walk the
+            // caret while there is still text to move through — so a typo in
+            // the middle of a price is still reachable. An empty cell has
+            // both edges at once, so the grid walks freely.
+            final ctrl = ctrlsOf(rows[row])[col];
+            final sel = ctrl.selection;
+            final atStart =
+                sel.isValid && sel.isCollapsed && sel.baseOffset <= 0;
+            final atEnd =
+                sel.isValid &&
+                sel.isCollapsed &&
+                sel.baseOffset >= ctrl.text.length;
+
+            if (key == LogicalKeyboardKey.arrowLeft && atStart) {
+              focusCell(row, col - 1);
+              return KeyEventResult.handled;
+            }
+            if (key == LogicalKeyboardKey.arrowRight && atEnd) {
+              focusCell(row, col + 1);
+              return KeyEventResult.handled;
+            }
+            return KeyEventResult.ignored;
+          }
+
+          for (final r in rows) {
+            for (final f in cellsOf(r)) {
+              f.onKeyEvent = onCellKey;
+            }
+          }
+
           final screenWidth = MediaQuery.of(ctx).size.width;
-          return Dialog(
+          return CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.arrowDown): () =>
+                  moveFocusRow(1),
+              const SingleActivator(LogicalKeyboardKey.arrowUp): () =>
+                  moveFocusRow(-1),
+              // '+' is Shift+'=' on most layouts, so the unshifted key is
+              // bound too — otherwise this only fires from a numpad.
+              const SingleActivator(LogicalKeyboardKey.equal, control: true):
+                  addVariantToFocusedRow,
+              const SingleActivator(LogicalKeyboardKey.add, control: true):
+                  addVariantToFocusedRow,
+              const SingleActivator(
+                LogicalKeyboardKey.numpadAdd,
+                control: true,
+              ): addVariantToFocusedRow,
+            },
+            child: Dialog(
             backgroundColor: Colors.white,
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(16),
@@ -20305,6 +20681,7 @@ end tell
                   ],
                 ),
               ),
+            ),
             ),
           );
         },
@@ -20858,6 +21235,37 @@ end tell
     }
   }
 
+  /// Dresses the calendar in BillCat's own palette and Inter. Stock Material
+  /// styling looked nothing like the rest of the app: purple accents, a heavy
+  /// tinted header and a different typeface.
+  Widget _themedPicker(BuildContext context, Widget child) => Theme(
+    data: Theme.of(context).copyWith(
+      colorScheme: const ColorScheme.light(
+        primary: AppColors.primary,
+        onPrimary: Colors.white,
+        surface: AppColors.surface,
+        onSurface: AppColors.textDark,
+      ),
+      textTheme: GoogleFonts.interTextTheme(Theme.of(context).textTheme),
+      datePickerTheme: DatePickerThemeData(
+        backgroundColor: AppColors.surface,
+        surfaceTintColor: Colors.transparent,
+        weekdayStyle: GoogleFonts.inter(
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+          color: AppColors.textMuted,
+        ),
+        dayStyle: GoogleFonts.inter(fontSize: 13),
+        todayBorder: const BorderSide(
+          color: AppColors.accentBlue,
+          width: 1.2,
+        ),
+        dividerColor: Colors.transparent,
+      ),
+    ),
+    child: child,
+  );
+
   /// A tappable field that opens a date picker, used for purchase dates in the
   /// add / edit / restock product dialogs. [onChanged] fires with the picked
   /// date, or null when the user clears it.
@@ -20880,11 +21288,80 @@ end tell
         var initial = value ?? now;
         if (initial.isBefore(firstDate)) initial = firstDate;
         if (initial.isAfter(lastDate)) initial = lastDate;
-        final picked = await showDatePicker(
+        // Built around CalendarDatePicker rather than showDatePicker so Enter
+        // can confirm: showDatePicker keeps its selection private, and from
+        // its builder there is no way to read what the user picked or to
+        // press its OK for them.
+        var selected = initial;
+        final picked = await showDialog<DateTime>(
           context: ctx,
-          initialDate: initial,
-          firstDate: firstDate,
-          lastDate: lastDate,
+          builder: (dctx) => _themedPicker(
+            dctx,
+            CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.enter): () =>
+                    Navigator.pop(dctx, selected),
+                const SingleActivator(LogicalKeyboardKey.numpadEnter): () =>
+                    Navigator.pop(dctx, selected),
+              },
+              // Focused on open, so Enter is caught without clicking first.
+              child: Focus(
+                autofocus: true,
+                child: Dialog(
+                  backgroundColor: AppColors.surface,
+                  surfaceTintColor: Colors.transparent,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: SizedBox(
+                    width: 340,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CalendarDatePicker(
+                          initialDate: initial,
+                          firstDate: firstDate,
+                          lastDate: lastDate,
+                          onDateChanged: (d) => selected = d,
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(dctx),
+                                child: Text(
+                                  'Cancel',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    color: AppColors.textMuted,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              TextButton(
+                                onPressed: () =>
+                                    Navigator.pop(dctx, selected),
+                                child: Text(
+                                  'OK',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w700,
+                                    color: AppColors.accentBlue,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
         );
         if (picked != null) onChanged(picked);
       },
@@ -25411,38 +25888,86 @@ end tell
                   children: [
                     IconButton(
                       onPressed: () async {
-                        final confirm = await showDialog<bool>(
+                        // A return or exchange moved stock the other way, so
+                        // undoing it TAKES stock back rather than giving it.
+                        // Saying "return to inventory" there would describe
+                        // the opposite of what happens.
+                        final reversal = t.isReturn;
+                        final choice = await showDialog<String>(
                           context: ctx,
                           builder: (c2) => AlertDialog(
+                            backgroundColor: Colors.white,
+                            surfaceTintColor: Colors.transparent,
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(14),
                             ),
+                            titlePadding: const EdgeInsets.fromLTRB(
+                              20,
+                              20,
+                              20,
+                              8,
+                            ),
+                            contentPadding: const EdgeInsets.fromLTRB(
+                              20,
+                              0,
+                              20,
+                              4,
+                            ),
+                            actionsPadding: const EdgeInsets.fromLTRB(
+                              12,
+                              0,
+                              12,
+                              12,
+                            ),
                             title: Text(
-                              'Delete Transaction?',
+                              'Delete bill?',
                               style: GoogleFonts.manrope(
                                 fontWeight: FontWeight.w700,
-                                fontSize: 16,
+                                fontSize: 15,
                               ),
                             ),
-                            content: Text(
-                              'This will permanently remove this transaction.',
-                              style: GoogleFonts.inter(
-                                fontSize: 13,
-                                color: AppColors.textMuted,
+                            // Without a width the dialog sizes to the longest
+                            // line and sprawls across the screen.
+                            content: SizedBox(
+                              width: 300,
+                              child: Text(
+                                reversal
+                                    ? 'This bill put items back in stock. '
+                                          'Take them out again?'
+                                    : 'Its items are still counted as sold. '
+                                          'Put them back in stock?',
+                                style: GoogleFonts.inter(
+                                  fontSize: 12.5,
+                                  height: 1.4,
+                                  color: AppColors.textMuted,
+                                ),
                               ),
                             ),
+                            actionsOverflowDirection: VerticalDirection.down,
                             actions: [
                               TextButton(
-                                onPressed: () => Navigator.pop(c2, false),
+                                onPressed: () => Navigator.pop(c2, 'cancel'),
                                 child: Text(
                                   'Cancel',
                                   style: GoogleFonts.inter(
+                                    fontSize: 12.5,
+                                    color: AppColors.textMuted,
+                                  ),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: () => Navigator.pop(c2, 'keep'),
+                                child: Text(
+                                  'Delete only',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w600,
                                     color: AppColors.textMuted,
                                   ),
                                 ),
                               ),
                               ElevatedButton(
-                                onPressed: () => Navigator.pop(c2, true),
+                                onPressed: () => Navigator.pop(c2, 'restore'),
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: Colors.red,
                                   foregroundColor: Colors.white,
@@ -25452,8 +25977,9 @@ end tell
                                   ),
                                 ),
                                 child: Text(
-                                  'Delete',
+                                  reversal ? 'Delete & remove' : 'Delete & restock',
                                   style: GoogleFonts.inter(
+                                    fontSize: 12.5,
                                     fontWeight: FontWeight.w600,
                                   ),
                                 ),
@@ -25461,9 +25987,13 @@ end tell
                             ],
                           ),
                         );
-                        if (confirm == true && ctx.mounted) {
+                        if ((choice == 'restore' || choice == 'keep') &&
+                            ctx.mounted) {
                           Navigator.pop(ctx);
-                          await _deleteTransaction(t.id);
+                          await _deleteTransaction(
+                            t.id,
+                            restoreStock: choice == 'restore',
+                          );
                         }
                       },
                       icon: const Icon(
@@ -25537,10 +26067,12 @@ end tell
     );
   }
 
-  Future<void> _deleteTransaction(String id) async {
+  Future<void> _deleteTransaction(String id, {bool restoreStock = false}) async {
     // Soft-delete locally (hidden immediately, tombstone marks it for cloud
     // removal). Refresh the UI right away so the row disappears instantly.
-    await LocalDbService.deleteTransaction(id);
+    await LocalDbService.deleteTransaction(id, restoreStock: restoreStock);
+    // Stock moved, so the product grid and dashboard both need rereading.
+    if (restoreStock) _loadProducts();
     _loadDashboardData();
     try {
       final userId = Supabase.instance.client.auth.currentUser?.id;
@@ -26966,6 +27498,15 @@ end tell
     );
     final lowStock = _products.where((p) => p.stock > 0 && p.stock <= 5).length;
     final outOfStock = _products.where((p) => p.stock == 0).length;
+    // What the stock on hand earns if it all sells at the listed price.
+    // A product with no recorded cost is skipped rather than counted at its
+    // full value, which would report the whole sale price as profit.
+    final totalProfit = _products
+        .where((p) => p.buyingPrice > 0)
+        .fold<double>(
+          0,
+          (sum, p) => sum + (p.price - p.buyingPrice) * p.stock,
+        );
 
     return Column(
       children: [
@@ -26990,6 +27531,14 @@ end tell
               '${_fmt(totalValue)}',
               Icons.attach_money_rounded,
               const Color(0xFF059669),
+              currencyIcon: _currencySymbol,
+            ),
+            const SizedBox(width: 16),
+            _reportSummaryCard(
+              'Profit',
+              _fmt(totalProfit),
+              Icons.trending_up_rounded,
+              const Color(0xFF7C3AED),
               currencyIcon: _currencySymbol,
             ),
             const SizedBox(width: 16),
@@ -27049,6 +27598,7 @@ end tell
                     Expanded(flex: 4, child: _dashColHeader('PRODUCT')),
                     Expanded(flex: 2, child: _dashColHeader('CATEGORY')),
                     Expanded(flex: 2, child: _dashColHeader('SKU')),
+                    Expanded(flex: 2, child: _dashColHeader('BUYING')),
                     Expanded(flex: 2, child: _dashColHeader('PRICE')),
                     Expanded(flex: 1, child: _dashColHeader('STOCK')),
                     Expanded(
@@ -27138,23 +27688,30 @@ end tell
                             ),
                             Expanded(
                               flex: 2,
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 3,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: AppColors.surfaceVariant,
-                                  borderRadius: BorderRadius.circular(100),
-                                ),
-                                child: Text(
-                                  p.category,
-                                  style: GoogleFonts.inter(
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w500,
-                                    color: AppColors.textMuted,
+                              // Left-aligned so the pill hugs its label. A
+                              // Container directly inside Expanded stretches
+                              // to the full column, which drew a long empty
+                              // bar after every short category name.
+                              child: Align(
+                                alignment: Alignment.centerLeft,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 3,
                                   ),
-                                  overflow: TextOverflow.ellipsis,
+                                  decoration: BoxDecoration(
+                                    color: AppColors.surfaceVariant,
+                                    borderRadius: BorderRadius.circular(100),
+                                  ),
+                                  child: Text(
+                                    p.category,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w500,
+                                      color: AppColors.textMuted,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
                                 ),
                               ),
                             ),
@@ -27165,6 +27722,26 @@ end tell
                                 style: GoogleFonts.inter(
                                   fontSize: 11,
                                   color: AppColors.textMuted,
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              flex: 2,
+                              child: Text(
+                                // Never set on some products, and a zero cost
+                                // would read as "free" rather than "unknown",
+                                // so show a dash instead of 0.00.
+                                p.buyingPrice > 0
+                                    ? _fmt(p.buyingPrice)
+                                    : '—',
+                                style: GoogleFonts.inter(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w500,
+                                  color: p.buyingPrice > 0
+                                      ? AppColors.textMuted
+                                      : AppColors.textMuted.withValues(
+                                          alpha: 0.5,
+                                        ),
                                 ),
                               ),
                             ),
@@ -28222,7 +28799,7 @@ class _ProductCardState extends State<_ProductCard> {
                               ..sort();
                         return prices.first == prices.last
                             ? _moneyFmt(widget.currencySymbol, prices.first)
-                            : '${widget.currencySymbol}${_groupDigits(prices.first.toStringAsFixed(0))}–${_groupDigits(prices.last.toStringAsFixed(0))}';
+                            : '${widget.currencySymbol}${_groupDigits(prices.first.toStringAsFixed(0), indian: _indianGrouping(widget.currencySymbol))}–${_groupDigits(prices.last.toStringAsFixed(0), indian: _indianGrouping(widget.currencySymbol))}';
                       }(),
                       style: GoogleFonts.manrope(
                         fontSize: 16,
@@ -29024,6 +29601,29 @@ class _DiscountToggleState extends State<_DiscountToggle> {
   /// selected, so the cashier can type straight over it. `autofocus` alone
   /// is not enough — the product search field already holds focus.
   void openInput() {
+    // Pressed again while the field is already open: switch between percent
+    // and flat, so the one key both opens the discount and picks its kind
+    // without reaching for the mouse. The field stays open and focused.
+    if (_showInput) {
+      setState(() {
+        _type = _type == DiscountType.percent
+            ? DiscountType.fixed
+            : DiscountType.percent;
+      });
+      // A discount already on the bill is re-applied under the new kind, so
+      // the total can never disagree with the % / ₹ shown beside it. An
+      // unsubmitted figure in the field is left alone — it applies on Enter,
+      // exactly as it does today.
+      if (widget.cart.discountValue > 0) {
+        widget.cart.applyDiscount(widget.cart.discountValue, _type);
+      }
+      _focus.requestFocus();
+      _ctrl.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: _ctrl.text.length,
+      );
+      return;
+    }
     setState(() => _showInput = true);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -29216,15 +29816,10 @@ class _PremiumBarChartState extends State<_PremiumBarChart> {
     return '$s${v.toStringAsFixed(0)}';
   }
 
-  String _fmtFull(double v) {
-    final s = widget.currencySymbol;
-    final parts = v.toStringAsFixed(2).split('.');
-    final intPart = parts[0].replaceAllMapped(
-      RegExp(r'(\d)(?=(\d{3})+$)'),
-      (m) => '${m[1]},',
-    );
-    return '$s$intPart.${parts[1]}';
-  }
+  // Defers to the shared formatter rather than grouping with its own regex:
+  // a private copy meant the chart's tooltips kept western grouping while
+  // every figure beside them used the Indian one.
+  String _fmtFull(double v) => _moneyFmt(widget.currencySymbol, v);
 
   @override
   Widget build(BuildContext context) {
