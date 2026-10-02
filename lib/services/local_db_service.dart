@@ -78,6 +78,7 @@ class LocalDbService {
       'balance_due': 'REAL NOT NULL DEFAULT 0',
       'hybrid_cash': 'REAL NOT NULL DEFAULT 0',
       'hybrid_upi': 'REAL NOT NULL DEFAULT 0',
+      'salesperson': "TEXT NOT NULL DEFAULT ''",
     },
     'customers': {
       'address': 'TEXT',
@@ -145,7 +146,7 @@ class LocalDbService {
   static Future<Database> _openVersioned(String dbPath, String userId) async {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 20,
+      version: 21,
       // Hardening against "database is locked" (SQLITE_BUSY) when another
       // process briefly holds the file (leftover instance, antivirus scan):
       // WAL lets readers and writers coexist, and busy_timeout makes a write
@@ -340,6 +341,16 @@ class LocalDbService {
             await db.execute(_recycleBinTableSql);
           } catch (_) {}
         }
+        if (oldVersion < 21) {
+          // Who rang the bill up. Blank on every existing bill; the receipt
+          // simply omits the line until a salesperson is chosen.
+          try {
+            await db.execute(
+              "ALTER TABLE transactions ADD COLUMN salesperson TEXT NOT NULL "
+              "DEFAULT ''",
+            );
+          } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -459,7 +470,8 @@ class LocalDbService {
         rev INTEGER NOT NULL DEFAULT 0,
         balance_due REAL NOT NULL DEFAULT 0,
         hybrid_cash REAL NOT NULL DEFAULT 0,
-        hybrid_upi REAL NOT NULL DEFAULT 0
+        hybrid_upi REAL NOT NULL DEFAULT 0,
+        salesperson TEXT NOT NULL DEFAULT ''
       )
     ''');
     await db.execute('''

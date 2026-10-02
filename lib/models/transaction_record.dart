@@ -81,6 +81,10 @@ class TransactionRecord {
   final double hybridCash;
   final double hybridUpi;
 
+  /// Who rang the bill up. Empty on bills taken before salespeople existed,
+  /// and on any till that has not set one.
+  final String salesperson;
+
   const TransactionRecord({
     required this.id,
     this.invoiceNumber,
@@ -97,6 +101,7 @@ class TransactionRecord {
     this.balanceDue = 0,
     this.hybridCash = 0,
     this.hybridUpi = 0,
+    this.salesperson = '',
   });
 
   /// Fractional tolerance keeps rounding noise from flagging a paid bill.
@@ -175,6 +180,7 @@ class TransactionRecord {
     'balance_due': balanceDue,
     'hybrid_cash': hybridCash,
     'hybrid_upi': hybridUpi,
+    'salesperson': salesperson,
   };
 
   factory TransactionRecord.fromMap(Map<String, dynamic> m) {
@@ -195,6 +201,7 @@ class TransactionRecord {
       balanceDue: (m['balance_due'] as num?)?.toDouble() ?? 0,
       hybridCash: (m['hybrid_cash'] as num?)?.toDouble() ?? 0,
       hybridUpi: (m['hybrid_upi'] as num?)?.toDouble() ?? 0,
+      salesperson: (m['salesperson'] as String?) ?? '',
     );
   }
 }

@@ -600,6 +600,7 @@ class ConnectivityService extends ChangeNotifier {
                         'balance_due': t.balanceDue,
                         'hybrid_cash': t.hybridCash,
                         'hybrid_upi': t.hybridUpi,
+                        'salesperson': t.salesperson,
                       },
                     )
                     .toList(),
@@ -1107,6 +1108,9 @@ class ConnectivityService extends ChangeNotifier {
       balanceDue: _asDouble(r['balance_due']),
       hybridCash: _asDouble(r['hybrid_cash']),
       hybridUpi: _asDouble(r['hybrid_upi']),
+      // Empty when the cloud column is absent, so a pull still succeeds
+      // against a project that has not run the salesperson migration yet.
+      salesperson: (r['salesperson'] as String?) ?? '',
     );
   }
 

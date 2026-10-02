@@ -9,7 +9,16 @@ import 'thermal_printer.dart';
 ///
 /// Kept separate from ThermalPrinter so that file stays pure Dart
 /// (dart:ui is only available inside a Flutter runtime).
-Future<LogoBitmap?> decodeReceiptLogo(String path, {int maxWidth = 360}) async {
+/// [maxWidth] is in printer dots. An 80mm head prints 576 of them per line
+/// (48 columns x 12 dots), so 512 fills most of the paper and still leaves a
+/// margin either side. It was 360 — barely over half the width — which is
+/// what made the logo print small next to the store name.
+///
+/// Upscaling stays off on purpose: a source image narrower than this is
+/// stretched into visible blocks once it is reduced to 1-bit black and
+/// white. A logo that still prints small needs a larger source file, not a
+/// larger number here.
+Future<LogoBitmap?> decodeReceiptLogo(String path, {int maxWidth = 512}) async {
   try {
     if (path.isEmpty) return null;
     final file = File(path);
@@ -38,8 +47,38 @@ Future<LogoBitmap?> decodeReceiptLogo(String path, {int maxWidth = 360}) async {
       }
     }
     img.dispose();
-    return LogoBitmap(w, h, rows);
+
+    // Trim blank rows off the top and bottom. A logo is usually a square
+    // canvas with the artwork centred in it, and every empty row prints as
+    // blank paper — which is what put a large gap between the logo and the
+    // store name. Only vertical padding is trimmed: the image is centred by
+    // the printer, so blank columns cost nothing.
+    var top = 0;
+    while (top < h && _rowIsBlank(rows, wb, top)) {
+      top++;
+    }
+    // Entirely blank: nothing worth printing.
+    if (top == h) return null;
+    var bottom = h - 1;
+    while (bottom > top && _rowIsBlank(rows, wb, bottom)) {
+      bottom--;
+    }
+    if (top == 0 && bottom == h - 1) return LogoBitmap(w, h, rows);
+    return LogoBitmap(
+      w,
+      bottom - top + 1,
+      rows.sublist(top * wb, (bottom + 1) * wb),
+    );
   } catch (_) {
     return null;
   }
+}
+
+/// Whether row [y] of a packed 1-bit bitmap has no black pixels at all.
+bool _rowIsBlank(Uint8List rows, int bytesPerRow, int y) {
+  final start = y * bytesPerRow;
+  for (var i = start; i < start + bytesPerRow; i++) {
+    if (rows[i] != 0) return false;
+  }
+  return true;
 }

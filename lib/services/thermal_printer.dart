@@ -24,11 +24,14 @@ class ThermalPrinter {
   // 80mm, font A: 48 characters per line.
   static const int width = 48;
 
-  // Item table columns: NAME | QTY | TAX% | PRICE  (24 + 5 + 6 + 13 = 48).
-  static const int _nameW = 24;
+  // Item table columns: ITEM | QTY | RATE | AMT  (18 + 5 + 12 + 13 = 48).
+  // RATE is the per-unit price, AMT the line total; both tax-inclusive and
+  // printed WITHOUT the currency symbol. "Rs " cost three columns on every
+  // row and pushed six-figure amounts onto a second line.
+  static const int _nameW = 18;
   static const int _qtyW = 5;
-  static const int _taxW = 6;
-  static const int _priceW = 13;
+  static const int _rateW = 12;
+  static const int _amtW = 13;
 
   static const _esc = 0x1B;
   static const _gs = 0x1D;
@@ -138,6 +141,9 @@ class ThermalPrinter {
         logo.height & 0xFF, (logo.height >> 8) & 0xFF,
       ]);
       b.addAll(logo.rows);
+      // Two feeds: the blank rows inside the logo are trimmed off now, so
+      // without this the store name sits hard against the artwork.
+      b.add(_lf);
       b.add(_lf);
     }
 
@@ -149,35 +155,59 @@ class ThermalPrinter {
       }
       b.addAll([_esc, 0x21, 0x00]); // normal
     }
+    // A blank line between each, so the header reads as separate facts
+    // rather than one dense block.
+    b.add(_lf);
     for (final l in _wrap(storeAddress, width)) {
       if (l.isNotEmpty) _line(b, l);
     }
-    if (storePhone.isNotEmpty) _line(b, 'Phone: $storePhone');
-    if (storeGstin.isNotEmpty) _line(b, 'GSTIN: $storeGstin');
-    final d = tx.createdAt;
-    _line(
-      b,
-      '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year} '
-      '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}:${d.second.toString().padLeft(2, '0')}',
-    );
-    _line(b, 'INVOICE ID: ${tx.displayInvoice}');
+    if (storeAddress.trim().isNotEmpty) b.add(_lf);
+    if (storePhone.isNotEmpty) {
+      _line(b, 'Phone: $storePhone');
+      b.add(_lf);
+    }
+    if (storeGstin.isNotEmpty) {
+      _line(b, 'GSTIN: $storeGstin');
+      b.add(_lf);
+    }
+    b.add(_lf);
+    b.addAll([_esc, 0x21, 0x08]); // bold
+    _line(b, 'TAX INVOICE');
+    b.addAll([_esc, 0x21, 0x00]);
 
     b.addAll([_esc, 0x61, 0x00]); // back to left justification
     _sep(b);
 
-    // ── Customer block ───────────────────────────────────────────────────
-    final hasCustomer =
-        (tx.customerName != null && tx.customerName!.isNotEmpty) ||
-        (tx.customerPhone != null && tx.customerPhone!.isNotEmpty);
-    if (hasCustomer) {
-      if (tx.customerName != null && tx.customerName!.isNotEmpty) {
-        _line(b, _center('Customer: ${tx.customerName}'));
-      }
-      if (tx.customerPhone != null && tx.customerPhone!.isNotEmpty) {
-        _line(b, _center('Phone: ${tx.customerPhone}'));
-      }
-      _sep(b);
+    // ── Bill details: one labelled line each, colons aligned ─────────────
+    const labelW = 12;
+    void detail(String label, String value) {
+      _line(b, '${label.padRight(labelW)}: $value');
+      b.add(_lf); // spaced, so each detail reads on its own
     }
+
+    final d = tx.createdAt;
+    detail('Bill No', tx.displayInvoice);
+    detail(
+      'Date',
+      '${d.day.toString().padLeft(2, '0')}/'
+          '${d.month.toString().padLeft(2, '0')}/${d.year}',
+    );
+    detail(
+      'Time',
+      '${d.hour.toString().padLeft(2, '0')}:'
+          '${d.minute.toString().padLeft(2, '0')}:'
+          '${d.second.toString().padLeft(2, '0')}',
+    );
+    // Each omitted when unset, so a till with no staff list and a walk-in
+    // customer prints the same compact block it always did.
+    if (tx.salesperson.isNotEmpty) detail('Salesperson', tx.salesperson);
+    if (tx.customerName != null && tx.customerName!.isNotEmpty) {
+      detail('Customer', tx.customerName!);
+    }
+    if (tx.customerPhone != null && tx.customerPhone!.isNotEmpty) {
+      detail('Phone', tx.customerPhone!);
+    }
+    _sep(b);
 
     // ── Item table: ITEM | QTY | PRICE ───────────────────────────────────
     // Each line is shown TAX-INCLUSIVE (the item's GST share folded into
@@ -198,19 +228,19 @@ class ThermalPrinter {
           : '${rate.toStringAsFixed(1)}%';
     }
 
-    // Stores that don't charge tax get the TAX% column dropped entirely;
-    // its width goes back to the item name.
-    final showTaxCol =
-        tx.taxAmount > 0 || tx.items.any((i) => i.taxPercent > 0);
-    final nameW = showTaxCol ? _nameW : _nameW + _taxW;
+    // Whether this bill carries GST at all — gates the summary below.
+    final hasTax = tx.taxAmount > 0 || tx.items.any((i) => i.taxPercent > 0);
+    // ITEM | QTY | RATE | AMT. RATE is what one unit costs, so a line of
+    // three reads as 3 x 250 = 750 rather than just 750. Both money columns
+    // are tax-inclusive, matching the line totals.
 
     b.addAll([_esc, 0x21, 0x08]); // bold
     _line(
       b,
-      'ITEM'.padRight(nameW) +
-          'QTY'.padLeft(4).padRight(_qtyW) +
-          (showTaxCol ? 'TAX%'.padLeft(_taxW) : '') +
-          'PRICE'.padLeft(_priceW),
+      'ITEM'.padRight(_nameW) +
+          'QTY'.padLeft(_qtyW) +
+          'RATE'.padLeft(_rateW) +
+          'AMT'.padLeft(_amtW),
     );
     b.addAll([_esc, 0x21, 0x00]);
     b.add(_lf);
@@ -218,14 +248,15 @@ class ThermalPrinter {
     for (final i in tx.items) {
       final incl = lineInclusive(i);
       inclusiveSubtotal += incl;
-      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
-      final nameLines = _wrap(i.displayName, nameW);
+      // Guard the division: a zero quantity would otherwise print infinity.
+      final unit = i.quantity > 0 ? incl / i.quantity : incl;
+      final nameLines = _wrap(i.displayName, _nameW);
       _line(
         b,
-        nameLines.first.padRight(nameW) +
-            '${i.quantity}'.padLeft(4).padRight(_qtyW) +
-            (showTaxCol ? pct(rate).padLeft(_taxW) : '') +
-            money(incl).padLeft(_priceW),
+        nameLines.first.padRight(_nameW) +
+            '${i.quantity}'.padLeft(_qtyW) +
+            unit.toStringAsFixed(2).padLeft(_rateW) +
+            incl.toStringAsFixed(2).padLeft(_amtW),
       );
       for (final l in nameLines.skip(1)) {
         _line(b, l);
@@ -235,6 +266,13 @@ class ThermalPrinter {
     _sep(b);
 
     // ── Totals (lines already tax-inclusive — no separate GST row) ───────
+    // Item count and unit count both: three lines of stock can be four
+    // pieces, and a customer checking the bag wants the piece count.
+    final totalQty = tx.items.fold<int>(0, (s, i) => s + i.quantity);
+    _line(b, _row('Total Items', '${tx.items.length}'));
+    if (totalQty != tx.items.length) {
+      _line(b, _row('Total Qty', '$totalQty'));
+    }
     _line(b, _row('Subtotal', money(inclusiveSubtotal)));
     if (tx.discountAmount > 0) {
       _line(b, _row('Discount', '-${money(tx.discountAmount)}'));
@@ -275,6 +313,63 @@ class ThermalPrinter {
       b.addAll([_esc, 0x21, 0x00]);
     }
 
+    // ── GST summary, one row per rate slab ───────────────────────────────
+    // The line prices above are shown tax-inclusive, which hides what was
+    // actually charged as GST. This is the breakdown a tax invoice has to
+    // carry, split the same way _gstSplitBill splits it everywhere else:
+    // each line at its own rate falling back to the store rate, with the
+    // bill discount spread proportionally so the taxable base matches what
+    // the customer paid.
+    //
+    // IGST is not a column. It is 0.00 on every intra-state sale, which is
+    // all a single shop rings up, and 48 characters is not enough to carry a
+    // column of zeroes without clipping the amounts that matter.
+    if (hasTax) {
+      final subtotal = tx.items.fold<double>(0, (s, i) => s + i.total);
+      final discountFactor = subtotal > 0
+          ? (subtotal - tx.discountAmount) / subtotal
+          : 1.0;
+      // rate -> taxable
+      final byRate = <double, double>{};
+      for (final i in tx.items) {
+        final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+        if (rate <= 0) continue;
+        byRate[rate] = (byRate[rate] ?? 0) + i.total * discountFactor;
+      }
+      if (byRate.isNotEmpty) {
+        _sep(b);
+        b.addAll([_esc, 0x21, 0x08]); // bold
+        _line(
+          b,
+          'GST%'.padRight(6) +
+              'TAX'.padLeft(11) +
+              'CGST'.padLeft(10) +
+              'SGST'.padLeft(10) +
+              'AMT'.padLeft(11),
+        );
+        b.addAll([_esc, 0x21, 0x00]);
+        final rates = byRate.keys.toList()..sort();
+        for (final r in rates) {
+          final taxable = byRate[r]!;
+          final tax = taxable * r / 100;
+          // Halved for the CGST/SGST split, the way an intra-state invoice
+          // states it.
+          final half = tax / 2;
+          // AMT is the slab's value INCLUDING its tax, so the row reads
+          // across as taxable + CGST + SGST = amount, and the amounts down
+          // the column add up to the bill.
+          _line(
+            b,
+            pct(r).padRight(6) +
+                taxable.toStringAsFixed(2).padLeft(11) +
+                half.toStringAsFixed(2).padLeft(10) +
+                half.toStringAsFixed(2).padLeft(10) +
+                (taxable + tax).toStringAsFixed(2).padLeft(11),
+          );
+        }
+      }
+    }
+
     // ── UPI QR (when the store has a UPI id configured) ──────────────────
     if (storeUpiId.isNotEmpty) {
       final upiUrl =
@@ -300,7 +395,9 @@ class ThermalPrinter {
       }
     }
 
-    b.addAll([_esc, 0x64, 0x03]); // feed 3 lines
+    // Feed well past the tear bar so the whole bill clears the printer and
+    // there is blank paper to hold when it is torn off.
+    b.addAll([_esc, 0x64, 0x06]); // feed 6 lines
     b.addAll([_gs, 0x56, 0x42, 0x00]); // feed + partial cut
     return b;
   }

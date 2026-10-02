@@ -1,4 +1,5 @@
 ﻿import 'dart:async';
+import 'dart:convert' show jsonEncode, jsonDecode;
 import 'dart:io';
 import 'dart:math' show max;
 import 'dart:typed_data';
@@ -33,6 +34,14 @@ import '../../services/thermal_logo.dart';
 import '../../services/thermal_printer.dart';
 import '../../services/whatsapp_service.dart' as _wa;
 import '../auth/login_screen.dart';
+
+/// Sentinel for the picker's "None" row — an empty value cannot be a
+/// PopupMenuItem value and still be distinguishable from no selection.
+const String _kNoSalesperson = '__none__';
+
+/// Action at the foot of the salesperson menu, so staff are
+/// managed where they are picked rather than buried in Settings.
+const String _kAddSalesperson = '__add__';
 
 const _defaultProducts = <Product>[];
 
@@ -317,6 +326,13 @@ class _BillingScreenState extends State<BillingScreen> {
   String _storeAddress = '';
   String _storePhone = '';
   String _storeEmail = '';
+
+  /// Who the next bill is credited to, and the names offered in the picker.
+  /// Both are per-till: the list is kept out of the synced settings so each
+  /// machine keeps its own staff.
+  String _salesperson = '';
+  List<String> _salespeople = [];
+
   String _storeGstin = '';
 
   /// Shop's state. Half of "place of supply" — with the buyer's state it is
@@ -332,7 +348,6 @@ class _BillingScreenState extends State<BillingScreen> {
   /// the shop's saved tax_rate is never written, and the switch returns to on
   /// for the next bill so a one-off untaxed sale can't quietly leave the rest
   /// of the day untaxed.
-  bool _gstEnabled = true;
   String _currencySymbol = '₹';
   String _currencyCode = 'INR';
 
@@ -465,6 +480,19 @@ class _BillingScreenState extends State<BillingScreen> {
   String _waAccessToken = '';
   String _editWaPhoneNumberId = '';
   String _editWaAccessToken = '';
+
+  /// Group invite link, pasted from WhatsApp. Sent to customers so they can
+  /// join themselves — the only route WhatsApp allows.
+  String _waGroupLink = '';
+  String _editWaGroupLink = '';
+
+  /// Customer id -> the day BillCat last sent them the group invite.
+  ///
+  /// This records who was INVITED, not who joined: WhatsApp exposes no way to
+  /// read a group's members, so whether they actually tapped the link is not
+  /// knowable from here. Kept per-till in settings, out of the synced
+  /// allowlist, since it describes what this machine sent.
+  Map<String, String> _waInvited = {};
 
   List<Product> get _filteredProducts {
     return _products.where((p) {
@@ -610,6 +638,13 @@ class _BillingScreenState extends State<BillingScreen> {
           ? savedLayout
           : 'Classic';
       _storeTerms = s['store_terms'] ?? _storeTerms;
+      // Per-till, so deliberately not in the synced settings allowlist.
+      _salesperson = s['active_salesperson'] ?? '';
+      _salespeople = (s['salespeople'] ?? '')
+          .split('|')
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
       _logoPath = s['logo_path'] ?? _logoPath;
       // Prefer local setting; fall back to auth user metadata logo_url
       final metaLogoUrl =
@@ -628,8 +663,18 @@ class _BillingScreenState extends State<BillingScreen> {
       _ownerLockEnabled = (s['owner_lock_enabled'] ?? '0') == '1';
       _waPhoneNumberId = s['wa_phone_number_id'] ?? '';
       _waAccessToken = s['wa_access_token'] ?? '';
+      _waGroupLink = s['wa_group_link'] ?? '';
+      try {
+        final raw = s['wa_invited'] ?? '';
+        _waInvited = raw.isEmpty
+            ? {}
+            : Map<String, String>.from(jsonDecode(raw) as Map);
+      } catch (_) {
+        _waInvited = {};
+      }
       _editWaPhoneNumberId = _waPhoneNumberId;
       _editWaAccessToken = _waAccessToken;
+      _editWaGroupLink = _waGroupLink;
     });
     _syncTaxRate();
     _restoreActivePrinter();
@@ -647,27 +692,15 @@ class _BillingScreenState extends State<BillingScreen> {
     } catch (_) {}
   }
 
-  /// The store rate, or 0 while the GST switch is off. Bill-scoped only.
-  double get _effectiveTaxRate =>
-      _gstEnabled ? (double.tryParse(_taxRateDisplay) ?? 0.0) : 0.0;
+  /// The shop's configured rate. Fixed — GST is no longer switchable per
+  /// bill, so every sale carries the rate the shop is registered for.
+  double get _effectiveTaxRate => double.tryParse(_taxRateDisplay) ?? 0.0;
 
   void _syncTaxRate() {
     final cart = context.read<CartProvider>();
     cart.setTaxRate(_effectiveTaxRate);
   }
 
-  void _setGstEnabled(bool on) {
-    setState(() => _gstEnabled = on);
-    // Deliberately no saveSettings: the shop rate stays as configured.
-    context.read<CartProvider>().setTaxRate(_effectiveTaxRate);
-  }
-
-  /// Puts GST back on once a bill is finished or cleared.
-  void _resetGstToggle() {
-    if (_gstEnabled) return;
-    if (mounted) setState(() => _gstEnabled = true);
-    context.read<CartProvider>().setTaxRate(_effectiveTaxRate);
-  }
 
   // Applies a tax rate entered from the cart summary: updates the running bill
   // and persists it so the next bill (and the receipt) uses the same rate.
@@ -3840,12 +3873,12 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Tax line for the bill: label, an on/off switch, and the amount. No
   /// percentage and no rate box — the rate is a shop setting, this only
   /// decides whether the running bill carries it.
+  /// GST is no longer switchable per bill: the shop's configured rate always
+  /// applies, so this is a plain readout of what it came to.
   Widget _gstToggleRow(double amount) {
     return Row(
       children: [
         Text(
-          // Always the shop's configured rate, so the switch reads as "5% on
-          // or off" rather than flipping to 0% and hiding what it would apply.
           'TAX ($_taxLabel $_taxRateDisplay%)',
           style: GoogleFonts.inter(
             fontSize: 10,
@@ -3854,26 +3887,13 @@ class _BillingScreenState extends State<BillingScreen> {
             letterSpacing: 1.5,
           ),
         ),
-        const SizedBox(width: 10),
-        SizedBox(
-          height: 20,
-          child: Transform.scale(
-            scale: 0.72,
-            child: Switch(
-              value: _gstEnabled,
-              onChanged: _setGstEnabled,
-              activeTrackColor: AppColors.primary,
-              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-          ),
-        ),
         const Spacer(),
         Text(
-          _fmt(_gstEnabled ? amount : 0),
+          _fmt(amount),
           style: GoogleFonts.inter(
             fontSize: 13,
             fontWeight: FontWeight.w700,
-            color: _gstEnabled ? AppColors.textDark : AppColors.textMuted,
+            color: AppColors.textDark,
           ),
         ),
       ],
@@ -4185,7 +4205,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       : () {
                           cart.clearCart();
                           _pendingInvoiceNumber = null;
-                          _resetGstToggle();
+
                         },
                   icon: const Icon(Icons.delete_sweep_outlined, size: 16),
                   label: Text(
@@ -4289,6 +4309,7 @@ class _BillingScreenState extends State<BillingScreen> {
           const SizedBox(width: 4),
           _bottomBarBtn(Icons.receipt_outlined, 'LAST RECEIPT'),
           const Spacer(),
+          _salespersonPicker(),
           Text(
             'POS T-01  •  SESSION: ${TimeOfDay.now().format(context)}  •  ${_sessionUserLabel()}',
             style: GoogleFonts.inter(
@@ -5128,6 +5149,7 @@ class _BillingScreenState extends State<BillingScreen> {
           : _editBranchNumber.trim();
       _waPhoneNumberId = _editWaPhoneNumberId.trim();
       _waAccessToken = _editWaAccessToken.trim();
+      _waGroupLink = _editWaGroupLink.trim();
       _showSettings = false;
     });
     _persistSettings();
@@ -5159,6 +5181,7 @@ class _BillingScreenState extends State<BillingScreen> {
       'branch_number': _branchNumber,
       'wa_phone_number_id': _waPhoneNumberId,
       'wa_access_token': _waAccessToken,
+      'wa_group_link': _waGroupLink,
     });
     ConnectivityService.instance.syncNow();
   }
@@ -5492,6 +5515,451 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Runs a reset after a type-DELETE confirmation. Soft-deletes locally (so it
   /// works offline and disappears at once), then lets the ordinary sync push
   /// remove the rows from the cloud.
+  /// Sends the WhatsApp group invite link to chosen customers.
+  ///
+  /// The link is what travels, not the customer: WhatsApp has no way to add
+  /// someone to a group from outside the app, so each person taps the link
+  /// and joins themselves. That tap is the consent WhatsApp enforces on its
+  /// servers, and no API or deep link removes it.
+  Future<void> _showGroupInviteDialog() async {
+    // The link is typed here rather than only in Settings: it is the one
+    // thing this action needs, and sending people to another screen to paste
+    // it was a dead end. Pre-filled from Settings when one is saved, and
+    // whatever is used here is saved back for next time.
+    final linkCtrl = TextEditingController(text: _waGroupLink);
+    final withPhone = _reportCustomers
+        .where((c) => (c.phone ?? '').trim().isNotEmpty)
+        .toList();
+    if (withPhone.isEmpty) {
+      _showToast('No customers have a phone number', isError: true);
+      return;
+    }
+    // Someone already invited is left unticked, so pressing Send again goes
+    // only to the people who have not had it yet.
+    final selected = {
+      for (final c in withPhone) c.id: !_waInvited.containsKey(c.id),
+    };
+    var sending = false;
+    var done = 0;
+    final failures = <String, String>{};
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          final picked = withPhone.where((c) => selected[c.id] == true).length;
+          return AlertDialog(
+            backgroundColor: Colors.white,
+            surfaceTintColor: Colors.transparent,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            title: Text(
+              'Invite to WhatsApp group',
+              style: GoogleFonts.manrope(
+                fontWeight: FontWeight.w700,
+                fontSize: 15,
+              ),
+            ),
+            content: SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: linkCtrl,
+                    enabled: !sending,
+                    autofocus: linkCtrl.text.isEmpty,
+                    style: GoogleFonts.inter(fontSize: 13),
+                    decoration: _dlgInputDecor(
+                      'https://chat.whatsapp.com/...',
+                    ),
+                    onChanged: (_) => setLocal(() {}),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'WhatsApp → group name → Invite via link → Copy link',
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    sending
+                        ? 'Sending… $done of $picked'
+                        : '$picked of ${withPhone.length} customers selected',
+                    style: GoogleFonts.inter(
+                      fontSize: 12.5,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 280),
+                    child: ListView(
+                      shrinkWrap: true,
+                      children: withPhone.map((c) {
+                        final failed = failures[c.id];
+                        final invitedOn = _waInvited[c.id];
+                        return CheckboxListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          value: selected[c.id] ?? false,
+                          onChanged: sending
+                              ? null
+                              : (v) =>
+                                    setLocal(() => selected[c.id] = v ?? false),
+                          title: Text(
+                            c.name.isEmpty ? (c.phone ?? '') : c.name,
+                            style: GoogleFonts.inter(fontSize: 13),
+                          ),
+                          subtitle: Text(
+                            failed ??
+                                (invitedOn != null
+                                    ? '${c.phone ?? ''} · invited $invitedOn'
+                                    : (c.phone ?? '')),
+                            style: GoogleFonts.inter(
+                              fontSize: 11.5,
+                              color: failed != null
+                                  ? AppColors.error
+                                  : invitedOn != null
+                                  ? AppColors.accent
+                                  : AppColors.textMuted,
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: sending ? null : () => Navigator.pop(ctx),
+                child: Text(
+                  'Close',
+                  style: GoogleFonts.inter(
+                    fontSize: 12.5,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: sending || picked == 0 || linkCtrl.text.trim().isEmpty
+                    ? null
+                    : () async {
+                        final link = linkCtrl.text.trim();
+                        // Remembered, so the next invite opens ready to send.
+                        if (link != _waGroupLink) {
+                          _waGroupLink = link;
+                          await LocalDbService.saveSettings({
+                            'wa_group_link': link,
+                          });
+                        }
+                        setLocal(() {
+                          sending = true;
+                          done = 0;
+                          failures.clear();
+                        });
+                        final wa = _wa.WhatsAppService(
+                          phoneNumberId: _waPhoneNumberId,
+                          accessToken: _waAccessToken,
+                        );
+                        final store = _storeName.isEmpty
+                            ? 'our'
+                            : _storeName;
+                        final msg =
+                            'Hi! Join $store on WhatsApp for offers and '
+                            'updates:\n$link';
+                        for (final c in withPhone) {
+                          if (selected[c.id] != true) continue;
+                          final err = await wa.sendText(
+                            toPhone: c.phone ?? '',
+                            message: msg,
+                          );
+                          if (!ctx.mounted) return;
+                          setLocal(() {
+                            done++;
+                            if (err != null) {
+                              failures[c.id] = err;
+                            } else {
+                              // Only a send that actually succeeded counts as
+                              // invited; a failed one stays ticked next time.
+                              _waInvited[c.id] = _fmtDMY(DateTime.now());
+                            }
+                          });
+                        }
+                        await LocalDbService.saveSettings({
+                          'wa_invited': jsonEncode(_waInvited),
+                        });
+                        if (!ctx.mounted) return;
+                        setLocal(() => sending = false);
+                        final ok = done - failures.length;
+                        _showToast(
+                          failures.isEmpty
+                              ? 'Invite sent to $ok customers'
+                              : 'Sent to $ok · ${failures.length} failed — '
+                                    'see the list',
+                          isError: failures.isNotEmpty,
+                        );
+                      },
+                child: Text(
+                  sending ? 'Sending…' : 'Send invite',
+                  style: GoogleFonts.inter(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                    color: sending || picked == 0
+                        ? AppColors.textMuted
+                        : AppColors.accentBlue,
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Confirms before dropping a name, since the x sits right beside the one
+  /// you tap to select and a stray hit would otherwise delete silently.
+  ///
+  /// Bills already credited to this person keep their name — it is stored on
+  /// the bill, not looked up from this list.
+  Future<void> _confirmRemoveSalesperson(String name) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: Text(
+          'Remove $name?',
+          style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 15),
+        ),
+        content: SizedBox(
+          width: 280,
+          child: Text(
+            'They will no longer appear in the salesperson list. Bills '
+            'already credited to them are unchanged.',
+            style: GoogleFonts.inter(
+              fontSize: 12.5,
+              height: 1.4,
+              color: AppColors.textMuted,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(
+              'Cancel',
+              style: GoogleFonts.inter(
+                fontSize: 12.5,
+                color: AppColors.textMuted,
+              ),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(
+              'Remove',
+              style: GoogleFonts.inter(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w700,
+                color: AppColors.error,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    _salespeople = _salespeople.where((x) => x != name).toList();
+    await LocalDbService.saveSettings({'salespeople': _salespeople.join('|')});
+    // Clear the active pick if it was the one removed, so no bill is credited
+    // to a name that no longer exists.
+    if (_salesperson == name) {
+      _salesperson = '';
+      await LocalDbService.saveSettings({'active_salesperson': ''});
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// One name, typed straight from the picker. The new name is selected on
+  /// save, since someone adding themselves mid-shift means to start billing
+  /// as themselves.
+  Future<void> _promptAddSalesperson() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: Text(
+          'Add salesperson',
+          style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 15),
+        ),
+        content: SizedBox(
+          width: 280,
+          child: TextField(
+            controller: ctrl,
+            autofocus: true,
+            textCapitalization: TextCapitalization.words,
+            style: GoogleFonts.inter(fontSize: 13),
+            decoration: _dlgInputDecor('Name'),
+            onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(
+              'Cancel',
+              style: GoogleFonts.inter(
+                fontSize: 12.5,
+                color: AppColors.textMuted,
+              ),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: Text(
+              'Add',
+              style: GoogleFonts.inter(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w700,
+                color: AppColors.accentBlue,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    // A pipe would split one name into two when the list is read back.
+    if (name == null || name.isEmpty || name.contains('|')) return;
+    if (!_salespeople.contains(name)) {
+      _salespeople = [..._salespeople, name];
+      await LocalDbService.saveSettings({
+        'salespeople': _salespeople.join('|'),
+      });
+    }
+    _salesperson = name;
+    await LocalDbService.saveSettings({'active_salesperson': name});
+    if (mounted) setState(() {});
+  }
+  /// Who the next bill is credited to. Opens UPWARDS, because the control
+  /// sits on the bottom bar and a normal menu would fall off the screen.
+  Widget _salespersonPicker() {
+    final has = _salesperson.isNotEmpty;
+    return PopupMenuButton<String>(
+      tooltip: 'Salesperson',
+      position: PopupMenuPosition.over,
+      // Lifts the menu clear of the bar so it opens over the bill, not under
+      // the taskbar.
+      offset: const Offset(0, -12),
+      constraints: const BoxConstraints(minWidth: 180),
+      onSelected: (v) async {
+        if (v == _kAddSalesperson) {
+          await _promptAddSalesperson();
+          return;
+        }
+        setState(() => _salesperson = v == _kNoSalesperson ? '' : v);
+        await LocalDbService.saveSettings({'active_salesperson': _salesperson});
+      },
+      itemBuilder: (menuCtx) => [
+        // "Guest" is the unattributed state: the bill is simply not credited
+        // to anyone, and the receipt omits the salesperson line entirely.
+        const PopupMenuItem(value: _kNoSalesperson, child: Text('Guest')),
+        ..._salespeople.map(
+          (s) => PopupMenuItem(
+            value: s,
+            child: Row(
+              children: [
+                Expanded(child: Text(s)),
+                // Its own tap target, so pressing the x removes the name
+                // rather than selecting it. The menu is closed first:
+                // confirming underneath an open popup leaves the dialog
+                // behind the menu.
+                InkWell(
+                  borderRadius: BorderRadius.circular(100),
+                  onTap: () async {
+                    Navigator.pop(menuCtx);
+                    await _confirmRemoveSalesperson(s);
+                  },
+                  child: const Padding(
+                    padding: EdgeInsets.all(4),
+                    child: Icon(
+                      Icons.close_rounded,
+                      size: 15,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: _kAddSalesperson,
+          child: Row(
+            children: [
+              const Icon(
+                Icons.person_add_alt_1_outlined,
+                size: 15,
+                color: AppColors.accentBlue,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Add salesperson',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.accentBlue,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.badge_outlined,
+              size: 13,
+              color: AppColors.textMuted.withValues(alpha: has ? 0.9 : 0.5),
+            ),
+            const SizedBox(width: 5),
+            Text(
+              has ? _salesperson.toUpperCase() : 'GUEST',
+              style: GoogleFonts.inter(
+                fontSize: 10,
+                fontWeight: has ? FontWeight.w600 : FontWeight.w300,
+                color: AppColors.textMuted.withValues(alpha: has ? 0.95 : 0.6),
+                letterSpacing: 0.5,
+              ),
+            ),
+            Icon(
+              Icons.arrow_drop_up_rounded,
+              size: 15,
+              color: AppColors.textMuted.withValues(alpha: 0.7),
+            ),
+            const SizedBox(width: 10),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// Lists what the bin holds, newest first, with a Restore on each row.
   ///
   /// Restoring re-inserts the archived row marked unsynced, so the existing
@@ -9352,6 +9820,16 @@ class _BillingScreenState extends State<BillingScreen> {
             hint: 'EAAxxxxxxxx...',
             obscureText: true,
           ),
+          _settingsDivider(),
+          // Copied from WhatsApp: group name -> Invite via link -> Copy link.
+          // WhatsApp has no way to add someone to a group from outside, so
+          // the link is what gets sent; the customer taps it and joins.
+          _settingsTextField(
+            'Group Invite Link',
+            _editWaGroupLink,
+            (v) => setState(() => _editWaGroupLink = v),
+            hint: 'https://chat.whatsapp.com/...',
+          ),
         ]),
         const SizedBox(height: 16),
         Container(
@@ -10512,6 +10990,9 @@ class _BillingScreenState extends State<BillingScreen> {
         // the sale that lands in the list show one invoice number.
         invoiceNumber: invoiceNumber,
         balanceDue: balanceDue,
+        // Same salesperson the saved bill will carry, so the printed preview
+        // and the stored sale agree.
+        salesperson: _salesperson,
         customerName: cart.customerName.isEmpty ? null : cart.customerName,
         customerPhone: cart.customerPhone.isEmpty ? null : cart.customerPhone,
         items: cart.items
@@ -12368,8 +12849,9 @@ class _BillingScreenState extends State<BillingScreen> {
               await cart.checkout(
                 invoiceNumber: invNum,
                 amountPaid: paid,
+                salesperson: _salesperson,
               );
-              _resetGstToggle();
+
             } catch (e) {
               // The checkout is atomic, so nothing was saved: keep the
               // cart and the number intact for a clean retry and tell the
@@ -12724,8 +13206,12 @@ class _BillingScreenState extends State<BillingScreen> {
     final snapshot = _snapshotCart(cart, invoiceNumber: invNum);
     final phone = cart.customerPhone;
     try {
-      await cart.checkout(invoiceNumber: invNum, amountPaid: total);
-      _resetGstToggle();
+      await cart.checkout(
+        invoiceNumber: invNum,
+        amountPaid: total,
+        salesperson: _salesperson,
+      );
+
     } catch (e) {
       _pendingInvoiceNumber = invNum;
       if (!mounted) return;
@@ -25446,7 +25932,12 @@ end tell
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '$dateStr · $timeStr',
+                            // Appended rather than given its own line, so a
+                            // bill with no salesperson reads exactly as it
+                            // did before.
+                            t.salesperson.isEmpty
+                                ? '$dateStr · $timeStr'
+                                : '$dateStr · $timeStr\nBilled by: ${t.salesperson}',
                             style: GoogleFonts.inter(
                               fontSize: 12,
                               color: AppColors.textMuted,
@@ -25624,7 +26115,7 @@ end tell
                               ),
                             ),
                             SizedBox(
-                              width: 80,
+                              width: 96,
                               child: Text(
                                 'Price',
                                 textAlign: TextAlign.right,
@@ -25636,7 +26127,7 @@ end tell
                               ),
                             ),
                             SizedBox(
-                              width: 80,
+                              width: 108,
                               child: Text(
                                 'Amount',
                                 textAlign: TextAlign.right,
@@ -25682,10 +26173,12 @@ end tell
                                 ),
                               ),
                               SizedBox(
-                                width: 80,
+                                width: 96,
                                 child: Text(
                                   '${_fmt(item.price)}',
                                   textAlign: TextAlign.right,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: GoogleFonts.inter(
                                     fontSize: 12,
                                     color: AppColors.textMuted,
@@ -25693,10 +26186,12 @@ end tell
                                 ),
                               ),
                               SizedBox(
-                                width: 80,
+                                width: 108,
                                 child: Text(
                                   '${_fmt(item.total)}',
                                   textAlign: TextAlign.right,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: GoogleFonts.inter(
                                     fontSize: 13,
                                     fontWeight: FontWeight.w700,
@@ -26775,6 +27270,29 @@ end tell
                           else
                             const SizedBox(width: 8),
                         ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _showGroupInviteDialog,
+                    icon: const Icon(Icons.group_add_outlined, size: 16),
+                    label: Text(
+                      'Invite to group',
+                      style: GoogleFonts.inter(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.textDark,
+                      side: const BorderSide(color: AppColors.border),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 14,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
                       ),
                     ),
                   ),

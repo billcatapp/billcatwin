@@ -167,7 +167,11 @@ class CartProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> checkout({String? invoiceNumber, double? amountPaid}) async {
+  Future<void> checkout({
+    String? invoiceNumber,
+    double? amountPaid,
+    String salesperson = '',
+  }) async {
     // Default to full payment; anything less is recorded as a balance owed.
     final paid = amountPaid ?? total;
     final balanceDue = (total - paid) > 0.005 ? total - paid : 0.0;
@@ -181,6 +185,7 @@ class CartProvider extends ChangeNotifier {
       balanceDue: balanceDue,
       hybridCash: isHybrid ? hybridCash : 0,
       hybridUpi: isHybrid ? hybridUpi : 0,
+      salesperson: salesperson,
       customerName: customerName.isEmpty ? null : customerName,
       customerPhone: customerPhone.isEmpty ? null : customerPhone,
       items: _items.map((i) => TransactionItem(

@@ -29,6 +29,52 @@ class WhatsAppService {
     return json['id'] as String?;
   }
 
+  /// Sends a plain text message. Returns null on success, or the reason it
+  /// failed so the caller can show it per recipient instead of a bare
+  /// "didn't send".
+  ///
+  /// Meta only accepts free-form text inside the 24 hours after the customer
+  /// last messaged this number. Outside that window it answers 131047 and the
+  /// message must be a pre-approved template — which is the usual reason a
+  /// send to a long customer list mostly fails.
+  Future<String?> sendText({
+    required String toPhone,
+    required String message,
+  }) async {
+    if (!isConfigured) return 'WhatsApp is not configured';
+    try {
+      final normalized = toPhone.replaceAll(RegExp(r'[^\d]'), '');
+      if (normalized.isEmpty) return 'No phone number';
+      final res = await http.post(
+        Uri.parse('https://graph.facebook.com/v19.0/$phoneNumberId/messages'),
+        headers: {
+          'Authorization': 'Bearer $accessToken',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'messaging_product': 'whatsapp',
+          'to': normalized,
+          'type': 'text',
+          'text': {'preview_url': true, 'body': message},
+        }),
+      );
+      if (res.statusCode == 200) return null;
+      try {
+        final err = jsonDecode(res.body) as Map<String, dynamic>;
+        final e = err['error'] as Map<String, dynamic>?;
+        final code = (e?['code'] as num?)?.toInt();
+        if (code == 131047) {
+          return 'Outside the 24-hour window — needs an approved template';
+        }
+        return (e?['message'] as String?) ?? 'HTTP ${res.statusCode}';
+      } catch (_) {
+        return 'HTTP ${res.statusCode}';
+      }
+    } catch (e) {
+      return 'Could not reach WhatsApp';
+    }
+  }
+
   /// Send a PDF invoice to a WhatsApp number via the Business API.
   /// Returns true on success.
   Future<bool> sendInvoicePdf({
