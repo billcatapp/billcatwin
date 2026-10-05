@@ -216,7 +216,12 @@ class ThermalPrinter {
     // follow the store's default tax rate — never a blended bill average,
     // which used to smear one taxed item's GST across every line.
     final fallbackRate = double.tryParse(taxRate) ?? 0.0;
+    // A line's total already contains its tax, so it IS the inclusive
+    // figure. Bills taken before prices became tax-inclusive stored the
+    // line before tax, so those still have it added on.
+    final inclusivePricing = tx.priceIncludesTax;
     double lineInclusive(TransactionItem i) {
+      if (inclusivePricing) return i.total;
       final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
       return i.total * (1 + rate / 100);
     }

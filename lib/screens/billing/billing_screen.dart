@@ -3664,14 +3664,72 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Live price breakdown shown in the product dialogs: base price, the tax it
   /// attracts, and the final customer-facing price. An empty tax field falls
   /// back to the store-wide rate, matching how the cart charges it.
-  Widget _finalPriceCard(String priceText, String taxText) {
+  /// Compact "GST / included" switch for a price field. On means the figure
+  /// typed beside it is the final price, which is how prices are stored; off
+  /// means it was quoted before tax and the tax is added before saving.
+  /// Dead when the store has no rate — there would be nothing to add.
+  Widget _gstInclToggle({
+    required bool on,
+    required double rate,
+    required ValueChanged<bool> onChanged,
+  }) {
+    final off = rate <= 0;
+    return Tooltip(
+      message: off
+          ? 'Set a $_taxLabel rate in Settings to use this'
+          : on
+          ? 'The price typed is the final price, $_taxLabel included'
+          : 'The price typed is before $_taxLabel — '
+                '${_formatRate(rate)}% is added before saving',
+      waitDuration: const Duration(milliseconds: 400),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '$_taxLabel INCL.',
+            style: GoogleFonts.inter(
+              fontSize: 9.5,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.9,
+              color: off
+                  ? AppColors.textMuted.withValues(alpha: 0.4)
+                  : AppColors.textMuted,
+            ),
+          ),
+          Transform.scale(
+            scale: 0.68,
+            child: Switch(
+              value: on,
+              onChanged: off ? null : onChanged,
+              activeTrackColor: AppColors.primary,
+              activeThumbColor: Colors.white,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// [includesTax] says whether [priceText] is the final price (the default,
+  /// and how prices are stored) or a figure quoted before tax.
+  Widget _finalPriceCard(
+    String priceText,
+    String taxText, {
+    bool includesTax = true,
+  }) {
     final base = double.tryParse(priceText) ?? 0;
     final typedRate = double.tryParse(taxText);
     final rate = (typedRate != null && typedRate > 0)
         ? typedRate
         : (double.tryParse(_taxRateDisplay) ?? 0);
-    final taxAmount = base * rate / 100;
-    final finalPrice = base + taxAmount;
+    // An inclusive figure has the tax read back out of it; one quoted before
+    // tax has it added on, and the final price is what that comes to.
+    final taxAmount = includesTax
+        ? base * rate / (100 + rate)
+        : base * rate / 100;
+    final taxable = includesTax ? base - taxAmount : base;
+    final finalPrice = taxable + taxAmount;
 
     return Container(
       width: double.infinity,
@@ -3694,7 +3752,7 @@ class _BillingScreenState extends State<BillingScreen> {
           Row(
             children: [
               Text(
-                'Base price',
+                'Taxable value',
                 style: GoogleFonts.inter(
                   fontSize: 12,
                   color: AppColors.textMuted,
@@ -3702,7 +3760,7 @@ class _BillingScreenState extends State<BillingScreen> {
               ),
               const Spacer(),
               Text(
-                '${_fmt(base)}',
+                '${_fmt(taxable)}',
                 style: GoogleFonts.inter(
                   fontSize: 12.5,
                   fontWeight: FontWeight.w600,
@@ -3801,15 +3859,10 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  /// Shelf price for a product: its price plus the tax it attracts (its own
-  /// rate, or the store default). This is what goes on barcode labels so the
-  /// sticker matches what the customer is charged at the till.
-  double _finalPriceOf(Product p) {
-    final rate = p.taxPercent > 0
-        ? p.taxPercent
-        : (double.tryParse(_taxRateDisplay) ?? 0);
-    return p.price * (1 + rate / 100);
-  }
+  /// Shelf price for a product. A price already carries the tax it attracts,
+  /// so this is simply that price — which is what goes on barcode labels, and
+  /// still matches what the customer is charged at the till.
+  double _finalPriceOf(Product p) => p.price;
 
   // Splits a "Product Name (Variant)" label into a product-name line and, if
   // present, a separate variant line below it — so the variant never gets
@@ -3878,8 +3931,11 @@ class _BillingScreenState extends State<BillingScreen> {
   Widget _gstToggleRow(double amount) {
     return Row(
       children: [
+        // "incl." because the tax sits inside the subtotal above rather than
+        // being added to it — without that the three rows read as though they
+        // should sum to the total, and they do not.
         Text(
-          'TAX ($_taxLabel $_taxRateDisplay%)',
+          'TAX ($_taxLabel $_taxRateDisplay% INCL.)',
           style: GoogleFonts.inter(
             fontSize: 10,
             fontWeight: FontWeight.w500,
@@ -11098,7 +11154,13 @@ class _BillingScreenState extends State<BillingScreen> {
     // rate <= 0 when charging — so it has to come back exempt too, or a
     // partial return refunds tax that was never collected on it.
     final anyLineRate = original.items.any((l) => l.taxPercent > 0);
-    final taxedBase = origSub - original.discountAmount;
+    // A reversal has to reproduce the bill it undoes, so it follows that
+    // bill's own pricing rule rather than today's.
+    final origInclusive = original.priceIncludesTax;
+    final gross = origSub - original.discountAmount;
+    // On an inclusive bill the tax is inside the gross, so the rate it
+    // implies is measured against what is left once the tax comes out.
+    final taxedBase = origInclusive ? gross - original.taxAmount : gross;
     final fallbackRate = (!anyLineRate && taxedBase > 0)
         ? original.taxAmount / taxedBase * 100
         : 0.0;
@@ -11112,15 +11174,23 @@ class _BillingScreenState extends State<BillingScreen> {
     // back only what those lines contributed.
     var taxWeightReturned = 0.0;
     var taxWeightAll = 0.0;
+    // Only the ratio of these two weights is used, but they still follow the
+    // original bill's rule so a bill mixing rates apportions correctly.
+    double weigh(double amount, double rate) => origInclusive
+        ? amount * rate / (100 + rate)
+        : amount * rate / 100;
     for (var i = 0; i < original.items.length; i++) {
       final line = original.items[i];
       final rate = line.taxPercent > 0 ? line.taxPercent : fallbackRate;
-      taxWeightAll += line.price * line.quantity * discountFactor * rate / 100;
+      taxWeightAll += weigh(
+        line.price * line.quantity * discountFactor,
+        rate,
+      );
       final qty = qtyByIndex[i] ?? 0;
       if (qty <= 0) continue;
-      final gross = line.price * qty;
-      sub += gross;
-      taxWeightReturned += gross * discountFactor * rate / 100;
+      final lineGross = line.price * qty;
+      sub += lineGross;
+      taxWeightReturned += weigh(lineGross * discountFactor, rate);
       items.add(
         TransactionItem(
           productId: line.productId,
@@ -11150,7 +11220,8 @@ class _BillingScreenState extends State<BillingScreen> {
       subtotal: -sub,
       discountAmount: -discount,
       taxAmount: -tax,
-      total: -(sub - discount + tax),
+      // An inclusive bill's tax is already inside the lines being sent back.
+      total: -(sub - discount + (origInclusive ? 0 : tax)),
       paymentMethod: paymentMethod,
       createdAt: DateTime.now(),
     );
@@ -11173,7 +11244,8 @@ class _BillingScreenState extends State<BillingScreen> {
       final gross = a.price * a.qty;
       final rate = a.product.taxPercent > 0 ? a.product.taxPercent : storeRate;
       sub += gross;
-      if (rate > 0) tax += gross * rate / 100;
+      // Priced the way the cart prices: the line already contains its tax.
+      if (rate > 0) tax += gross * rate / (100 + rate);
       items.add(
         TransactionItem(
           productId: a.product.id,
@@ -11198,7 +11270,8 @@ class _BillingScreenState extends State<BillingScreen> {
       subtotal: sub,
       discountAmount: 0,
       taxAmount: tax,
-      total: sub + tax,
+      // The tax is inside the lines, so it is not added again.
+      total: sub,
       paymentMethod: paymentMethod,
       createdAt: DateTime.now(),
     );
@@ -18657,6 +18730,11 @@ end tell
     String category = _userCategories.isNotEmpty ? _userCategories.first : '';
     bool skuAutoMode = true;
     final pendingProductId = const Uuid().v4();
+    // Whether the selling price typed in is the final figure the customer
+    // pays, which is how prices are stored. Off means it was quoted before
+    // tax, so the tax goes on before saving.
+    final gstRate = double.tryParse(_taxRateDisplay) ?? 0.0;
+    bool gstIncluded = true;
     List<ProductVariant> variants = [];
     // Shared selling price: the first price typed applies to every variant.
     // Re-pricing while a different variant is selected overrides only that
@@ -18754,6 +18832,17 @@ end tell
             // With variants, the product has no base of its own: price and
             // stock derive from the variants. Without variants, the product
             // itself is the base.
+            //
+            // A stored price is the final figure the customer pays, so a
+            // price typed with the tax toggle ON is saved as typed, and one
+            // typed with it OFF has the tax put on first. Converted here at
+            // save rather than as you type, so flipping the toggle after
+            // entering a figure still lands on the right number.
+            double priced(double typed) => (gstIncluded || gstRate <= 0)
+                ? typed
+                : double.parse(
+                    (typed * (1 + gstRate / 100)).toStringAsFixed(2),
+                  );
             final double productPrice;
             final double productBuying;
             final int productStock;
@@ -18768,12 +18857,12 @@ end tell
                 });
                 return;
               }
-              productPrice = basePrice;
+              productPrice = priced(basePrice);
               productBuying = double.tryParse(baseBuyingText) ?? 0.0;
               productStock = baseStock;
             } else {
               productPrice = variants
-                  .map((v) => v.price)
+                  .map((v) => priced(v.price))
                   .reduce((a, b) => a < b ? a : b);
               productBuying = variants.first.buyingPrice;
               productStock = variants.fold(0, (s, v) => s + v.stock);
@@ -18800,8 +18889,11 @@ end tell
               purchaseDate: purchaseDate != null ? _isoDate(purchaseDate!) : '',
             );
             await LocalDbService.insertProduct(newProduct);
-            for (final v in variants) {
-              await LocalDbService.insertVariant(v);
+            // Each variant's price goes through the same conversion as the
+            // product's own, so the two can never disagree.
+            for (var i = 0; i < variants.length; i++) {
+              variants[i] = variants[i].copyWith(price: priced(variants[i].price));
+              await LocalDbService.insertVariant(variants[i]);
             }
             ConnectivityService.instance.syncNow();
             if (!ctx.mounted) return;
@@ -19402,8 +19494,24 @@ end tell
                                         crossAxisAlignment:
                                             CrossAxisAlignment.start,
                                         children: [
-                                          _dlgLabel(
-                                            'SELLING PRICE ($_currencySymbol)',
+                                          // The toggle sits on the label so
+                                          // it reads as part of the price
+                                          // field it governs.
+                                          Row(
+                                            children: [
+                                              _dlgLabel(
+                                                'SELLING PRICE '
+                                                '($_currencySymbol)',
+                                              ),
+                                              const Spacer(),
+                                              _gstInclToggle(
+                                                on: gstIncluded,
+                                                rate: gstRate,
+                                                onChanged: (v) => setLocal(
+                                                  () => gstIncluded = v,
+                                                ),
+                                              ),
+                                            ],
                                           ),
                                           const SizedBox(height: 6),
                                           TextFormField(
@@ -19657,6 +19765,7 @@ end tell
                                 _finalPriceCard(
                                   priceCtrl.text,
                                   _taxRateDisplay,
+                                  includesTax: gstIncluded,
                                 ),
                                 const SizedBox(height: 18),
                                 _dlgLabel('TAGS'),
@@ -19938,11 +20047,26 @@ end tell
     int productCount = 0;
     bool saving = false;
 
+    // The store-wide rate is the only one this grid has: rows save with
+    // taxPercent 0, which billing reads as "use the store rate".
+    final gstRate = double.tryParse(_taxRateDisplay) ?? 0.0;
+
+    /// What to store for the price typed into [r]. A saved price is the final
+    /// figure the customer pays, tax included, so a row marked INCL is stored
+    /// exactly as typed. A row marked EXC was quoted before tax, so the tax is
+    /// put on before saving — otherwise that product would be sold for less
+    /// than it was meant to be.
+    double basePrice(_BulkProductRow r, double typed) =>
+        (r.gstIncluded || gstRate <= 0)
+        ? typed
+        : double.parse((typed * (1 + gstRate / 100)).toStringAsFixed(2));
+
     // Column widths shared by the header strip and every row so the two stay
     // aligned. Name / variant / SKU / category divide up whatever is left.
     const wNum = 38.0;
     const wHsn = 96.0;
     const wPrice = 100.0;
+    const wGst = 60.0;
     const wStock = 78.0;
     const wBuying = 100.0;
     const wActions = 78.0;
@@ -19979,6 +20103,10 @@ end tell
                   : Alignment.centerLeft,
               child: Text(
                 text,
+                // The PRICE heading grows when the grid switches to
+                // inclusive mode; clipping it beats overflowing the column.
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: GoogleFonts.inter(
                   fontSize: 10,
                   fontWeight: FontWeight.w600,
@@ -19988,6 +20116,84 @@ end tell
               ),
             ),
           );
+
+          /// Sets a row's tax mode. A product row carries the change down to
+          /// the variants still following its prices, the same way the price
+          /// itself travels.
+          void setRowGst(_BulkProductRow r, bool v) => setLocal(() {
+            r.gstIncluded = v;
+            if (r.variantOf == null) {
+              for (final o in rows) {
+                if (o.variantOf == r.id && o.priceAuto) o.gstIncluded = v;
+              }
+            }
+          });
+
+          /// This row's tax mode: whether the price beside it is before tax
+          /// (the way the rest of the app stores prices) or a shelf price
+          /// with tax already in it. Dead when the store has no rate set —
+          /// there would be nothing to take out.
+          Widget gstCell(int i) {
+            final r = rows[i];
+            final off = gstRate <= 0;
+            final on = r.gstIncluded;
+            void flip(bool v) => setRowGst(r, v);
+
+            return Tooltip(
+              message: off
+                  ? 'Set a $_taxLabel rate in Settings to use this'
+                  : on
+                  ? 'This price already includes $_taxLabel '
+                        '${_formatRate(gstRate)}% — it is taken back out so '
+                        'the bill comes to exactly what you typed'
+                  : 'This price is before $_taxLabel — '
+                        '${_formatRate(gstRate)}% is added at billing',
+              waitDuration: const Duration(milliseconds: 400),
+              // The cell owns the focus, not the switch inside it: the grid
+              // walks by its own list of nodes, and a switch that can hold
+              // focus takes the next arrow key with it — Flutter answers
+              // that with directional traversal and throws focus at
+              // whichever field happens to be nearest.
+              child: Focus(
+                focusNode: r.gstFocus,
+                child: Builder(
+                  builder: (fctx) {
+                    final focused = Focus.of(fctx).hasFocus;
+                    return Center(
+                      child: Container(
+                        height: 32,
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(7),
+                          // Same ring the text cells draw, so the walk looks
+                          // the same whichever column it is in.
+                          border: Border.all(
+                            color: focused
+                                ? AppColors.primary
+                                : Colors.transparent,
+                            width: 1.5,
+                          ),
+                        ),
+                        child: ExcludeFocus(
+                          child: Transform.scale(
+                            scale: 0.7,
+                            child: Switch(
+                              value: on,
+                              onChanged: off ? null : flip,
+                              activeTrackColor: AppColors.primary,
+                              activeThumbColor: Colors.white,
+                              materialTapTargetSize:
+                                  MaterialTapTargetSize.shrinkWrap,
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            );
+          }
 
           // Cells sit borderless inside the table and only the focused one
           // draws a ring, so the grid stays quiet until you type in it.
@@ -20131,6 +20337,9 @@ end tell
             // it stops following.
             row.priceCtrl.text = src.priceCtrl.text;
             row.buyingCtrl.text = src.buyingCtrl.text;
+            // The copied price means nothing without the mode it was typed
+            // in, so that comes across with it.
+            row.gstIncluded = src.gstIncluded;
             rows.insert(i + 1, row);
             regenSkus();
             recount();
@@ -20238,8 +20447,12 @@ end tell
               }
 
               final hasVariants = labels.any((l) => l.isNotEmpty);
+              // Converted once here so both the product's own price and its
+              // variants' read the same figures.
               final prices = group
-                  .map((r) => double.parse(r.priceCtrl.text.trim()))
+                  .map(
+                    (r) => basePrice(r, double.parse(r.priceCtrl.text.trim())),
+                  )
                   .toList();
               final stocks = group
                   .map((r) => int.parse(r.stockCtrl.text.trim()))
@@ -20542,7 +20755,7 @@ end tell
                             numeric: true,
                             align: TextAlign.end,
                             focusNode: r.priceFocus,
-                            onEnter: () => r.stockFocus.requestFocus(),
+                            onEnter: () => r.gstFocus.requestFocus(),
                             onChanged: (_) {
                               // Typing here sets a variant apart from its
                               // product; on a product row it carries the new
@@ -20556,6 +20769,7 @@ end tell
                             },
                           ),
                         ),
+                        SizedBox(width: wGst, child: gstCell(i)),
                         SizedBox(
                           width: wStock,
                           child: cellField(
@@ -20723,6 +20937,7 @@ end tell
             r.skuFocus,
             r.hsnFocus,
             r.priceFocus,
+            r.gstFocus,
             r.stockFocus,
             r.buyingFocus,
           ];
@@ -20749,13 +20964,17 @@ end tell
           // ancestor, which is what it takes to beat Flutter's built-in text
           // editing: inside a field, up and down otherwise jump the caret to
           // the start or end of the value and the event never bubbles out.
-          // The text behind each cell, in the same order as [cellsOf].
-          List<TextEditingController> ctrlsOf(_BulkProductRow r) => [
+          // The text behind each cell, in the same order as [cellsOf]. The
+          // tax toggle holds no text, so its slot is null — callers read that
+          // as "no caret here", which makes left and right step straight out
+          // of it.
+          List<TextEditingController?> ctrlsOf(_BulkProductRow r) => [
             r.nameCtrl,
             r.variantCtrl,
             r.skuCtrl,
             r.hsnCtrl,
             r.priceCtrl,
+            null,
             r.stockCtrl,
             r.buyingCtrl,
           ];
@@ -20779,6 +20998,7 @@ end tell
             // Caret to the end, so typing appends instead of landing wherever
             // the caret happened to sit last time that cell was visited.
             final ctrl = ctrlsOf(rows[row])[col];
+            if (ctrl == null) return;
             ctrl.selection = TextSelection.collapsed(offset: ctrl.text.length);
           }
 
@@ -20805,20 +21025,57 @@ end tell
             // the middle of a price is still reachable. An empty cell has
             // both edges at once, so the grid walks freely.
             final ctrl = ctrlsOf(rows[row])[col];
-            final sel = ctrl.selection;
-            final atStart =
-                sel.isValid && sel.isCollapsed && sel.baseOffset <= 0;
-            final atEnd =
-                sel.isValid &&
-                sel.isCollapsed &&
-                sel.baseOffset >= ctrl.text.length;
 
-            if (key == LogicalKeyboardKey.arrowLeft && atStart) {
-              focusCell(row, col - 1);
+            // The tax toggle has no caret to walk, so the row steps straight
+            // through it. Space flips it without leaving the cell, and Enter
+            // carries on along the row the way it does everywhere else.
+            if (ctrl == null) {
+              // Guarded the same way the switch itself is: with no store
+              // rate there is nothing to take out, so the toggle is dead.
+              if (key == LogicalKeyboardKey.space) {
+                if (gstRate > 0) {
+                  setRowGst(rows[row], !rows[row].gstIncluded);
+                }
+                return KeyEventResult.handled;
+              }
+              if (key == LogicalKeyboardKey.enter ||
+                  key == LogicalKeyboardKey.numpadEnter) {
+                focusCell(row, col + 1);
+                return KeyEventResult.handled;
+              }
+            }
+
+            // A cell nobody has typed in yet carries no caret at all — its
+            // selection is invalid, not merely empty — and so does the tax
+            // toggle. Treating that as "neither edge" was what let the arrow
+            // fall through to Flutter's own traversal, which walked off the
+            // grid and onto the row's + and x buttons.
+            final sel = ctrl?.selection;
+            final noCaret =
+                ctrl == null || sel == null || !sel.isValid || !sel.isCollapsed;
+            final atStart = noCaret || sel.baseOffset <= 0;
+            final atEnd = noCaret || sel.baseOffset >= ctrl.text.length;
+
+            final lastCol = cellsOf(rows[row]).length - 1;
+            if (key == LogicalKeyboardKey.arrowLeft) {
+              if (!atStart) return KeyEventResult.ignored; // walk the caret
+              // Off the front of a row, carry on at the end of the one above
+              // rather than stopping dead.
+              if (col > 0) {
+                focusCell(row, col - 1);
+              } else if (row > 0) {
+                focusCell(row - 1, cellsOf(rows[row - 1]).length - 1);
+              }
               return KeyEventResult.handled;
             }
-            if (key == LogicalKeyboardKey.arrowRight && atEnd) {
-              focusCell(row, col + 1);
+            if (key == LogicalKeyboardKey.arrowRight) {
+              if (!atEnd) return KeyEventResult.ignored;
+              // Off the end of a row, start the next one at its first field.
+              if (col < lastCol) {
+                focusCell(row, col + 1);
+              } else if (row + 1 < rows.length) {
+                focusCell(row + 1, 0);
+              }
               return KeyEventResult.handled;
             }
             return KeyEventResult.ignored;
@@ -21016,6 +21273,10 @@ end tell
                                     SizedBox(
                                       width: wPrice,
                                       child: colLabel('PRICE', trailing: true),
+                                    ),
+                                    SizedBox(
+                                      width: wGst,
+                                      child: colLabel(_taxLabel.toUpperCase()),
                                     ),
                                     SizedBox(
                                       width: wStock,
@@ -23873,8 +24134,12 @@ end tell
   double _gstFallbackRate(TransactionRecord t) {
     final storeRate = double.tryParse(_taxRateDisplay) ?? 0;
     if (t.items.any((i) => i.taxPercent > 0)) return storeRate;
-    final taxable = t.subtotal - t.discountAmount;
-    if (t.taxAmount.abs() < 0.005 || taxable.abs() < 0.005) return storeRate;
+    final net = t.subtotal - t.discountAmount;
+    if (t.taxAmount.abs() < 0.005 || net.abs() < 0.005) return storeRate;
+    // On an inclusive bill the discounted subtotal is the gross, so the
+    // taxable value is what is left once the stored tax is taken out of it.
+    final taxable = t.priceIncludesTax ? net - t.taxAmount : net;
+    if (taxable.abs() < 0.005) return storeRate;
     final derived = t.taxAmount / taxable * 100;
     if (!derived.isFinite || derived <= 0 || derived > 100) return storeRate;
     // Two decimals: rates are whole or half percentages in practice, and this
@@ -23893,11 +24158,17 @@ end tell
     if (!factor.isFinite || factor < 0 || factor > 1.000001) {
       return (byRate: out, split: false);
     }
+    // An inclusive line carries its tax inside its total, so the tax comes
+    // back out of it; an older additive line has the tax added on top.
+    final inclusive = tx.priceIncludesTax;
     for (final i in tx.items) {
       final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
-      final taxable = i.total * factor;
+      final gross = i.total * factor;
+      final tax = inclusive
+          ? gross * rate / (100 + rate)
+          : gross * rate / 100;
       final prev = out[rate] ?? (0.0, 0.0);
-      out[rate] = (prev.$1 + taxable, prev.$2 + taxable * rate / 100);
+      out[rate] = (prev.$1 + gross - (inclusive ? tax : 0), prev.$2 + tax);
     }
     return (byRate: out, split: true);
   }
@@ -30908,6 +31179,10 @@ class _BulkProductRow {
   final skuFocus = FocusNode();
   final hsnFocus = FocusNode();
   final priceFocus = FocusNode();
+  /// The tax toggle is a cell of the grid like any other, so it takes its
+  /// turn in the arrow-key walk. Nothing is typed into it, so it has no
+  /// controller — Space flips it instead.
+  final gstFocus = FocusNode();
   final stockFocus = FocusNode();
   final buyingFocus = FocusNode();
   final skuCtrl = TextEditingController();
@@ -30928,6 +31203,15 @@ class _BulkProductRow {
   /// consulted on a variant row; a product row carries its own figures.
   bool priceAuto = true;
   bool buyingAuto = true;
+
+  /// True when [priceCtrl] holds a shelf price that already contains tax, so
+  /// the tax has to be taken back out before the row is saved. False means
+  /// the price is the base figure that tax is added to at billing — which is
+  /// how every price in the app is stored.
+  ///
+  /// Defaults to true because a shop types the price it sells at, and that
+  /// figure has tax in it.
+  bool gstIncluded = true;
 
   /// Why this row failed the last save attempt, shown beneath it.
   String? error;

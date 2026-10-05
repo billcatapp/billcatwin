@@ -107,6 +107,25 @@ class TransactionRecord {
   /// Fractional tolerance keeps rounding noise from flagging a paid bill.
   bool get isCredit => balanceDue > 0.005;
 
+  /// Whether this bill's line prices already contain the tax.
+  ///
+  /// Prices used to be stored before tax, so a bill's total overshot its
+  /// discounted subtotal by the tax. Prices are now the final figure the
+  /// customer pays, so the total matches the discounted subtotal and the
+  /// tax sits inside it. Which of the two a bill was written under is
+  /// readable from the figures it already stores — whichever reading lands
+  /// closer to the recorded total is the one that produced it — so bills
+  /// taken before the change keep reporting exactly as they always have,
+  /// with no column to add and nothing to back-fill.
+  ///
+  /// [total] is rounded to the rupee, hence comparing distances rather than
+  /// testing either sum for equality. A bill carrying no tax reads as
+  /// inclusive, which costs nothing: there is no tax to place either way.
+  bool get priceIncludesTax {
+    final net = subtotal - discountAmount;
+    return (net - total).abs() <= (net + taxAmount - total).abs();
+  }
+
   double get amountPaid => total - balanceDue;
 
   /// Prefixes that mark a record as reversing an earlier bill. Returns are

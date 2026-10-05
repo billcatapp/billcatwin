@@ -46,10 +46,16 @@ class CartProvider extends ChangeNotifier {
     return discountValue.clamp(0, subtotal);
   }
 
-  /// Tax owed per rate, e.g. {5.0: 65.00, 12.0: 120.00}. Each line uses the
-  /// product's own tax percent, falling back to the store-wide [taxRate] when
-  /// the product doesn't define one. Discount is spread proportionally so the
-  /// taxable base always matches what the customer actually pays.
+  /// Tax contained per rate, e.g. {5.0: 65.00, 12.0: 120.00}. Each line uses
+  /// the product's own tax percent, falling back to the store-wide [taxRate]
+  /// when the product doesn't define one. Discount is spread proportionally so
+  /// the taxable base always matches what the customer actually pays.
+  ///
+  /// A product's price is the final figure the customer pays, with the tax
+  /// already inside it, so the tax is taken back OUT of the line rather than
+  /// added on top of it: on a 105 line at 5% the tax is 105 x 5/105 = 5.00,
+  /// leaving 100.00 of taxable value. Adding it on top instead would charge
+  /// the tax a second time.
   Map<double, double> get taxBreakdown {
     final sub = subtotal;
     final result = <double, double>{};
@@ -59,8 +65,8 @@ class CartProvider extends ChangeNotifier {
       final rate =
           item.product.taxPercent > 0 ? item.product.taxPercent : taxRate;
       if (rate <= 0) continue;
-      final taxable = item.total * discountFactor;
-      result[rate] = (result[rate] ?? 0) + taxable * rate / 100;
+      final gross = item.total * discountFactor;
+      result[rate] = (result[rate] ?? 0) + gross * rate / (100 + rate);
     }
     return result;
   }
@@ -68,8 +74,9 @@ class CartProvider extends ChangeNotifier {
   double get taxAmount =>
       taxBreakdown.values.fold(0.0, (s, v) => s + v);
 
-  /// Exact pre-round total; kept for the round-off calculation.
-  double get rawTotal => subtotal - discountAmount + taxAmount;
+  /// Exact pre-round total; kept for the round-off calculation. The tax is
+  /// already part of [subtotal], so it is not added again here.
+  double get rawTotal => subtotal - discountAmount;
 
   /// Payable total, rounded to the nearest rupee (Indian retail standard).
   /// This is what gets charged, saved and split — not the paise-exact figure.
