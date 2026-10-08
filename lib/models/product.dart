@@ -6,7 +6,27 @@ class Product {
   final String description;
   final double price;
   final double buyingPrice;
+
+  /// The product's own tax rate. Zero means "no rate of its own, use the
+  /// store-wide one" — which is every ordinary product. A NEGATIVE value
+  /// marks the product tax-free: it is sold without tax whatever the store
+  /// rate is, for goods that genuinely attract none.
+  ///
+  /// Zero could not carry that meaning, since it already means "not set",
+  /// and a sentinel keeps this out of the database schema and the sync
+  /// layer — the column is already a number and a negative one round-trips
+  /// untouched.
   final double taxPercent;
+
+  /// Sold without tax, whatever the store charges.
+  bool get isTaxFree => taxPercent < 0;
+
+  /// The rate to charge on this product, given the shop's [storeRate].
+  /// Everything that prices a product resolves it through here, so the
+  /// tax-free case cannot be missed at one of the call sites and quietly
+  /// fall back to the store rate.
+  double rateWith(double storeRate) =>
+      taxPercent < 0 ? 0.0 : (taxPercent > 0 ? taxPercent : storeRate);
 
   /// HSN/SAC classification code for tax invoices and the GSTR-1 HSN summary.
   /// Empty when not yet classified; the invoice prints an em-dash for those.

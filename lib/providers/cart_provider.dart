@@ -52,21 +52,34 @@ class CartProvider extends ChangeNotifier {
   /// the taxable base always matches what the customer actually pays.
   ///
   /// A product's price is the final figure the customer pays, with the tax
-  /// already inside it, so the tax is taken back OUT of the line rather than
-  /// added on top of it: on a 105 line at 5% the tax is 105 x 5/105 = 5.00,
-  /// leaving 100.00 of taxable value. Adding it on top instead would charge
-  /// the tax a second time.
+  /// already inside it, so the tax comes OUT of the line rather than being
+  /// added on top of it — adding it on top would charge it a second time.
+  ///
+  /// The share taken out is the plain rate percent of the line: on a 1000
+  /// line at 5% the tax is 50.00, leaving 950.00 of taxable value. This is
+  /// the owner's instruction (8 Oct) and is NOT the textbook inclusive
+  /// formula, which would take 1000 x 5/105 = 47.62 and leave 952.38 — the
+  /// figure that makes the tax exactly 5% OF the taxable value. Here 50 is
+  /// 5.26% of 950, so the taxable and tax columns on a return do not
+  /// reconcile to the stated rate. Do not "correct" this back without
+  /// asking: it is deliberate.
+  ///
+  /// A discount does NOT reduce the tax — also the owner's instruction
+  /// (8 Oct). The rate is read against the line's full value, so a 1000 line
+  /// discounted by 100 still carries 50 of tax while the customer pays 900,
+  /// leaving 850 of taxable value. GST ordinarily treats an invoice discount
+  /// as reducing the taxable value, so this too is deliberate and departs
+  /// from it: the discount comes out of the shop's own margin, not the tax.
   Map<double, double> get taxBreakdown {
     final sub = subtotal;
     final result = <double, double>{};
     if (sub <= 0) return result;
-    final discountFactor = (sub - discountAmount) / sub;
     for (final item in _items) {
-      final rate =
-          item.product.taxPercent > 0 ? item.product.taxPercent : taxRate;
+      // A tax-free product resolves to 0 here and is skipped, so it
+      // contributes nothing to the bill's tax.
+      final rate = item.product.rateWith(taxRate);
       if (rate <= 0) continue;
-      final gross = item.total * discountFactor;
-      result[rate] = (result[rate] ?? 0) + gross * rate / (100 + rate);
+      result[rate] = (result[rate] ?? 0) + item.total * rate / 100;
     }
     return result;
   }
@@ -205,8 +218,10 @@ class CartProvider extends ChangeNotifier {
         variantLabel: i.variant?.label,
         // Freeze the rate actually charged, so reprinted receipts stay
         // accurate even if the product's or store's rate changes later.
-        taxPercent:
-            i.product.taxPercent > 0 ? i.product.taxPercent : taxRate,
+        // Resolves to 0 for a tax-free product. On a bill that has rated
+        // lines, 0 on a line already means "sold tax-free" everywhere that
+        // reads bills back, which is exactly what this should record.
+        taxPercent: i.product.rateWith(taxRate),
       )).toList(),
       subtotal: subtotal,
       discountAmount: discountAmount,

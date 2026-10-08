@@ -334,12 +334,18 @@ class ThermalPrinter {
       final discountFactor = subtotal > 0
           ? (subtotal - tx.discountAmount) / subtotal
           : 1.0;
-      // rate -> taxable
-      final byRate = <double, double>{};
+      // rate -> (value paid, tax). Tax is read against the line's FULL
+      // value, since a discount does not reduce it; the paid value is the
+      // discounted one, which is what the slab's amount has to add up to.
+      final byRate = <double, ({double paid, double tax})>{};
       for (final i in tx.items) {
         final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
         if (rate <= 0) continue;
-        byRate[rate] = (byRate[rate] ?? 0) + i.total * discountFactor;
+        final prev = byRate[rate] ?? (paid: 0.0, tax: 0.0);
+        byRate[rate] = (
+          paid: prev.paid + i.total * discountFactor,
+          tax: prev.tax + i.total * rate / 100,
+        );
       }
       if (byRate.isNotEmpty) {
         _sep(b);
@@ -355,8 +361,11 @@ class ThermalPrinter {
         b.addAll([_esc, 0x21, 0x00]);
         final rates = byRate.keys.toList()..sort();
         for (final r in rates) {
-          final taxable = byRate[r]!;
-          final tax = taxable * r / 100;
+          // The slab's value as paid: already tax-inclusive on a current
+          // bill, pre-tax on one taken before prices carried their tax.
+          final paid = byRate[r]!.paid;
+          final tax = byRate[r]!.tax;
+          final taxable = inclusivePricing ? paid - tax : paid;
           // Halved for the CGST/SGST split, the way an intra-state invoice
           // states it.
           final half = tax / 2;
@@ -377,16 +386,25 @@ class ThermalPrinter {
 
     // ── UPI QR (when the store has a UPI id configured) ──────────────────
     if (storeUpiId.isNotEmpty) {
+      // On a split payment only the UPI share is to be scanned — the rest is
+      // being handed over in cash — so the code carries that share, not the
+      // bill total. hybridUpi is 0 on every other kind of bill.
+      final qrAmount = tx.hybridUpi > 0 ? tx.hybridUpi : tx.total;
       final upiUrl =
           'upi://pay?pa=${Uri.encodeComponent(storeUpiId)}'
           '&pn=${Uri.encodeComponent(storeName)}'
-          '&am=${tx.total.toStringAsFixed(2)}&cu=INR'
+          '&am=${qrAmount.toStringAsFixed(2)}&cu=INR'
           '&tn=${Uri.encodeComponent(tx.displayInvoice)}';
       b.addAll([_esc, 0x61, 0x01]); // center
       b.add(_lf);
       b.addAll(_qr(upiUrl));
       b.add(_lf);
-      _line(b, 'SCAN TO PAY VIA UPI');
+      _line(
+        b,
+        tx.hybridUpi > 0
+            ? 'SCAN TO PAY ${qrAmount.toStringAsFixed(2)} VIA UPI'
+            : 'SCAN TO PAY VIA UPI',
+      );
       b.addAll([_esc, 0x61, 0x00]);
     }
 

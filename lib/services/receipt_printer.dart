@@ -1731,11 +1731,12 @@ class ReceiptPrinter {
     final out = <double, double>{};
     final sub = tx.items.fold<double>(0, (s, i) => s + i.total);
     if (sub <= 0) return out;
-    final factor = (sub - tx.discountAmount) / sub;
     for (final i in tx.items) {
       final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
       if (rate <= 0) continue;
-      out[rate] = (out[rate] ?? 0) + i.total * factor * rate / 100;
+      // Read against the line's full value: a discount does not reduce the
+      // tax, so it is not spread into this.
+      out[rate] = (out[rate] ?? 0) + i.total * rate / 100;
     }
     return out;
   }

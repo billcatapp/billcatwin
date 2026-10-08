@@ -240,6 +240,13 @@ class _BillingScreenState extends State<BillingScreen> {
   // Dealers page data, reloaded when the page opens or a dealer changes.
   Future<(List<Dealer>, List<Product>, Map<String, List<ProductVariant>>)>?
   _dealersPageFuture;
+
+  /// Saved dealer records, keyed by lower-cased name, for the Dealers report.
+  /// That page groups products by the dealer NAME stored on each product, so
+  /// without this it has no way to reach the dealer's own details — which is
+  /// why the GST number never appeared there.
+  Map<String, Dealer> _dealerDirectory = const {};
+  bool _dealerDirectoryLoading = false;
   String _salesSearchQuery = '';
   String _customerSearchQuery = '';
   List<Customer> _reportCustomers = [];
@@ -2401,9 +2408,9 @@ class _BillingScreenState extends State<BillingScreen> {
                             onTap: () => _activateGridItem(item, cart),
                             currencySymbol: _currencySymbol,
                             variants: _variantsByProduct[item.id] ?? const [],
-                            effectiveTaxRate: item.taxPercent > 0
-                                ? item.taxPercent
-                                : (double.tryParse(_taxRateDisplay) ?? 0),
+                            effectiveTaxRate: item.rateWith(
+                              double.tryParse(_taxRateDisplay) ?? 0,
+                            ),
                             taxLabel: _taxLabel,
                             variantsExpanded:
                                 _expandedVariantProductId == item.id,
@@ -2417,9 +2424,9 @@ class _BillingScreenState extends State<BillingScreen> {
                           product: pair.$1,
                           variant: pair.$2,
                           currencySymbol: _currencySymbol,
-                          effectiveTaxRate: pair.$1.taxPercent > 0
-                              ? pair.$1.taxPercent
-                              : (double.tryParse(_taxRateDisplay) ?? 0),
+                          effectiveTaxRate: pair.$1.rateWith(
+                            double.tryParse(_taxRateDisplay) ?? 0,
+                          ),
                           taxLabel: _taxLabel,
                         );
                       },
@@ -3664,10 +3671,10 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Live price breakdown shown in the product dialogs: base price, the tax it
   /// attracts, and the final customer-facing price. An empty tax field falls
   /// back to the store-wide rate, matching how the cart charges it.
-  /// Compact "GST / included" switch for a price field. On means the figure
-  /// typed beside it is the final price, which is how prices are stored; off
-  /// means it was quoted before tax and the tax is added before saving.
-  /// Dead when the store has no rate — there would be nothing to add.
+  /// Compact switch saying whether a product is taxed. On — nearly every
+  /// product — it sells at the store's rate, contained in its price. Off
+  /// marks it tax-free: no tax at the till whatever the store charges.
+  /// Dead when the store has no rate, since nothing is being charged anyway.
   Widget _gstInclToggle({
     required bool on,
     required double rate,
@@ -3678,15 +3685,16 @@ class _BillingScreenState extends State<BillingScreen> {
       message: off
           ? 'Set a $_taxLabel rate in Settings to use this'
           : on
-          ? 'The price typed is the final price, $_taxLabel included'
-          : 'The price typed is before $_taxLabel — '
-                '${_formatRate(rate)}% is added before saving',
+          ? 'Sold at $_taxLabel ${_formatRate(rate)}%, included in the price. '
+                'Turn off for a tax-free product.'
+          : 'Tax-free — no $_taxLabel is charged on this product, and the '
+                'price is what the customer pays',
       waitDuration: const Duration(milliseconds: 400),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(
-            '$_taxLabel INCL.',
+            _taxLabel,
             style: GoogleFonts.inter(
               fontSize: 9.5,
               fontWeight: FontWeight.w600,
@@ -3711,25 +3719,25 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
-  /// [includesTax] says whether [priceText] is the final price (the default,
-  /// and how prices are stored) or a figure quoted before tax.
+  /// [taxed] false means the product is tax-free, so the price carries none
+  /// and the whole of it is taxable value.
   Widget _finalPriceCard(
     String priceText,
     String taxText, {
-    bool includesTax = true,
+    bool taxed = true,
   }) {
     final base = double.tryParse(priceText) ?? 0;
     final typedRate = double.tryParse(taxText);
-    final rate = (typedRate != null && typedRate > 0)
+    final storeRate = (typedRate != null && typedRate > 0)
         ? typedRate
         : (double.tryParse(_taxRateDisplay) ?? 0);
-    // An inclusive figure has the tax read back out of it; one quoted before
-    // tax has it added on, and the final price is what that comes to.
-    final taxAmount = includesTax
-        ? base * rate / (100 + rate)
-        : base * rate / 100;
-    final taxable = includesTax ? base - taxAmount : base;
-    final finalPrice = taxable + taxAmount;
+    final rate = taxed ? storeRate : 0.0;
+    // The price typed is what the customer pays, so the tax it carries is
+    // read back out of it rather than added on top -- the plain rate percent
+    // of the price, matching what the till charges.
+    final taxAmount = base * rate / 100;
+    final taxable = base - taxAmount;
+    final finalPrice = base;
 
     return Container(
       width: double.infinity,
@@ -11046,6 +11054,14 @@ class _BillingScreenState extends State<BillingScreen> {
         // the sale that lands in the list show one invoice number.
         invoiceNumber: invoiceNumber,
         balanceDue: balanceDue,
+        // The split on a hybrid payment, decided the same way checkout
+        // decides it. Without this the preview printed before the sale is
+        // closed carried zeros, and the receipt's UPI QR fell back to asking
+        // for the whole bill instead of the UPI share.
+        hybridCash:
+            cart.paymentMethod == PaymentMethod.hybrid ? cart.hybridCash : 0,
+        hybridUpi:
+            cart.paymentMethod == PaymentMethod.hybrid ? cart.hybridUpi : 0,
         // Same salesperson the saved bill will carry, so the printed preview
         // and the stored sale agree.
         salesperson: _salesperson,
@@ -11063,9 +11079,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 description: i.product.description,
                 variantId: i.variant?.id,
                 variantLabel: i.variant?.label,
-                taxPercent: i.product.taxPercent > 0
-                    ? i.product.taxPercent
-                    : cart.taxRate,
+                taxPercent: i.product.rateWith(cart.taxRate),
               ),
             )
             .toList(),
@@ -11174,11 +11188,9 @@ class _BillingScreenState extends State<BillingScreen> {
     // back only what those lines contributed.
     var taxWeightReturned = 0.0;
     var taxWeightAll = 0.0;
-    // Only the ratio of these two weights is used, but they still follow the
-    // original bill's rule so a bill mixing rates apportions correctly.
-    double weigh(double amount, double rate) => origInclusive
-        ? amount * rate / (100 + rate)
-        : amount * rate / 100;
+    // Only the ratio of these two weights is used, so the same plain share
+    // serves either pricing rule.
+    double weigh(double amount, double rate) => amount * rate / 100;
     for (var i = 0; i < original.items.length; i++) {
       final line = original.items[i];
       final rate = line.taxPercent > 0 ? line.taxPercent : fallbackRate;
@@ -11242,10 +11254,10 @@ class _BillingScreenState extends State<BillingScreen> {
     var tax = 0.0;
     for (final a in adds) {
       final gross = a.price * a.qty;
-      final rate = a.product.taxPercent > 0 ? a.product.taxPercent : storeRate;
+      final rate = a.product.rateWith(storeRate);
       sub += gross;
       // Priced the way the cart prices: the line already contains its tax.
-      if (rate > 0) tax += gross * rate / (100 + rate);
+      if (rate > 0) tax += gross * rate / 100;
       items.add(
         TransactionItem(
           productId: a.product.id,
@@ -17739,9 +17751,9 @@ end tell
               buyingPrice: variants.isEmpty
                   ? double.tryParse(baseBuyingText) ?? 0.0
                   : variants.first.buyingPrice,
-              // 0 means "use the store-wide rate": CartProvider resolves it
-              // at checkout and freezes the rate onto the bill line.
-              taxPercent: 0.0,
+              // Whatever the product already carried: editing a product is
+              // not where its tax treatment is set.
+              taxPercent: p.taxPercent,
               hsnCode: hsnCtrl.text.trim(),
               category: category,
               emoji: emoji,
@@ -18730,11 +18742,12 @@ end tell
     String category = _userCategories.isNotEmpty ? _userCategories.first : '';
     bool skuAutoMode = true;
     final pendingProductId = const Uuid().v4();
-    // Whether the selling price typed in is the final figure the customer
-    // pays, which is how prices are stored. Off means it was quoted before
-    // tax, so the tax goes on before saving.
+    // Whether this product is taxed at all. On — nearly every product — it
+    // sells at the store's rate, contained in the price. Off marks it
+    // tax-free, for goods that genuinely attract none. The price typed is
+    // saved exactly as typed either way.
     final gstRate = double.tryParse(_taxRateDisplay) ?? 0.0;
-    bool gstIncluded = true;
+    bool taxed = true;
     List<ProductVariant> variants = [];
     // Shared selling price: the first price typed applies to every variant.
     // Re-pricing while a different variant is selected overrides only that
@@ -18832,17 +18845,6 @@ end tell
             // With variants, the product has no base of its own: price and
             // stock derive from the variants. Without variants, the product
             // itself is the base.
-            //
-            // A stored price is the final figure the customer pays, so a
-            // price typed with the tax toggle ON is saved as typed, and one
-            // typed with it OFF has the tax put on first. Converted here at
-            // save rather than as you type, so flipping the toggle after
-            // entering a figure still lands on the right number.
-            double priced(double typed) => (gstIncluded || gstRate <= 0)
-                ? typed
-                : double.parse(
-                    (typed * (1 + gstRate / 100)).toStringAsFixed(2),
-                  );
             final double productPrice;
             final double productBuying;
             final int productStock;
@@ -18857,12 +18859,12 @@ end tell
                 });
                 return;
               }
-              productPrice = priced(basePrice);
+              productPrice = basePrice;
               productBuying = double.tryParse(baseBuyingText) ?? 0.0;
               productStock = baseStock;
             } else {
               productPrice = variants
-                  .map((v) => priced(v.price))
+                  .map((v) => v.price)
                   .reduce((a, b) => a < b ? a : b);
               productBuying = variants.first.buyingPrice;
               productStock = variants.fold(0, (s, v) => s + v.stock);
@@ -18878,7 +18880,8 @@ end tell
               buyingPrice: productBuying,
               // 0 means "use the store-wide rate": CartProvider resolves it
               // at checkout and freezes the rate onto the bill line.
-              taxPercent: 0.0,
+              // Negative marks the product tax-free.
+              taxPercent: taxed ? 0.0 : -1.0,
               hsnCode: hsnCtrl.text.trim(),
               category: category,
               emoji: emoji,
@@ -18889,11 +18892,8 @@ end tell
               purchaseDate: purchaseDate != null ? _isoDate(purchaseDate!) : '',
             );
             await LocalDbService.insertProduct(newProduct);
-            // Each variant's price goes through the same conversion as the
-            // product's own, so the two can never disagree.
-            for (var i = 0; i < variants.length; i++) {
-              variants[i] = variants[i].copyWith(price: priced(variants[i].price));
-              await LocalDbService.insertVariant(variants[i]);
+            for (final v in variants) {
+              await LocalDbService.insertVariant(v);
             }
             ConnectivityService.instance.syncNow();
             if (!ctx.mounted) return;
@@ -19505,10 +19505,10 @@ end tell
                                               ),
                                               const Spacer(),
                                               _gstInclToggle(
-                                                on: gstIncluded,
+                                                on: taxed,
                                                 rate: gstRate,
                                                 onChanged: (v) => setLocal(
-                                                  () => gstIncluded = v,
+                                                  () => taxed = v,
                                                 ),
                                               ),
                                             ],
@@ -19765,7 +19765,7 @@ end tell
                                 _finalPriceCard(
                                   priceCtrl.text,
                                   _taxRateDisplay,
-                                  includesTax: gstIncluded,
+                                  taxed: taxed,
                                 ),
                                 const SizedBox(height: 18),
                                 _dlgLabel('TAGS'),
@@ -20051,15 +20051,10 @@ end tell
     // taxPercent 0, which billing reads as "use the store rate".
     final gstRate = double.tryParse(_taxRateDisplay) ?? 0.0;
 
-    /// What to store for the price typed into [r]. A saved price is the final
-    /// figure the customer pays, tax included, so a row marked INCL is stored
-    /// exactly as typed. A row marked EXC was quoted before tax, so the tax is
-    /// put on before saving — otherwise that product would be sold for less
-    /// than it was meant to be.
-    double basePrice(_BulkProductRow r, double typed) =>
-        (r.gstIncluded || gstRate <= 0)
-        ? typed
-        : double.parse((typed * (1 + gstRate / 100)).toStringAsFixed(2));
+    /// What a row stores on the product for its tax rate. 0 leaves it on the
+    /// store-wide rate, which is every ordinary product; a negative marks it
+    /// tax-free. The price itself is always saved exactly as typed.
+    double taxPercentFor(_BulkProductRow r) => r.taxed ? 0.0 : -1.0;
 
     // Column widths shared by the header strip and every row so the two stay
     // aligned. Name / variant / SKU / category divide up whatever is left.
@@ -20121,33 +20116,32 @@ end tell
           /// the variants still following its prices, the same way the price
           /// itself travels.
           void setRowGst(_BulkProductRow r, bool v) => setLocal(() {
-            r.gstIncluded = v;
+            r.taxed = v;
             if (r.variantOf == null) {
               for (final o in rows) {
-                if (o.variantOf == r.id && o.priceAuto) o.gstIncluded = v;
+                if (o.variantOf == r.id && o.priceAuto) o.taxed = v;
               }
             }
           });
 
-          /// This row's tax mode: whether the price beside it is before tax
-          /// (the way the rest of the app stores prices) or a shelf price
-          /// with tax already in it. Dead when the store has no rate set —
-          /// there would be nothing to take out.
+          /// Whether this row's product is taxed. On — nearly every product —
+          /// it sells at the store's rate, contained in its price. Off marks
+          /// it tax-free: no tax at the till whatever the store charges.
+          /// Dead when the store has no rate, since nothing is charged anyway.
           Widget gstCell(int i) {
             final r = rows[i];
             final off = gstRate <= 0;
-            final on = r.gstIncluded;
+            final on = r.taxed;
             void flip(bool v) => setRowGst(r, v);
 
             return Tooltip(
               message: off
                   ? 'Set a $_taxLabel rate in Settings to use this'
                   : on
-                  ? 'This price already includes $_taxLabel '
-                        '${_formatRate(gstRate)}% — it is taken back out so '
-                        'the bill comes to exactly what you typed'
-                  : 'This price is before $_taxLabel — '
-                        '${_formatRate(gstRate)}% is added at billing',
+                  ? 'Sold at $_taxLabel ${_formatRate(gstRate)}%, included in '
+                        'the price. Turn off for a tax-free product.'
+                  : 'Tax-free — no $_taxLabel is charged on this product, and '
+                        'the price is what the customer pays',
               waitDuration: const Duration(milliseconds: 400),
               // The cell owns the focus, not the switch inside it: the grid
               // walks by its own list of nodes, and a switch that can hold
@@ -20337,9 +20331,8 @@ end tell
             // it stops following.
             row.priceCtrl.text = src.priceCtrl.text;
             row.buyingCtrl.text = src.buyingCtrl.text;
-            // The copied price means nothing without the mode it was typed
-            // in, so that comes across with it.
-            row.gstIncluded = src.gstIncluded;
+            // Variants of one product share its tax treatment.
+            row.taxed = src.taxed;
             rows.insert(i + 1, row);
             regenSkus();
             recount();
@@ -20447,12 +20440,10 @@ end tell
               }
 
               final hasVariants = labels.any((l) => l.isNotEmpty);
-              // Converted once here so both the product's own price and its
-              // variants' read the same figures.
+              // Saved exactly as typed: a price is the final figure the
+              // customer pays, whether or not tax sits inside it.
               final prices = group
-                  .map(
-                    (r) => basePrice(r, double.parse(r.priceCtrl.text.trim())),
-                  )
+                  .map((r) => double.parse(r.priceCtrl.text.trim()))
                   .toList();
               final stocks = group
                   .map((r) => int.parse(r.stockCtrl.text.trim()))
@@ -20468,9 +20459,10 @@ end tell
                   price: prices.reduce((a, b) => a < b ? a : b),
                   buyingPrice:
                       double.tryParse(head.buyingCtrl.text.trim()) ?? 0.0,
-                  // 0 means "use the store-wide rate": CartProvider resolves it
-                  // at checkout and freezes the rate onto the bill line.
-                  taxPercent: 0.0,
+                  // 0 means "use the store-wide rate": CartProvider resolves
+                  // it at checkout and freezes the rate onto the bill line.
+                  // Negative marks the product tax-free.
+                  taxPercent: taxPercentFor(head),
                   hsnCode: head.hsnCtrl.text.trim(),
                   category: head.category,
                   emoji: '',
@@ -21034,7 +21026,7 @@ end tell
               // rate there is nothing to take out, so the toggle is dead.
               if (key == LogicalKeyboardKey.space) {
                 if (gstRate > 0) {
-                  setRowGst(rows[row], !rows[row].gstIncluded);
+                  setRowGst(rows[row], !rows[row].taxed);
                 }
                 return KeyEventResult.handled;
               }
@@ -24136,9 +24128,9 @@ end tell
     if (t.items.any((i) => i.taxPercent > 0)) return storeRate;
     final net = t.subtotal - t.discountAmount;
     if (t.taxAmount.abs() < 0.005 || net.abs() < 0.005) return storeRate;
-    // On an inclusive bill the discounted subtotal is the gross, so the
-    // taxable value is what is left once the stored tax is taken out of it.
-    final taxable = t.priceIncludesTax ? net - t.taxAmount : net;
+    // The rate is read against the line values BEFORE any discount, since a
+    // discount does not reduce the tax, so the subtotal is the base here.
+    final taxable = t.subtotal;
     if (taxable.abs() < 0.005) return storeRate;
     final derived = t.taxAmount / taxable * 100;
     if (!derived.isFinite || derived <= 0 || derived > 100) return storeRate;
@@ -24163,12 +24155,13 @@ end tell
     final inclusive = tx.priceIncludesTax;
     for (final i in tx.items) {
       final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
-      final gross = i.total * factor;
-      final tax = inclusive
-          ? gross * rate / (100 + rate)
-          : gross * rate / 100;
+      // Tax is read against the line's FULL value — a discount does not
+      // reduce it — while the value the customer actually paid is the
+      // discounted one, which is what the taxable figure comes out of.
+      final tax = i.total * rate / 100;
+      final paid = i.total * factor;
       final prev = out[rate] ?? (0.0, 0.0);
-      out[rate] = (prev.$1 + gross - (inclusive ? tax : 0), prev.$2 + tax);
+      out[rate] = (prev.$1 + (inclusive ? paid - tax : paid), prev.$2 + tax);
     }
     return (byRate: out, split: true);
   }
@@ -24516,9 +24509,13 @@ end tell
     if (choice == 'purchase') _exportPurchaseCsv();
   }
 
-  /// Every purchase record, as a CSV in the same B2BINV layout as the sales
-  /// export: all products with a purchase date or a dealer, whatever period
-  /// the GST page shows. BillCat keeps only the last purchase date, dealer and
+  /// The purchase records for the period the GST page is showing, as a CSV in
+  /// the same B2BINV layout as the sales export. A return is filed one period
+  /// at a time, so a product bought outside the selected month does not belong
+  /// in it; a product carrying no purchase date at all cannot be placed in any
+  /// period and is left out too.
+  ///
+  /// BillCat keeps only the last purchase date, dealer and
   /// buying price per product (no supplier invoice number, quantity bought or
   /// tax paid), so, as agreed with the owner:
   /// - each dealer + purchase day is one invoice (INV_NO left blank);
@@ -24535,23 +24532,26 @@ end tell
       return t == null ? null : _isoDate(t.toLocal());
     }
 
+    final (rangeFrom, rangeTo, periodLabel) = _gstRangeFor(_gstPeriod);
+    // Compared as yyyy-MM-dd strings so both ends are inclusive whole days,
+    // the same way the rest of this page treats a stored date.
+    final fromDay = _isoDate(rangeFrom);
+    final toDay = _isoDate(rangeTo);
+
     final bought = _products.where((p) {
-      return localDay(p.purchaseDate) != null ||
-          p.dealerName.trim().isNotEmpty;
+      final day = localDay(p.purchaseDate);
+      if (day == null) return false;
+      return day.compareTo(fromDay) >= 0 && day.compareTo(toDay) <= 0;
     }).toList()
       ..sort((a, b) {
-        // Oldest first; products with no purchase date go last.
-        final da = localDay(a.purchaseDate);
-        final db = localDay(b.purchaseDate);
-        if (da != db) {
-          if (da == null) return 1;
-          if (db == null) return -1;
-          return da.compareTo(db);
-        }
+        // Oldest first.
+        final da = localDay(a.purchaseDate)!;
+        final db = localDay(b.purchaseDate)!;
+        if (da != db) return da.compareTo(db);
         return a.dealerName.compareTo(b.dealerName);
       });
     if (bought.isEmpty) {
-      _showToast('No purchase records found', isError: true);
+      _showToast('No purchases in $periodLabel', isError: true);
       return;
     }
 
@@ -24588,7 +24588,7 @@ end tell
     for (final p in bought) {
       final key =
           '${p.dealerName.trim().toLowerCase()}|${localDay(p.purchaseDate) ?? ''}';
-      final rate = p.taxPercent > 0 ? p.taxPercent : storeRate;
+      final rate = p.rateWith(storeRate);
       final inv = invoices.putIfAbsent(
         key,
         () => (first: p, byRate: <double, double>{}),
@@ -24632,21 +24632,19 @@ end tell
     }
     if (rows == 0) {
       if (mounted) {
-        _showToast('No purchase records with a value found', isError: true);
+        _showToast(
+          'No purchases with a value in $periodLabel',
+          isError: true,
+        );
       }
       return;
     }
 
-    final path = await FilePicker.platform.saveFile(
-      dialogTitle: 'Save purchase list',
-      fileName: 'purchases-all.csv',
-      type: FileType.custom,
-      allowedExtensions: ['csv'],
-      lockParentWindow: true,
-    );
-    if (path == null) return;
+    // Named for the period it covers, like every other export here, so two
+    // months' files cannot be mistaken for each other.
+    final withExt = await _pickSavePath('purchases', periodLabel, 'csv');
+    if (withExt == null) return;
     try {
-      final withExt = path.toLowerCase().endsWith('.csv') ? path : '$path.csv';
       await File(withExt).writeAsString(b.toString());
       if (mounted) _showToast('Saved $withExt');
     } catch (e) {
@@ -25612,6 +25610,23 @@ end tell
         ? 'this week'
         : 'this month';
 
+    // The dates behind that phrase. "this month" alone never says WHICH
+    // month, which is no help on a printed page or when a list is read back
+    // later. Custom already carries its own dates in the label.
+    final now = DateTime.now();
+    String span(DateTime a, DateTime b) => a.year == b.year
+        ? '${a.day} ${_monthName(a.month)} – ${b.day} ${_monthName(b.month)} '
+              '${b.year}'
+        : '${_fmtDMY(a)} – ${_fmtDMY(b)}';
+    final periodDates = isCustom
+        ? ''
+        : isToday
+        ? _fmtDMY(now)
+        : isWeek
+        // Week runs Monday to today, the same span the figures cover.
+        ? span(now.subtract(Duration(days: now.weekday - 1)), now)
+        : '${_monthName(now.month)} ${now.year}';
+
     String fmtAmt(double v) {
       final parts = v.abs().toStringAsFixed(2).split('.');
       final intPart = parts[0];
@@ -25730,7 +25745,9 @@ end tell
                           ),
                         ),
                         Text(
-                          'All transactions $periodLabel',
+                          periodDates.isEmpty
+                              ? 'All transactions $periodLabel'
+                              : 'All transactions $periodLabel · $periodDates',
                           style: GoogleFonts.inter(
                             fontSize: 12,
                             fontWeight: FontWeight.w300,
@@ -27713,6 +27730,22 @@ end tell
   // ── Dealers sub-view ───────────────────────────────────────────────────────
 
   Widget _buildDealersReport() {
+    // The saved dealer records carry the GST number and phone; the grouping
+    // below only knows names. Fetched once, the same lazy pattern the other
+    // dealer views use, and the page rebuilds when it lands.
+    if (_dealerDirectory.isEmpty && !_dealerDirectoryLoading) {
+      _dealerDirectoryLoading = true;
+      LocalDbService.getDealers().then((ds) {
+        if (!mounted) return;
+        setState(() {
+          _dealerDirectory = {
+            for (final d in ds) d.name.trim().toLowerCase(): d,
+          };
+          _dealerDirectoryLoading = false;
+        });
+      });
+    }
+
     // Group products by the dealer/supplier recorded on each product.
     final byDealer = <String, List<Product>>{};
     for (final p in _products) {
@@ -27842,6 +27875,10 @@ end tell
                     (s, p) => s + p.price * p.stock,
                   );
                   final isUnassigned = name == 'Unassigned';
+                  final gstin = isUnassigned
+                      ? ''
+                      : (_dealerDirectory[name.trim().toLowerCase()]?.gstin ??
+                            '');
                   return Column(
                     children: [
                       InkWell(
@@ -27890,19 +27927,39 @@ end tell
                                     ),
                                     const SizedBox(width: 8),
                                     Flexible(
-                                      child: Text(
-                                        name,
-                                        style: GoogleFonts.inter(
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w600,
-                                          color: isUnassigned
-                                              ? AppColors.textMuted
-                                              : AppColors.textDark,
-                                          fontStyle: isUnassigned
-                                              ? FontStyle.italic
-                                              : FontStyle.normal,
-                                        ),
-                                        overflow: TextOverflow.ellipsis,
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Text(
+                                            name,
+                                            style: GoogleFonts.inter(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w600,
+                                              color: isUnassigned
+                                                  ? AppColors.textMuted
+                                                  : AppColors.textDark,
+                                              fontStyle: isUnassigned
+                                                  ? FontStyle.italic
+                                                  : FontStyle.normal,
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                          // Shown here too so a GST number can
+                                          // be read off the list without
+                                          // opening each dealer in turn.
+                                          if (gstin.isNotEmpty)
+                                            Text(
+                                              'GSTIN $gstin',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 10.5,
+                                                color: AppColors.textMuted,
+                                                letterSpacing: 0.2,
+                                              ),
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                        ],
                                       ),
                                     ),
                                   ],
@@ -27970,6 +28027,9 @@ end tell
   // [_products] each time it's built, so it reflects the latest product edits.
   void _showDealerDetailDialog(String dealerName, List<Product> _) {
     final isUnassigned = dealerName == 'Unassigned';
+    final record = isUnassigned
+        ? null
+        : _dealerDirectory[dealerName.trim().toLowerCase()];
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -28083,6 +28143,29 @@ end tell
                                   color: AppColors.textMuted,
                                 ),
                               ),
+                              // The dealer's own details, which this page
+                              // reaches by name. "Unassigned" is not a real
+                              // dealer, so it has none.
+                              if (record != null &&
+                                  (record.gstin.isNotEmpty ||
+                                      record.phone.isNotEmpty))
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 3),
+                                  child: Text(
+                                    [
+                                      if (record.gstin.isNotEmpty)
+                                        'GSTIN ${record.gstin}',
+                                      if (record.phone.isNotEmpty)
+                                        record.phone,
+                                    ].join('  ·  '),
+                                    style: GoogleFonts.inter(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w500,
+                                      color: AppColors.textMuted,
+                                      letterSpacing: 0.2,
+                                    ),
+                                  ),
+                                ),
                             ],
                           ),
                         ),
@@ -29599,7 +29682,7 @@ class _ProductCardState extends State<_ProductCard> {
                     ),
                     if (widget.effectiveTaxRate > 0)
                       Text(
-                        '+ ${widget.taxLabel} '
+                        'incl. ${widget.taxLabel} '
                         '${widget.effectiveTaxRate == widget.effectiveTaxRate.truncateToDouble() ? widget.effectiveTaxRate.toStringAsFixed(0) : widget.effectiveTaxRate}%',
                         style: GoogleFonts.inter(
                           fontSize: 8.5,
@@ -29894,7 +29977,7 @@ class _VariantCardState extends State<_VariantCard> {
                       ),
                       if (widget.effectiveTaxRate > 0)
                         Text(
-                          '+ ${widget.taxLabel} '
+                          'incl. ${widget.taxLabel} '
                           '${widget.effectiveTaxRate == widget.effectiveTaxRate.truncateToDouble() ? widget.effectiveTaxRate.toStringAsFixed(0) : widget.effectiveTaxRate}%',
                           style: GoogleFonts.inter(
                             fontSize: 8.5,
@@ -31204,14 +31287,14 @@ class _BulkProductRow {
   bool priceAuto = true;
   bool buyingAuto = true;
 
-  /// True when [priceCtrl] holds a shelf price that already contains tax, so
-  /// the tax has to be taken back out before the row is saved. False means
-  /// the price is the base figure that tax is added to at billing — which is
-  /// how every price in the app is stored.
+  /// Whether this product is taxed at all. On — the default, and nearly every
+  /// product — it is sold at the store's tax rate, contained in the price.
+  /// Off marks it tax-free: no tax at the till whatever the store charges,
+  /// for goods that genuinely attract none.
   ///
-  /// Defaults to true because a shop types the price it sells at, and that
-  /// figure has tax in it.
-  bool gstIncluded = true;
+  /// The price typed is saved exactly as typed either way; this says only
+  /// whether tax sits inside it.
+  bool taxed = true;
 
   /// Why this row failed the last save attempt, shown beneath it.
   String? error;
