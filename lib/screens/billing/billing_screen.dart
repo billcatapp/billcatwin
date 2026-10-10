@@ -20211,6 +20211,9 @@ end tell
     // The supplier's invoice number, as printed on their bill. With it the
     // entry is saved as a purchase as well as stock.
     final invoiceCtrl = TextEditingController();
+    // Taxable value to report for this supplier bill, typed off the bill.
+    // Empty means report buying x stock, as before.
+    final reportAmtCtrl = TextEditingController();
     // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
     // is needed when it resolves.
     final List<Dealer> dealerOptions = [];
@@ -20239,7 +20242,6 @@ end tell
     const wHsn = 96.0;
     const wPrice = 100.0;
     const wGst = 76.0;
-    const wReport = 70.0;
     const wStock = 78.0;
     const wBuying = 100.0;
     const wActions = 78.0;
@@ -20306,44 +20308,6 @@ end tell
           /// it sells at the store's rate, contained in its price. Off marks
           /// it tax-free: no tax at the till whatever the store charges.
           /// Dead when the store has no rate, since nothing is charged anyway.
-          /// Whether this product's stock goes in the GST purchase report.
-          /// A product and its variants are one product, so flipping any row
-          /// of a group flips the whole group. Mouse-only: kept out of the
-          /// arrow-key walk so the grid's keyboard flow is unchanged.
-          Widget reportCell(int i) {
-            final r = rows[i];
-            final on = r.inGstReport;
-            void flip(bool v) => setLocal(() {
-              final headId = r.variantOf ?? r.id;
-              for (final o in rows) {
-                if (o.id == headId || o.variantOf == headId) {
-                  o.inGstReport = v;
-                }
-              }
-            });
-            return Tooltip(
-              message: on
-                  ? 'In the GST purchase report'
-                  : 'Left out of the GST purchase report — still saved and '
-                        'kept on the bill\'s record',
-              waitDuration: const Duration(milliseconds: 400),
-              child: Center(
-                child: ExcludeFocus(
-                  child: Transform.scale(
-                    scale: 0.7,
-                    child: Switch(
-                      value: on,
-                      onChanged: flip,
-                      activeTrackColor: AppColors.primary,
-                      activeThumbColor: Colors.white,
-                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                  ),
-                ),
-              ),
-            );
-          }
-
           Widget gstCell(int i) {
             final r = rows[i];
             final rate = r.rate ?? gstRate;
@@ -20804,6 +20768,17 @@ end tell
               _showToast('Pick the supplier invoice date', isError: true);
               return;
             }
+            // A reported amount belongs to a supplier's bill; without an
+            // invoice number the entry is no bill, and the figure would
+            // have nowhere to go.
+            final reportAmt = double.tryParse(reportAmtCtrl.text.trim());
+            if (reportAmt != null && reportAmt > 0 && invoiceNo.isEmpty) {
+              _showToast(
+                'Enter the supplier invoice number for the GST report amount',
+                isError: true,
+              );
+              return;
+            }
             setLocal(() => saving = true);
             for (final p in prepared) {
               await LocalDbService.insertProduct(p);
@@ -20877,6 +20852,28 @@ end tell
                   );
                 }
               }
+              final typedAmt = reportAmt != null && reportAmt > 0
+                  ? reportAmt
+                  : null;
+              // With an amount typed but nothing priced to carry it, the bill
+              // is still recorded at that amount, on one line at the store
+              // rate.
+              if (typedAmt != null &&
+                  !lines.any(
+                    (l) => prepared.any(
+                      (p) => p.id == l.productId && p.gstPurchase,
+                    ),
+                  )) {
+                lines.add(
+                  PurchaseItem(
+                    description: 'As per supplier bill',
+                    quantity: 1,
+                    rate: typedAmt,
+                    taxable: typedAmt,
+                    taxPercent: gstRate,
+                  ),
+                );
+              }
               if (lines.isEmpty) {
                 purchaseNote =
                     'Invoice $invoiceNo not recorded — no row had both a '
@@ -20893,14 +20890,39 @@ end tell
                   for (final p in prepared)
                     if (p.gstPurchase) p.id,
                 };
+                // The synthetic "as per supplier bill" line has no product
+                // and is always reported.
+                bool reported(PurchaseItem l) =>
+                    l.productId.isEmpty || included.contains(l.productId);
+                var reportLines = [
+                  for (final l in lines)
+                    if (reported(l)) l,
+                ];
+                // A typed amount replaces buying x stock: the reported lines
+                // are scaled so their taxable value adds up to exactly what
+                // was typed, each keeping its share and its GST rate, and
+                // their quantities stay as entered so stock still reconciles.
+                final reportSum = reportLines.fold<double>(
+                  0,
+                  (s, l) => s + l.taxable,
+                );
+                if (typedAmt != null && reportSum > 0) {
+                  final k = typedAmt / reportSum;
+                  reportLines = [
+                    for (final l in reportLines)
+                      l.copyWith(
+                        taxable: l.taxable * k,
+                        rate: l.quantity > 0
+                            ? l.taxable * k / l.quantity
+                            : l.rate,
+                      ),
+                  ];
+                }
                 final parts = <bool, List<PurchaseItem>>{
-                  true: [
-                    for (final l in lines)
-                      if (included.contains(l.productId)) l,
-                  ],
+                  true: reportLines,
                   false: [
                     for (final l in lines)
-                      if (!included.contains(l.productId)) l,
+                      if (!reported(l)) l,
                   ],
                 };
                 try {
@@ -21188,7 +21210,6 @@ end tell
                           ),
                         ),
                         SizedBox(width: wGst, child: gstCell(i)),
-                        SizedBox(width: wReport, child: reportCell(i)),
                         SizedBox(
                           width: wStock,
                           child: cellField(
@@ -21714,10 +21735,6 @@ end tell
                                       child: colLabel(_taxLabel.toUpperCase()),
                                     ),
                                     SizedBox(
-                                      width: wReport,
-                                      child: colLabel('REPORT'),
-                                    ),
-                                    SizedBox(
                                       width: wStock,
                                       child: colLabel('STOCK', trailing: true),
                                     ),
@@ -21810,6 +21827,58 @@ end tell
                             style: GoogleFonts.inter(
                               fontSize: 12.5,
                               color: AppColors.textMuted,
+                            ),
+                          ),
+                          const SizedBox(width: 20),
+                          // Taxable value to report for this supplier bill,
+                          // typed straight off the bill. Nothing is worked
+                          // out here: left empty, the report uses buying x
+                          // stock; typed, this figure is reported instead.
+                          SizedBox(
+                            width: 250,
+                            height: 40,
+                            child: TextField(
+                              controller: reportAmtCtrl,
+                              keyboardType:
+                                  const TextInputType.numberWithOptions(
+                                    decimal: true,
+                                  ),
+                              inputFormatters: [
+                                FilteringTextInputFormatter.allow(
+                                  RegExp(r'^\d*\.?\d{0,2}'),
+                                ),
+                              ],
+                              style: GoogleFonts.inter(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textDark,
+                              ),
+                              decoration: _dlgInputDecor('taxable value')
+                                  .copyWith(
+                                    isDense: true,
+                                    contentPadding:
+                                        const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 10,
+                                        ),
+                                    // Always visible, unlike prefixText,
+                                    // which only shows once focused.
+                                    prefixIcon: Padding(
+                                      padding: const EdgeInsets.only(
+                                        left: 12,
+                                        right: 6,
+                                      ),
+                                      child: Text(
+                                        'GST REPORT  $_currencySymbol',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 12,
+                                          color: AppColors.textMuted,
+                                        ),
+                                      ),
+                                    ),
+                                    prefixIconConstraints:
+                                        const BoxConstraints(),
+                                  ),
                             ),
                           ),
                           const Spacer(),
@@ -25216,7 +25285,8 @@ end tell
       'GST,NAME,INV_NO,INV_DATE,NET_AMT,RC,APP_TAX,ITYPE,EC,TAX,TAXABLE,'
       // SUPPLIER_STATE is appended AFTER the standard columns so the layout
       // an accountant reads stays exactly where it was.
-      'TAX_AMT,IGST,CGST,SGST,SUPPLIER_STATE',
+      // HSN appended last for the same reason.
+      'TAX_AMT,IGST,CGST,SGST,SUPPLIER_STATE,HSN',
     );
     for (final r in rows) {
       b.writeln(
@@ -25224,7 +25294,7 @@ end tell
         '${d(r.date)},${n(r.net)},N,,Regular,,'
         '${_formatRate(r.rate)},${n(r.taxable)},${n(r.tax)},'
         '${n(r.igst)},${n(r.cgst)},${n(r.sgst)},'
-        '${_csvCell(r.supplierState)}',
+        '${_csvCell(r.supplierState)},${_csvCell(r.hsn)}',
       );
     }
 
@@ -25316,16 +25386,17 @@ end tell
       String gstin,
       String invoiceNo,
       String date,
-      Map<double, double> byRate,
+      Map<(double, String), double> byRate,
     })>[];
 
     // Recorded purchases, as entered. The GSTIN is the one captured with the
     // bill; only when none was captured does the dealer directory fill in,
     // so correcting a dealer later never rewrites a bill already recorded.
     for (final pu in reported) {
-      final byRate = <double, double>{};
+      final byRate = <(double, String), double>{};
       for (final it in pu.items) {
-        byRate[it.taxPercent] = (byRate[it.taxPercent] ?? 0) + it.taxable;
+        final k = (it.taxPercent, it.hsnCode.trim());
+        byRate[k] = (byRate[k] ?? 0) + it.taxable;
       }
       final dealer = pu.dealerName.trim();
       invoices.add((
@@ -25341,7 +25412,7 @@ end tell
 
     // Stock bought without a recorded bill: estimated as before, one invoice
     // per dealer + purchase day with no invoice number.
-    final estimated = <String, Map<double, double>>{};
+    final estimated = <String, Map<(double, String), double>>{};
     final estimatedFirst = <String, Product>{};
     for (final p in bought) {
       // Stock with no dealer is grouped per PRODUCT, not per day: nothing
@@ -25353,7 +25424,10 @@ end tell
           ? '|${p.id}|${localDay(p.purchaseDate) ?? ''}'
           : '$dealerKey|${localDay(p.purchaseDate) ?? ''}';
       final rate = p.rateWith(storeRate);
-      final byRate = estimated.putIfAbsent(key, () => <double, double>{});
+      final byRate = estimated.putIfAbsent(
+        key,
+        () => <(double, String), double>{},
+      );
       estimatedFirst.putIfAbsent(key, () => p);
       // Stock still includes any units already on a recorded bill; those are
       // taken off so they are not reported a second time. A product bought
@@ -25363,7 +25437,9 @@ end tell
       // side to err on.
       final qty =
           p.stock - billedSince(p.id, localDay(p.purchaseDate) ?? '');
-      byRate[rate] = (byRate[rate] ?? 0) + p.buyingPrice * (qty < 0 ? 0 : qty);
+      final slab = (rate, p.hsnCode.trim());
+      byRate[slab] =
+          (byRate[slab] ?? 0) + p.buyingPrice * (qty < 0 ? 0 : qty);
     }
     for (final e in estimated.entries) {
       final first = estimatedFirst[e.key]!;
@@ -25397,24 +25473,29 @@ end tell
       final interState = dealerState.isNotEmpty &&
           storeState.isNotEmpty &&
           dealerState != storeState;
-      // Rate slabs worth nothing (zero stock or no buying price) are skipped.
+      // One row per GST rate AND HSN code, so each row names a single HSN.
+      // Slabs worth nothing (zero stock or no buying price) are skipped.
       final slabs = inv.byRate.entries
           .where((e) => e.value.abs() >= 0.005)
           .toList()
-        ..sort((a, b) => a.key.compareTo(b.key));
+        ..sort((a, b) {
+          final c = a.key.$1.compareTo(b.key.$1);
+          return c != 0 ? c : a.key.$2.compareTo(b.key.$2);
+        });
       final net = slabs.fold<double>(
         0,
-        (s, e) => s + e.value + e.value * e.key / 100,
+        (s, e) => s + e.value + e.value * e.key.$1 / 100,
       );
       for (final e in slabs) {
-        final tax = e.value * e.key / 100;
+        final tax = e.value * e.key.$1 / 100;
         out.add((
           date: inv.date,
           invoiceNo: inv.invoiceNo,
           dealer: dealer,
           gstin: gstin,
           supplierState: supplierState,
-          rate: e.key,
+          hsn: e.key.$2,
+          rate: e.key.$1,
           taxable: e.value,
           tax: tax,
           igst: interState ? tax : 0.0,
@@ -25733,6 +25814,7 @@ end tell
                     Expanded(flex: 3, child: _dashColHeader('INVOICE')),
                     Expanded(flex: 4, child: _dashColHeader('SUPPLIER')),
                     Expanded(flex: 4, child: _dashColHeader('GSTIN')),
+                    Expanded(flex: 2, child: _dashColHeader('HSN')),
                     Expanded(
                       flex: 2,
                       child: _dashColHeader('RATE', right: true),
@@ -25796,6 +25878,11 @@ end tell
                                 : '${r.gstin} · ${r.supplierState}',
                             4,
                             muted: r.gstin.isEmpty,
+                          ),
+                          cell(
+                            r.hsn.isEmpty ? '—' : r.hsn,
+                            2,
+                            muted: r.hsn.isEmpty,
                           ),
                           cell('${_formatRate(r.rate)}%', 2, right: true),
                           cell(_fmt(r.taxable), 3, right: true),
@@ -32355,6 +32442,7 @@ typedef _PurchaseRegRow = ({
   String dealer,
   String gstin,
   String supplierState,
+  String hsn,
   double rate,
   double taxable,
   double tax,
