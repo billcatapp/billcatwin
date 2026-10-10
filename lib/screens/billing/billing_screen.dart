@@ -15,6 +15,7 @@ import '../../constants/app_colors.dart';
 import 'package:uuid/uuid.dart';
 import '../../models/customer.dart';
 import '../../models/dealer.dart';
+import '../../models/purchase.dart';
 import '../../models/product.dart';
 import '../../models/product_variant.dart';
 import '../../models/transaction_record.dart';
@@ -240,6 +241,16 @@ class _BillingScreenState extends State<BillingScreen> {
   // Dealers page data, reloaded when the page opens or a dealer changes.
   Future<(List<Dealer>, List<Product>, Map<String, List<ProductVariant>>)>?
   _dealersPageFuture;
+
+  /// Focus nodes for the dealer fields, one per controller. The suggestion
+  /// list needs a node that outlives a rebuild, and the field is built inside
+  /// dialogs that would otherwise make a fresh one on every frame. Keyed by
+  /// the controller the dialog owns, and disposed with this screen.
+  final Map<TextEditingController, FocusNode> _dealerFocusNodes = {};
+
+  /// Marks the "add this as a new dealer" row among the dealer suggestions.
+  /// A control character, so no real dealer name can ever start with it.
+  static const String _kAddDealerOption = '\u0001add:';
 
   /// Saved dealer records, keyed by lower-cased name, for the Dealers report.
   /// That page groups products by the dealer NAME stored on each product, so
@@ -1558,6 +1569,10 @@ class _BillingScreenState extends State<BillingScreen> {
 
   @override
   void dispose() {
+    for (final f in _dealerFocusNodes.values) {
+      f.dispose();
+    }
+    _dealerFocusNodes.clear();
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     _printSafetyTimer?.cancel();
     _scanDebounce?.cancel();
@@ -5576,6 +5591,29 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
+  /// A customer's number the way wa.me wants it: digits only, country code
+  /// first, no plus. Customers are stored as the local number alone (ten
+  /// digits for India), so the shop's dial code goes in front. A number is
+  /// taken as already international only when it says so — typed with a '+',
+  /// or longer than a local number AND starting with the shop's own dial
+  /// code — because some countries' local numbers run to eleven digits and
+  /// length alone would send those to the wrong country. A leading trunk
+  /// zero or 00 international prefix is dropped first. Returns '' when
+  /// nothing usable is left.
+  String _waNumber(String phone) {
+    var digits = phone.replaceAll(RegExp(r'[^\d]'), '');
+    if (digits.startsWith('00')) {
+      // Dialled-style international prefix: what follows is the full number.
+      return digits.substring(2);
+    }
+    if (digits.startsWith('0')) digits = digits.substring(1);
+    if (digits.isEmpty) return '';
+    final cc = _dialCode.replaceAll(RegExp(r'[^\d]'), '');
+    final international = phone.trim().startsWith('+') ||
+        (digits.length > 10 && digits.startsWith(cc));
+    return international ? digits : '$cc$digits';
+  }
+
   /// Runs a reset after a type-DELETE confirmation. Soft-deletes locally (so it
   /// works offline and disappears at once), then lets the ordinary sync push
   /// remove the rows from the cloud.
@@ -5603,9 +5641,18 @@ class _BillingScreenState extends State<BillingScreen> {
     final selected = {
       for (final c in withPhone) c.id: !_waInvited.containsKey(c.id),
     };
-    var sending = false;
-    var done = 0;
+    // Sent through WhatsApp's own click-to-chat link (wa.me) rather than the
+    // Cloud API: the link needs no credentials, no approved template and no
+    // 24-hour window, which is where the API route dead-ended. The trade is
+    // that each link opens ONE chat with the text ready, and someone has to
+    // press Send in WhatsApp — so the dialog walks the list one customer per
+    // press instead of firing them all off, which would open a chat window
+    // per customer at once.
+    final opened = <String>{};
     final failures = <String, String>{};
+    // True while a chat is being opened, so a double-click cannot open the
+    // same customer twice before the first press has moved the list on.
+    var launching = false;
 
     await showDialog<void>(
       context: context,
@@ -5634,7 +5681,6 @@ class _BillingScreenState extends State<BillingScreen> {
                 children: [
                   TextField(
                     controller: linkCtrl,
-                    enabled: !sending,
                     autofocus: linkCtrl.text.isEmpty,
                     style: GoogleFonts.inter(fontSize: 13),
                     decoration: _dlgInputDecor(
@@ -5644,7 +5690,10 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    'WhatsApp → group name → Invite via link → Copy link',
+                    'WhatsApp → group → Invite via link → Copy link. Each '
+                    'press below opens one customer\'s chat with the invite '
+                    'ready — press Send in WhatsApp, then come back for the '
+                    'next.',
                     style: GoogleFonts.inter(
                       fontSize: 11,
                       color: AppColors.textMuted,
@@ -5652,9 +5701,13 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                   const SizedBox(height: 14),
                   Text(
-                    sending
-                        ? 'Sending… $done of $picked'
-                        : '$picked of ${withPhone.length} customers selected',
+                    opened.isEmpty
+                        ? '$picked of ${withPhone.length} customers selected'
+                        // Counted among those still ticked, so unticking a
+                        // customer after opening theirs cannot make it read
+                        // more opened than selected.
+                        : '${opened.where((id) => selected[id] == true).length}'
+                              ' of $picked opened in WhatsApp',
                     style: GoogleFonts.inter(
                       fontSize: 12.5,
                       color: AppColors.textMuted,
@@ -5672,10 +5725,8 @@ class _BillingScreenState extends State<BillingScreen> {
                           dense: true,
                           contentPadding: EdgeInsets.zero,
                           value: selected[c.id] ?? false,
-                          onChanged: sending
-                              ? null
-                              : (v) =>
-                                    setLocal(() => selected[c.id] = v ?? false),
+                          onChanged: (v) =>
+                              setLocal(() => selected[c.id] = v ?? false),
                           title: Text(
                             c.name.isEmpty ? (c.phone ?? '') : c.name,
                             style: GoogleFonts.inter(fontSize: 13),
@@ -5703,7 +5754,7 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
             actions: [
               TextButton(
-                onPressed: sending ? null : () => Navigator.pop(ctx),
+                onPressed: () => Navigator.pop(ctx),
                 child: Text(
                   'Close',
                   style: GoogleFonts.inter(
@@ -5712,75 +5763,111 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                 ),
               ),
-              TextButton(
-                onPressed: sending || picked == 0 || linkCtrl.text.trim().isEmpty
-                    ? null
-                    : () async {
-                        final link = linkCtrl.text.trim();
-                        // Remembered, so the next invite opens ready to send.
-                        if (link != _waGroupLink) {
-                          _waGroupLink = link;
-                          await LocalDbService.saveSettings({
-                            'wa_group_link': link,
-                          });
-                        }
-                        setLocal(() {
-                          sending = true;
-                          done = 0;
-                          failures.clear();
-                        });
-                        final wa = _wa.WhatsAppService(
-                          phoneNumberId: _waPhoneNumberId,
-                          accessToken: _waAccessToken,
-                        );
-                        final store = _storeName.isEmpty
-                            ? 'our'
-                            : _storeName;
-                        final msg =
-                            'Hi! Join $store on WhatsApp for offers and '
-                            'updates:\n$link';
-                        for (final c in withPhone) {
-                          if (selected[c.id] != true) continue;
-                          final err = await wa.sendText(
-                            toPhone: c.phone ?? '',
-                            message: msg,
-                          );
-                          if (!ctx.mounted) return;
-                          setLocal(() {
-                            done++;
-                            if (err != null) {
-                              failures[c.id] = err;
-                            } else {
-                              // Only a send that actually succeeded counts as
-                              // invited; a failed one stays ticked next time.
-                              _waInvited[c.id] = _fmtDMY(DateTime.now());
+              Builder(
+                builder: (_) {
+                  // The next ticked customer not yet opened this time round.
+                  // A launch that failed is skipped rather than retried on a
+                  // loop; the row shows why and stays ticked for next time.
+                  final next = withPhone.cast<Customer?>().firstWhere(
+                    (c) =>
+                        selected[c!.id] == true &&
+                        !opened.contains(c.id) &&
+                        !failures.containsKey(c.id),
+                    orElse: () => null,
+                  );
+                  final canGo =
+                      !launching &&
+                      next != null &&
+                      linkCtrl.text.trim().isNotEmpty;
+                  final label = next == null
+                      ? (opened.isEmpty ? 'Open in WhatsApp' : 'All opened')
+                      : opened.isEmpty && failures.isEmpty
+                      ? 'Open in WhatsApp'
+                      : 'Next: ${next.name.isEmpty ? next.phone : next.name}';
+                  return TextButton(
+                    onPressed: !canGo
+                        ? null
+                        : () async {
+                            setLocal(() => launching = true);
+                            final link = linkCtrl.text.trim();
+                            // Remembered, so the next invite opens ready.
+                            // Only a convenience: if it cannot be saved the
+                            // invite still goes, and nothing here may throw
+                            // past the point that re-enables the button.
+                            if (link != _waGroupLink) {
+                              _waGroupLink = link;
+                              try {
+                                await LocalDbService.saveSettings({
+                                  'wa_group_link': link,
+                                });
+                              } catch (_) {}
                             }
-                          });
-                        }
-                        await LocalDbService.saveSettings({
-                          'wa_invited': jsonEncode(_waInvited),
-                        });
-                        if (!ctx.mounted) return;
-                        setLocal(() => sending = false);
-                        final ok = done - failures.length;
-                        _showToast(
-                          failures.isEmpty
-                              ? 'Invite sent to $ok customers'
-                              : 'Sent to $ok · ${failures.length} failed — '
-                                    'see the list',
-                          isError: failures.isNotEmpty,
-                        );
-                      },
-                child: Text(
-                  sending ? 'Sending…' : 'Send invite',
-                  style: GoogleFonts.inter(
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w700,
-                    color: sending || picked == 0
-                        ? AppColors.textMuted
-                        : AppColors.accentBlue,
-                  ),
-                ),
+                            final store = _storeName.isEmpty
+                                ? 'our'
+                                : _storeName;
+                            final msg =
+                                'Hi! Join $store on WhatsApp for offers and '
+                                'updates:\n$link';
+                            final number = _waNumber(next.phone ?? '');
+                            var ok = number.isNotEmpty;
+                            if (ok) {
+                              // Built as a Uri so the message is encoded
+                              // properly; opened externally so Windows hands
+                              // it to WhatsApp Desktop, or WhatsApp Web when
+                              // the app is not installed.
+                              try {
+                                ok = await launchUrl(
+                                  Uri(
+                                    scheme: 'https',
+                                    host: 'wa.me',
+                                    path: '/$number',
+                                    queryParameters: {'text': msg},
+                                  ),
+                                  mode: LaunchMode.externalApplication,
+                                );
+                              } catch (_) {
+                                // On Windows only "nothing handles https"
+                                // comes back as false; every other launch
+                                // failure is THROWN. Without this the press
+                                // silently did nothing and stayed on the
+                                // same customer.
+                                ok = false;
+                              }
+                            }
+                            if (!ctx.mounted) return;
+                            setLocal(() {
+                              launching = false;
+                              if (ok) {
+                                opened.add(next.id);
+                                // Counted as invited once the chat is
+                                // opened with the message ready: the app
+                                // cannot see the Send press in WhatsApp
+                                // itself, and this is the closest it gets.
+                                _waInvited[next.id] = _fmtDMY(DateTime.now());
+                              } else {
+                                failures[next.id] = number.isEmpty
+                                    ? 'No usable phone number'
+                                    : 'Could not open WhatsApp';
+                              }
+                            });
+                            if (ok) {
+                              await LocalDbService.saveSettings({
+                                'wa_invited': jsonEncode(_waInvited),
+                              });
+                            }
+                          },
+                    child: Text(
+                      label,
+                      style: GoogleFonts.inter(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: !canGo
+                            ? AppColors.textMuted
+                            : AppColors.accentBlue,
+                      ),
+                    ),
+                  );
+                },
               ),
             ],
           );
@@ -20038,6 +20125,9 @@ end tell
       for (var i = 0; i < 3; i++) _BulkProductRow(category: defaultCategory),
     ];
     final dealerCtrl = TextEditingController();
+    // The supplier's invoice number, as printed on their bill. With it the
+    // entry is saved as a purchase as well as stock.
+    final invoiceCtrl = TextEditingController();
     // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
     // is needed when it resolves.
     final List<Dealer> dealerOptions = [];
@@ -20395,6 +20485,13 @@ end tell
                 } else if (int.tryParse(r.stockCtrl.text.trim()) == null) {
                   fail(r, 'Stock required');
                   numbersOk = false;
+                } else if (!(double.tryParse(r.buyingCtrl.text.trim()) ?? 0)
+                    .isFinite) {
+                  // 'Infinity' or '1e999' parse to an infinite number, which
+                  // the supplier bill cannot store; caught before anything
+                  // is written rather than half-way through the save.
+                  fail(r, 'Buying price is not a valid number');
+                  numbersOk = false;
                 }
               }
               if (!numbersOk) continue;
@@ -20499,12 +20596,122 @@ end tell
               _showToast(firstProblem!, isError: true);
               return;
             }
+            // Taken once, here: the header fields stay editable while the
+            // save runs, and the bill must record what was on screen when
+            // Save was pressed — not whatever is there after the inserts.
+            final invoiceNo = invoiceCtrl.text.trim();
+            final dealerName = dealerCtrl.text.trim();
+            final billDate = purchaseDate;
+            // A supplier bill is dated by the supplier. With an invoice number
+            // but the date cleared there is no honest date to record, and
+            // using today's would put the bill in the wrong return period.
+            if (invoiceNo.isNotEmpty && billDate == null) {
+              _showToast('Pick the supplier invoice date', isError: true);
+              return;
+            }
             setLocal(() => saving = true);
             for (final p in prepared) {
               await LocalDbService.insertProduct(p);
               for (final v
                   in preparedVariants[p.id] ?? const <ProductVariant>[]) {
                 await LocalDbService.insertVariant(v);
+              }
+            }
+            // With a supplier invoice number typed, the entry doubles as that
+            // supplier's bill and is recorded as one — invoice number, dealer
+            // and GSTIN as they stood, one line per product or variant at its
+            // buying price — so the GST purchase register reports it exactly
+            // instead of estimating it from the products.
+            //
+            // A dealer named WITHOUT an invoice number is not recorded: it
+            // stays in the per-product estimate as before, where editing the
+            // product still corrects it, and where several entries from one
+            // dealer on one day merge into a single invoice.
+            // Shown after the success toast so it is the message that stays.
+            String? purchaseNote;
+            if (invoiceNo.isNotEmpty) {
+              final dealer = dealerOptions.cast<Dealer?>().firstWhere(
+                (d) =>
+                    d!.name.trim().toLowerCase() == dealerName.toLowerCase(),
+                orElse: () => null,
+              );
+              final storeRate = double.tryParse(_taxRateDisplay) ?? 0.0;
+              final lines = <PurchaseItem>[];
+              for (final p in prepared) {
+                final rate = p.rateWith(storeRate);
+                final variants =
+                    preparedVariants[p.id] ?? const <ProductVariant>[];
+                // A line with no buying price or no stock bought has no value
+                // to report. Recording it anyway would also count its units
+                // as billed, taking them out of the estimate — so if the
+                // buying price is filled in later the purchase is lost.
+                if (variants.isEmpty) {
+                  if (p.buyingPrice <= 0 || p.stock <= 0) continue;
+                  lines.add(
+                    PurchaseItem(
+                      productId: p.id,
+                      description: p.name,
+                      hsnCode: p.hsnCode,
+                      quantity: p.stock.toDouble(),
+                      rate: p.buyingPrice,
+                      taxable: p.buyingPrice * p.stock,
+                      taxPercent: rate,
+                    ),
+                  );
+                  continue;
+                }
+                // When any variant carries a buying price the product is on
+                // this bill, and every variant goes on it — an unpriced one
+                // at 0 — so all its units count as billed. Leaving one off
+                // would let its units resurface as an estimated invoice.
+                if (!variants.any((v) => v.buyingPrice > 0 && v.stock > 0)) {
+                  continue;
+                }
+                for (final v in variants) {
+                  if (v.stock <= 0) continue;
+                  lines.add(
+                    PurchaseItem(
+                      productId: p.id,
+                      description: '${p.name} (${v.label})',
+                      hsnCode: p.hsnCode,
+                      quantity: v.stock.toDouble(),
+                      rate: v.buyingPrice,
+                      taxable: v.buyingPrice * v.stock,
+                      taxPercent: rate,
+                    ),
+                  );
+                }
+              }
+              if (lines.isEmpty) {
+                purchaseNote =
+                    'Invoice $invoiceNo not recorded — no row had both a '
+                    'buying price and stock';
+              } else {
+                // The products are already saved by now, so a failure here
+                // must not strand the dialog: it is reported and the save
+                // carries on to close normally.
+                try {
+                  await LocalDbService.insertPurchase(
+                    Purchase(
+                      id: const Uuid().v4(),
+                      dealerId: dealer?.id ?? '',
+                      dealerName: dealerName,
+                      dealerGstin: dealer?.gstin ?? '',
+                      invoiceNo: invoiceNo,
+                      // Non-null: an invoice number with no date was refused
+                      // before saving started, and both were read then.
+                      invoiceDate: _isoDate(billDate!),
+                      // Where the goods were delivered to: the shop.
+                      placeOfSupply: _storePlaceOfSupply(),
+                      items: lines,
+                      createdAt: DateTime.now(),
+                    ),
+                  );
+                } catch (_) {
+                  purchaseNote =
+                      'Products saved, but invoice $invoiceNo could not be '
+                      'recorded';
+                }
               }
             }
             ConnectivityService.instance.syncNow();
@@ -20521,6 +20728,7 @@ end tell
                   ? '${prepared.first.name} added to inventory'
                   : '${prepared.length} products added to inventory',
             );
+            if (purchaseNote != null) _showToast(purchaseNote, isError: true);
           }
 
           Widget categoryCell(int i) => DropdownButtonFormField<String>(
@@ -21209,6 +21417,20 @@ end tell
                           const SizedBox(width: 12),
                           Expanded(
                             flex: 2,
+                            child: TextField(
+                              controller: invoiceCtrl,
+                              style: GoogleFonts.inter(
+                                fontSize: 13,
+                                color: AppColors.textDark,
+                              ),
+                              decoration: _dlgInputDecor(
+                                'Supplier invoice no.',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            flex: 2,
                             child: _dlgDateField(
                               ctx: ctx,
                               value: purchaseDate,
@@ -21623,18 +21845,19 @@ end tell
     ),
   );
 
-  /// Selection-only dealer picker. The dropdown lists saved dealers and ends
-  /// with an "Add dealer" action; choosing a name writes it into [ctrl] so
-  /// the existing save paths keep reading dealerCtrl.text unchanged.
+  /// Dealer picker. The name can be typed straight in, or chosen from the
+  /// arrow's list of saved dealers, which ends with an "Add dealer" action.
+  /// Either way it lands in [ctrl], so the existing save paths keep reading
+  /// dealerCtrl.text unchanged.
   Widget _dealerDropdownField({
     required TextEditingController ctrl,
     required List<Dealer> dealers,
     required StateSetter setLocal,
   }) {
     final selectedName = ctrl.text.trim();
-    return PopupMenuButton<String>(
+    final menu = PopupMenuButton<String>(
       tooltip: '',
-      offset: const Offset(0, 48),
+      offset: const Offset(0, 36),
       constraints: const BoxConstraints(minWidth: 280, maxHeight: 340),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
       color: Colors.white,
@@ -21721,50 +21944,250 @@ end tell
           ),
         ),
       ],
-      child: Container(
+      child: const SizedBox(
         height: 44,
-        padding: const EdgeInsets.symmetric(horizontal: 14),
-        decoration: BoxDecoration(
-          color: AppColors.surfaceVariant,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: AppColors.border),
+        width: 30,
+        child: Icon(
+          Icons.keyboard_arrow_down_rounded,
+          size: 18,
+          color: AppColors.textMuted,
         ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                selectedName.isEmpty ? 'Select dealer' : selectedName,
-                overflow: TextOverflow.ellipsis,
+      ),
+    );
+
+    // The name is typed into the field itself, with saved dealers offered
+    // underneath as you type; the arrow beside it still opens the whole
+    // list. Free text is fine here — a product stores its dealer as a name,
+    // which is what the list writes too.
+    final focus = _dealerFocusNodes.putIfAbsent(ctrl, () => FocusNode());
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.only(left: 14, right: 6),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: RawAutocomplete<String>(
+              textEditingController: ctrl,
+              focusNode: focus,
+              optionsBuilder: (value) {
+                final typed = value.text.trim();
+                final q = typed.toLowerCase();
+                if (q.isEmpty) return const Iterable<String>.empty();
+                // A name already typed in full needs no suggesting.
+                final matches = dealers
+                    .map((d) => d.name)
+                    .where(
+                      (n) =>
+                          n.toLowerCase().contains(q) &&
+                          n.toLowerCase() != q,
+                    );
+                // A name that is not saved yet is offered as a new dealer at
+                // the foot of the list, so it can be saved — with its GSTIN —
+                // without leaving the field. Without that a typed supplier
+                // stays a bare name the GST register cannot match.
+                final known = dealers.any(
+                  (d) => d.name.trim().toLowerCase() == q,
+                );
+                return [...matches, if (!known) '$_kAddDealerOption$typed'];
+              },
+              // The add row carries a marker; the field shows the name only.
+              displayStringForOption: (o) => o.startsWith(_kAddDealerOption)
+                  ? o.substring(_kAddDealerOption.length)
+                  : o,
+              onSelected: (value) async {
+                if (!value.startsWith(_kAddDealerOption)) {
+                  setLocal(() => ctrl.text = value);
+                  return;
+                }
+                final typed = value.substring(_kAddDealerOption.length);
+                final added = await _showAddDealerDialog(initialName: typed);
+                if (added == null) return; // cancelled: the typed name stays
+                dealers.add(added);
+                dealers.sort(
+                  (a, b) =>
+                      a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+                );
+                setLocal(() => ctrl.text = added.name);
+              },
+              fieldViewBuilder: (_, c, f, onSubmit) => TextField(
+                controller: c,
+                focusNode: f,
+                onSubmitted: (_) => onSubmit(),
                 style: GoogleFonts.inter(
                   fontSize: 13,
-                  color: selectedName.isEmpty
-                      ? AppColors.textMuted
-                      : AppColors.textDark,
+                  color: AppColors.textDark,
+                ),
+                decoration: InputDecoration(
+                  hintText: 'Select or type dealer',
+                  hintStyle: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textMuted,
+                  ),
+                  isDense: true,
+                  border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              // Sized to the field it hangs off, with the same border and
+              // radius as the rest of the dialog's inputs, so it reads as
+              // part of the field rather than a panel dropped over it.
+              optionsViewBuilder: (_, onSelected, options) => Align(
+                alignment: Alignment.topLeft,
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 4, right: 36),
+                  child: Material(
+                    elevation: 2,
+                    borderRadius: BorderRadius.circular(10),
+                    color: Colors.white,
+                    clipBehavior: Clip.antiAlias,
+                    child: Container(
+                      width: double.infinity,
+                      constraints: const BoxConstraints(maxHeight: 196),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: AppColors.border),
+                      ),
+                      child: ListView.builder(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        shrinkWrap: true,
+                        itemCount: options.length,
+                        itemBuilder: (_, i) {
+                          final option = options.elementAt(i);
+                          final isAdd = option.startsWith(_kAddDealerOption);
+                          final name = isAdd
+                              ? option.substring(_kAddDealerOption.length)
+                              : option;
+                          return InkWell(
+                            onTap: () => onSelected(option),
+                            child: Container(
+                              height: 36,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                              ),
+                              // Set apart from the matches above it.
+                              decoration: isAdd && i > 0
+                                  ? const BoxDecoration(
+                                      border: Border(
+                                        top: BorderSide(
+                                          color: AppColors.border,
+                                        ),
+                                      ),
+                                    )
+                                  : null,
+                              alignment: Alignment.centerLeft,
+                              child: isAdd
+                                  ? Row(
+                                      children: [
+                                        const Icon(
+                                          Icons.add_rounded,
+                                          size: 16,
+                                          color: AppColors.primary,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          child: Text(
+                                            'Add “$name” as dealer',
+                                            overflow: TextOverflow.ellipsis,
+                                            style: GoogleFonts.inter(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w600,
+                                              color: AppColors.primary,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    )
+                                  : Text(
+                                      name,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: GoogleFonts.inter(
+                                        fontSize: 13,
+                                        color: AppColors.textDark,
+                                      ),
+                                    ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
                 ),
               ),
             ),
-            const Icon(
-              Icons.keyboard_arrow_down_rounded,
-              size: 18,
-              color: AppColors.textMuted,
-            ),
-          ],
-        ),
+          ),
+          menu,
+        ],
       ),
     );
   }
 
   /// Small form to save a new dealer to the local directory. Returns the
-  /// saved dealer, or null when cancelled.
-  Future<Dealer?> _showAddDealerDialog() async {
-    final nameCtrl = TextEditingController();
+  /// saved dealer, or null when cancelled. [initialName] pre-fills the name,
+  /// for when the dealer was first typed into a dealer field.
+  Future<Dealer?> _showAddDealerDialog({String initialName = ''}) async {
+    final nameCtrl = TextEditingController(text: initialName);
     final phoneCtrl = TextEditingController();
     final gstinCtrl = TextEditingController();
+    // Enter walks name -> phone -> GSTIN, and Enter on the GSTIN saves.
+    final phoneFocus = FocusNode();
+    final gstinFocus = FocusNode();
     String? error;
-    return showDialog<Dealer>(
+    final saved = await showDialog<Dealer>(
       context: context,
       builder: (dctx) => StatefulBuilder(
-        builder: (dctx, setD) => AlertDialog(
+        builder: (dctx, setD) {
+          Future<void> save() async {
+            final name = nameCtrl.text.trim();
+            if (name.isEmpty) {
+              setD(() => error = 'Enter a dealer name.');
+              return;
+            }
+            final existing = await LocalDbService.getDealers();
+            if (existing.any(
+              (d) => d.name.toLowerCase() == name.toLowerCase(),
+            )) {
+              setD(() => error = 'A dealer with this name already exists.');
+              return;
+            }
+            final gstin = gstinCtrl.text.replaceAll(' ', '').toUpperCase();
+            if (gstin.isNotEmpty &&
+                !RegExp(r'^[0-9]{2}[A-Z0-9]{13}$').hasMatch(gstin)) {
+              setD(
+                () => error =
+                    'GSTIN must be 15 letters/numbers, starting with the 2-digit state code.',
+              );
+              return;
+            }
+            final dealer = Dealer(
+              id: const Uuid().v4(),
+              name: name,
+              phone: phoneCtrl.text.trim(),
+              gstin: gstin,
+              createdAt: DateTime.now().toIso8601String(),
+            );
+            await LocalDbService.insertDealer(dealer);
+            if (dctx.mounted) Navigator.pop(dctx, dealer);
+          }
+
+          // The state the GSTIN belongs to, read off its first two digits
+          // as they are typed: "33 – Tamil Nadu", or a warning when those
+          // two digits are no state at all.
+          final g = gstinCtrl.text.replaceAll(' ', '');
+          final stateCode = _gstStateCode(g);
+          final stateLine = g.length < 2
+              ? null
+              : stateCode.isNotEmpty
+              ? '$stateCode – ${_gstStates[stateCode]}'
+              : '${g.substring(0, 2)} is not a GST state code';
+
+          return AlertDialog(
           backgroundColor: Colors.white,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
@@ -21788,6 +22211,8 @@ end tell
                 TextField(
                   controller: nameCtrl,
                   autofocus: true,
+                  textInputAction: TextInputAction.next,
+                  onSubmitted: (_) => phoneFocus.requestFocus(),
                   style: GoogleFonts.inter(
                     fontSize: 13,
                     color: AppColors.textDark,
@@ -21799,6 +22224,9 @@ end tell
                 const SizedBox(height: 6),
                 TextField(
                   controller: phoneCtrl,
+                  focusNode: phoneFocus,
+                  textInputAction: TextInputAction.next,
+                  onSubmitted: (_) => gstinFocus.requestFocus(),
                   keyboardType: TextInputType.phone,
                   style: GoogleFonts.inter(
                     fontSize: 13,
@@ -21811,8 +22239,13 @@ end tell
                 const SizedBox(height: 6),
                 TextField(
                   controller: gstinCtrl,
+                  focusNode: gstinFocus,
                   maxLength: 15,
                   textCapitalization: TextCapitalization.characters,
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => save(),
+                  // Rebuilds so the state line follows the typing.
+                  onChanged: (_) => setD(() {}),
                   style: GoogleFonts.inter(
                     fontSize: 13,
                     color: AppColors.textDark,
@@ -21821,6 +22254,20 @@ end tell
                     'e.g. 33ABCDE1234F1Z5',
                   ).copyWith(counterText: ''),
                 ),
+                if (stateLine != null) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    'STATE  $stateLine',
+                    style: GoogleFonts.inter(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.3,
+                      color: stateCode.isNotEmpty
+                          ? AppColors.accent
+                          : AppColors.error,
+                    ),
+                  ),
+                ],
                 if (error != null) ...[
                   const SizedBox(height: 10),
                   Text(
@@ -21853,38 +22300,7 @@ end tell
                   borderRadius: BorderRadius.circular(10),
                 ),
               ),
-              onPressed: () async {
-                final name = nameCtrl.text.trim();
-                if (name.isEmpty) {
-                  setD(() => error = 'Enter a dealer name.');
-                  return;
-                }
-                final existing = await LocalDbService.getDealers();
-                if (existing.any(
-                  (d) => d.name.toLowerCase() == name.toLowerCase(),
-                )) {
-                  setD(() => error = 'A dealer with this name already exists.');
-                  return;
-                }
-                final gstin = gstinCtrl.text.replaceAll(' ', '').toUpperCase();
-                if (gstin.isNotEmpty &&
-                    !RegExp(r'^[0-9]{2}[A-Z0-9]{13}$').hasMatch(gstin)) {
-                  setD(
-                    () => error =
-                        'GSTIN must be 15 letters/numbers, starting with the 2-digit state code.',
-                  );
-                  return;
-                }
-                final dealer = Dealer(
-                  id: const Uuid().v4(),
-                  name: name,
-                  phone: phoneCtrl.text.trim(),
-                  gstin: gstin,
-                  createdAt: DateTime.now().toIso8601String(),
-                );
-                await LocalDbService.insertDealer(dealer);
-                if (dctx.mounted) Navigator.pop(dctx, dealer);
-              },
+              onPressed: save,
               child: Text(
                 'Save',
                 style: GoogleFonts.inter(
@@ -21894,9 +22310,13 @@ end tell
               ),
             ),
           ],
-        ),
+          );
+        },
       ),
     );
+    phoneFocus.dispose();
+    gstinFocus.dispose();
+    return saved;
   }
 
   /// Parses an ISO `yyyy-MM-dd` purchase-date string; null when empty/invalid.
@@ -23571,7 +23991,12 @@ end tell
           ),
           const SizedBox(height: 4),
           Text(
-            _fmtDate(DateTime.now()),
+            // GST is read one return period at a time, so the line under the
+            // title names the period being shown rather than today's date —
+            // which said nothing about the figures underneath it.
+            _utilitiesView == 'GST'
+                ? _gstRangeFor(_gstPeriod).$3
+                : _fmtDate(DateTime.now()),
             style: GoogleFonts.inter(fontSize: 13, color: AppColors.textMuted),
           ),
           const SizedBox(height: 24),
@@ -24538,19 +24963,43 @@ end tell
     final fromDay = _isoDate(rangeFrom);
     final toDay = _isoDate(rangeTo);
 
+    // Purchases recorded from the supplier's own bill — Bulk Add with an
+    // invoice number — are reported exactly as entered.
+    final recorded = await LocalDbService.getPurchasesForRange(
+      rangeFrom,
+      rangeTo,
+    );
+    String billDay(String iso) =>
+        iso.length >= 10 ? iso.substring(0, 10) : iso;
+
+    // Units of each product on a recorded bill, with the bill's day, for
+    // bills dated up to the end of this period. The estimate below takes off
+    // only those dated ON OR AFTER the product's current purchase stamp: a
+    // bill from before a restock describes units that may already be sold,
+    // so subtracting it from today's stock would eat into the restock. Done
+    // by quantity rather than by excluding "covered" products outright:
+    // Update Stock keeps the product's last dealer and date, so a restock
+    // can carry the same stamp as a recorded bill and would otherwise vanish.
+    final recordedLots = <String, List<(String, double)>>{};
+    for (final pu in await LocalDbService.getPurchases()) {
+      final day = billDay(pu.invoiceDate);
+      if (day.compareTo(toDay) > 0) continue;
+      for (final it in pu.items) {
+        if (it.productId.isEmpty) continue;
+        (recordedLots[it.productId] ??= []).add((day, it.quantity));
+      }
+    }
+    double billedSince(String productId, String stampDay) =>
+        (recordedLots[productId] ?? const <(String, double)>[])
+            .where((l) => l.$1.compareTo(stampDay) >= 0)
+            .fold<double>(0, (s, l) => s + l.$2);
+
     final bought = _products.where((p) {
       final day = localDay(p.purchaseDate);
       if (day == null) return false;
       return day.compareTo(fromDay) >= 0 && day.compareTo(toDay) <= 0;
-    }).toList()
-      ..sort((a, b) {
-        // Oldest first.
-        final da = localDay(a.purchaseDate)!;
-        final db = localDay(b.purchaseDate)!;
-        if (da != db) return da.compareTo(db);
-        return a.dealerName.compareTo(b.dealerName);
-      });
-    if (bought.isEmpty) {
+    }).toList();
+    if (bought.isEmpty && recorded.isEmpty) {
       _showToast('No purchases in $periodLabel', isError: true);
       return;
     }
@@ -24580,32 +25029,92 @@ end tell
     };
     final storeRate = double.tryParse(_taxRateDisplay) ?? 0;
     final storeState = _gstStateCode(_storeGstin);
-    final pos = _storePlaceOfSupply();
 
-    // One invoice per dealer + purchase day, in the (already sorted) order of
-    // [bought]; within it, taxable value per GST rate.
-    final invoices = <String, ({Product first, Map<double, double> byRate})>{};
+    // Every invoice to report, each with its taxable value per GST rate.
+    final invoices = <({
+      String dealer,
+      String gstin,
+      String invoiceNo,
+      String date,
+      Map<double, double> byRate,
+    })>[];
+
+    // Recorded purchases, as entered. The GSTIN is the one captured with the
+    // bill; only when none was captured does the dealer directory fill in,
+    // so correcting a dealer later never rewrites a bill already recorded.
+    for (final pu in recorded) {
+      final byRate = <double, double>{};
+      for (final it in pu.items) {
+        byRate[it.taxPercent] = (byRate[it.taxPercent] ?? 0) + it.taxable;
+      }
+      final dealer = pu.dealerName.trim();
+      invoices.add((
+        dealer: dealer,
+        gstin: pu.dealerGstin.trim().isNotEmpty
+            ? pu.dealerGstin.trim()
+            : (gstinByDealer[dealer.toLowerCase()] ?? ''),
+        invoiceNo: pu.invoiceNo,
+        date: billDay(pu.invoiceDate),
+        byRate: byRate,
+      ));
+    }
+
+    // Stock bought without a recorded bill: estimated as before, one invoice
+    // per dealer + purchase day with no invoice number.
+    final estimated = <String, Map<double, double>>{};
+    final estimatedFirst = <String, Product>{};
     for (final p in bought) {
       final key =
           '${p.dealerName.trim().toLowerCase()}|${localDay(p.purchaseDate) ?? ''}';
       final rate = p.rateWith(storeRate);
-      final inv = invoices.putIfAbsent(
-        key,
-        () => (first: p, byRate: <double, double>{}),
-      );
-      inv.byRate[rate] = (inv.byRate[rate] ?? 0) + p.buyingPrice * p.stock;
+      final byRate = estimated.putIfAbsent(key, () => <double, double>{});
+      estimatedFirst.putIfAbsent(key, () => p);
+      // Stock still includes any units already on a recorded bill; those are
+      // taken off so they are not reported a second time. A product bought
+      // only on a recorded bill comes to zero here and its empty slab is
+      // dropped below. Floored at zero — sales in between can leave fewer
+      // units than the bills had, and under-reporting input tax is the safe
+      // side to err on.
+      final qty =
+          p.stock - billedSince(p.id, localDay(p.purchaseDate) ?? '');
+      byRate[rate] = (byRate[rate] ?? 0) + p.buyingPrice * (qty < 0 ? 0 : qty);
     }
+    for (final e in estimated.entries) {
+      final first = estimatedFirst[e.key]!;
+      final dealer = first.dealerName.trim();
+      invoices.add((
+        dealer: dealer,
+        gstin: gstinByDealer[dealer.toLowerCase()] ?? '',
+        invoiceNo: '',
+        date: localDay(first.purchaseDate) ?? '',
+        byRate: e.value,
+      ));
+    }
+
+    // Oldest first, then by dealer.
+    invoices.sort((a, b) {
+      final c = a.date.compareTo(b.date);
+      return c != 0 ? c : a.dealer.compareTo(b.dealer);
+    });
 
     final b = StringBuffer();
     b.writeln(
-      'GST,NAME,INV_NO,INV_DATE,NET_AMT,POS,RC,APP_TAX,ITYPE,EC,TAX,TAXABLE,'
-      'TAX_AMT,IGST,CGST,SGST',
+      'GST,NAME,INV_NO,INV_DATE,NET_AMT,RC,APP_TAX,ITYPE,EC,TAX,TAXABLE,'
+      // SUPPLIER_STATE is appended AFTER the standard columns so the layout
+      // an accountant reads stays exactly where it was.
+      'TAX_AMT,IGST,CGST,SGST,SUPPLIER_STATE',
     );
     var rows = 0;
-    for (final inv in invoices.values) {
-      final dealer = inv.first.dealerName.trim();
-      final gstin = gstinByDealer[dealer.toLowerCase()] ?? '';
+    for (final inv in invoices) {
+      final dealer = inv.dealer;
+      final gstin = inv.gstin;
       final dealerState = _gstStateCode(gstin);
+      // The supplier's own state, read off the first two digits of their
+      // GSTIN — e.g. 24-Gujarat. Blank when the dealer has no GSTIN saved,
+      // since there is then nothing to read it from.
+      final supplierState = dealerState.isEmpty
+          ? ''
+          : '$dealerState-${_gstStates[dealerState]}';
       final interState = dealerState.isNotEmpty &&
           storeState.isNotEmpty &&
           dealerState != storeState;
@@ -24621,11 +25130,12 @@ end tell
       for (final e in slabs) {
         final tax = e.value * e.key / 100;
         b.writeln(
-          '${_csvCell(gstin)},${_csvCell(dealer)},,'
-          '${d(inv.first.purchaseDate)},${n(net)},${_csvCell(pos)},N,,Regular,,'
+          '${_csvCell(gstin)},${_csvCell(dealer)},${_csvCell(inv.invoiceNo)},'
+          '${d(inv.date)},${n(net)},N,,Regular,,'
           '${_formatRate(e.key)},${n(e.value)},${n(tax)},'
           '${interState ? n(tax) : '0'},'
-          '${interState ? '0' : n(tax / 2)},${interState ? '0' : n(tax / 2)}',
+          '${interState ? '0' : n(tax / 2)},${interState ? '0' : n(tax / 2)},'
+          '${_csvCell(supplierState)}',
         );
         rows++;
       }
