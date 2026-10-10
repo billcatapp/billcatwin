@@ -236,6 +236,11 @@ class _BillingScreenState extends State<BillingScreen> {
   DateTimeRange? _gstCustomRange;
   String _gstCustomLabel = '';
   List<TransactionRecord>? _gstTxList;
+
+  /// Which side of GST the page is showing: 'Sales' (output tax) or
+  /// 'Purchase' (input tax).
+  String _gstTab = 'Sales';
+  List<_PurchaseRegRow>? _gstPurchaseRows;
   bool _gstLoading = false;
   String? _gstError;
   // Dealers page data, reloaded when the page opens or a dealer changes.
@@ -251,6 +256,14 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Marks the "add this as a new dealer" row among the dealer suggestions.
   /// A control character, so no real dealer name can ever start with it.
   static const String _kAddDealerOption = '\u0001add:';
+
+  /// GST rates offered per product in Bulk Add. 0 is tax-free. 5, 18 and 40
+  /// are the slabs since the September 2025 rate reform; 12 and 28 stay for
+  /// goods still carrying their older rate.
+  static const List<double> _kGstRates = [0, 5, 12, 18, 28, 40];
+
+  /// How the purchase register names stock bought with no dealer recorded.
+  static const String _kUnknownDealer = 'Unknown dealer';
 
   /// Saved dealer records, keyed by lower-cased name, for the Dealers report.
   /// That page groups products by the dealer NAME stored on each product, so
@@ -11323,6 +11336,9 @@ class _BillingScreenState extends State<BillingScreen> {
       total: -(sub - discount + (origInclusive ? 0 : tax)),
       paymentMethod: paymentMethod,
       createdAt: DateTime.now(),
+      // A reversal follows the bill it undoes: returning goods from a bill
+      // kept out of the GST report must not show up in it as a negative.
+      gstBilled: original.gstBilled,
     );
   }
 
@@ -12973,6 +12989,9 @@ class _BillingScreenState extends State<BillingScreen> {
     bool sendWaAfterClose = false;
     // Guards against a doubled Enter checking the bill out twice.
     bool submitted = false;
+    // On for every bill unless switched off here. Off keeps the bill out of
+    // the GST page and its exports; nothing else about it changes.
+    bool gstBilled = true;
     final hasPhone = cart.customerPhone.isNotEmpty;
     final hasWa = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
     final paidCtrl = TextEditingController(text: cart.total.toStringAsFixed(2));
@@ -13005,10 +13024,20 @@ class _BillingScreenState extends State<BillingScreen> {
             if (submitted || !canConfirm) return;
             submitted = true;
             // Reuse the number already printed on this bill, if any, so
-            // the receipt and the saved sale share one invoice number.
-            final invNum =
-                _pendingInvoiceNumber ??
-                await LocalDbService.nextInvoiceNumber();
+            // the receipt and the saved sale share one invoice number —
+            // but only when it belongs to the series this bill is going
+            // into. A bill printed as a GST bill and then switched off here
+            // takes the next 'INV/0001'-style number instead; the unused
+            // GST number was never saved, so the GST series loses nothing.
+            final pending = _pendingInvoiceNumber;
+            final pendingFits =
+                pending != null &&
+                LocalDbService.isNonGstInvoice(pending) == !gstBilled;
+            final invNum = pendingFits
+                ? pending
+                : gstBilled
+                ? await LocalDbService.nextInvoiceNumber()
+                : await LocalDbService.nextNonGstInvoiceNumber();
             _pendingInvoiceNumber = null;
             final snapshot = _snapshotCart(
               cart,
@@ -13022,6 +13051,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 invoiceNumber: invNum,
                 amountPaid: paid,
                 salesperson: _salesperson,
+                gstBilled: gstBilled,
               );
 
             } catch (e) {
@@ -13144,6 +13174,56 @@ class _BillingScreenState extends State<BillingScreen> {
                 style: GoogleFonts.inter(
                   fontSize: 12,
                   color: AppColors.textMuted,
+                ),
+              ),
+              const SizedBox(height: 8),
+              // Kept out of the focus walk, so Enter in the amount field
+              // still confirms the bill rather than landing on the switch.
+              ExcludeFocus(
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () => setLocal(() => gstBilled = !gstBilled),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'GST billed',
+                              style: GoogleFonts.inter(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.textDark,
+                              ),
+                            ),
+                            Text(
+                              gstBilled
+                                  ? 'Included in the GST report'
+                                  : 'Left out of the GST report',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                color: gstBilled
+                                    ? AppColors.textMuted
+                                    : AppColors.error,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Transform.scale(
+                        scale: 0.75,
+                        child: Switch(
+                          value: gstBilled,
+                          onChanged: (v) => setLocal(() => gstBilled = v),
+                          activeTrackColor: AppColors.primary,
+                          activeThumbColor: Colors.white,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
               if (changeDue > 0.005) ...[
@@ -17432,6 +17512,7 @@ end tell
                                 barcodeNo: p.barcodeNo,
                                 dealerName: dealer,
                                 purchaseDate: pd,
+                                gstPurchase: p.gstPurchase,
                               ),
                             );
                           } else if (variants.isEmpty) {
@@ -17469,6 +17550,7 @@ end tell
                                   barcodeNo: p.barcodeNo,
                                   dealerName: dealer,
                                   purchaseDate: newPd,
+                                  gstPurchase: p.gstPurchase,
                                 ),
                               );
                             }
@@ -17851,6 +17933,7 @@ end tell
               description: tags.join(', '),
               dealerName: dealerCtrl.text.trim(),
               purchaseDate: purchaseDate != null ? _isoDate(purchaseDate!) : '',
+              gstPurchase: p.gstPurchase,
               barcodeNo: p.barcodeNo,
             );
             await LocalDbService.updateProduct(updated);
@@ -20144,14 +20227,19 @@ end tell
     /// What a row stores on the product for its tax rate. 0 leaves it on the
     /// store-wide rate, which is every ordinary product; a negative marks it
     /// tax-free. The price itself is always saved exactly as typed.
-    double taxPercentFor(_BulkProductRow r) => r.taxed ? 0.0 : -1.0;
+    double taxPercentFor(_BulkProductRow r) {
+      final rate = r.rate;
+      if (rate == null) return 0.0; // untouched: follows the store rate
+      return rate <= 0 ? -1.0 : rate; // 0% is tax-free; else its own rate
+    }
 
     // Column widths shared by the header strip and every row so the two stay
     // aligned. Name / variant / SKU / category divide up whatever is left.
     const wNum = 38.0;
     const wHsn = 96.0;
     const wPrice = 100.0;
-    const wGst = 60.0;
+    const wGst = 76.0;
+    const wReport = 70.0;
     const wStock = 78.0;
     const wBuying = 100.0;
     const wActions = 78.0;
@@ -20202,14 +20290,14 @@ end tell
             ),
           );
 
-          /// Sets a row's tax mode. A product row carries the change down to
-          /// the variants still following its prices, the same way the price
-          /// itself travels.
-          void setRowGst(_BulkProductRow r, bool v) => setLocal(() {
-            r.taxed = v;
+          /// Sets a row's GST rate (null = follow the store rate). A product
+          /// row carries the change down to the variants still following its
+          /// prices, the same way the price itself travels.
+          void setRowGst(_BulkProductRow r, double? v) => setLocal(() {
+            r.rate = v;
             if (r.variantOf == null) {
               for (final o in rows) {
-                if (o.variantOf == r.id && o.priceAuto) o.taxed = v;
+                if (o.variantOf == r.id && o.priceAuto) o.rate = v;
               }
             }
           });
@@ -20218,20 +20306,56 @@ end tell
           /// it sells at the store's rate, contained in its price. Off marks
           /// it tax-free: no tax at the till whatever the store charges.
           /// Dead when the store has no rate, since nothing is charged anyway.
+          /// Whether this product's stock goes in the GST purchase report.
+          /// A product and its variants are one product, so flipping any row
+          /// of a group flips the whole group. Mouse-only: kept out of the
+          /// arrow-key walk so the grid's keyboard flow is unchanged.
+          Widget reportCell(int i) {
+            final r = rows[i];
+            final on = r.inGstReport;
+            void flip(bool v) => setLocal(() {
+              final headId = r.variantOf ?? r.id;
+              for (final o in rows) {
+                if (o.id == headId || o.variantOf == headId) {
+                  o.inGstReport = v;
+                }
+              }
+            });
+            return Tooltip(
+              message: on
+                  ? 'In the GST purchase report'
+                  : 'Left out of the GST purchase report — still saved and '
+                        'kept on the bill\'s record',
+              waitDuration: const Duration(milliseconds: 400),
+              child: Center(
+                child: ExcludeFocus(
+                  child: Transform.scale(
+                    scale: 0.7,
+                    child: Switch(
+                      value: on,
+                      onChanged: flip,
+                      activeTrackColor: AppColors.primary,
+                      activeThumbColor: Colors.white,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+
           Widget gstCell(int i) {
             final r = rows[i];
-            final off = gstRate <= 0;
-            final on = r.taxed;
-            void flip(bool v) => setRowGst(r, v);
+            final rate = r.rate ?? gstRate;
+            final free = rate <= 0;
 
             return Tooltip(
-              message: off
-                  ? 'Set a $_taxLabel rate in Settings to use this'
-                  : on
-                  ? 'Sold at $_taxLabel ${_formatRate(gstRate)}%, included in '
-                        'the price. Turn off for a tax-free product.'
-                  : 'Tax-free — no $_taxLabel is charged on this product, and '
-                        'the price is what the customer pays',
+              message: free
+                  ? 'Tax-free — no $_taxLabel is charged on this product, and '
+                        'the price is what the customer pays'
+                  : 'Sold at $_taxLabel ${_formatRate(rate)}%, included in '
+                        'the price${r.rate == null ? ' (store rate)' : ''}. '
+                        'Click or press Space to change.',
               waitDuration: const Duration(milliseconds: 400),
               // The cell owns the focus, not the switch inside it: the grid
               // walks by its own list of nodes, and a switch that can hold
@@ -20259,15 +20383,83 @@ end tell
                           ),
                         ),
                         child: ExcludeFocus(
-                          child: Transform.scale(
-                            scale: 0.7,
-                            child: Switch(
-                              value: on,
-                              onChanged: off ? null : flip,
-                              activeTrackColor: AppColors.primary,
-                              activeThumbColor: Colors.white,
-                              materialTapTargetSize:
-                                  MaterialTapTargetSize.shrinkWrap,
+                          child: PopupMenuButton<double>(
+                            tooltip: '',
+                            offset: const Offset(0, 30),
+                            color: Colors.white,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            // Back on the store rate means "follow the
+                            // store", the same as a row never touched.
+                            onSelected: (v) =>
+                                setRowGst(r, v == gstRate ? null : v),
+                            itemBuilder: (_) => [
+                              for (final v in _kGstRates)
+                                PopupMenuItem<double>(
+                                  value: v,
+                                  height: 34,
+                                  child: Text(
+                                    v <= 0
+                                        ? '0%  tax-free'
+                                        : v == gstRate
+                                        ? '${_formatRate(v)}%  store rate'
+                                        : '${_formatRate(v)}%',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 13,
+                                      fontWeight: v == rate
+                                          ? FontWeight.w700
+                                          : FontWeight.w500,
+                                      color: v == rate
+                                          ? AppColors.primary
+                                          : AppColors.textDark,
+                                    ),
+                                  ),
+                                ),
+                            ],
+                            child: Container(
+                              height: 24,
+                              padding: const EdgeInsets.only(
+                                left: 8,
+                                right: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                // A rate picked by hand stands out from one
+                                // simply following the store.
+                                color: r.rate == null
+                                    ? AppColors.surfaceVariant
+                                    : AppColors.primary.withValues(
+                                        alpha: 0.1,
+                                      ),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: r.rate == null
+                                      ? AppColors.border
+                                      : AppColors.primary.withValues(
+                                          alpha: 0.4,
+                                        ),
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    '${_formatRate(rate)}%',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                      color: free
+                                          ? AppColors.textMuted
+                                          : AppColors.textDark,
+                                    ),
+                                  ),
+                                  const Icon(
+                                    Icons.arrow_drop_down_rounded,
+                                    size: 16,
+                                    color: AppColors.textMuted,
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
@@ -20422,7 +20614,8 @@ end tell
             row.priceCtrl.text = src.priceCtrl.text;
             row.buyingCtrl.text = src.buyingCtrl.text;
             // Variants of one product share its tax treatment.
-            row.taxed = src.taxed;
+            row.rate = src.rate;
+            row.inGstReport = src.inGstReport;
             rows.insert(i + 1, row);
             regenSkus();
             recount();
@@ -20571,6 +20764,8 @@ end tell
                   purchaseDate: purchaseDate != null
                       ? _isoDate(purchaseDate!)
                       : '',
+                  // The product row decides; its variants share one product.
+                  gstPurchase: head.inGstReport,
                 ),
               );
               if (hasVariants) {
@@ -20690,23 +20885,46 @@ end tell
                 // The products are already saved by now, so a failure here
                 // must not strand the dialog: it is reported and the save
                 // carries on to close normally.
+                // Products in the GST report and products left out of it go
+                // on two records under the same invoice number, so the
+                // report takes exactly the lines that belong in it and the
+                // rest are still kept.
+                final included = {
+                  for (final p in prepared)
+                    if (p.gstPurchase) p.id,
+                };
+                final parts = <bool, List<PurchaseItem>>{
+                  true: [
+                    for (final l in lines)
+                      if (included.contains(l.productId)) l,
+                  ],
+                  false: [
+                    for (final l in lines)
+                      if (!included.contains(l.productId)) l,
+                  ],
+                };
                 try {
-                  await LocalDbService.insertPurchase(
-                    Purchase(
-                      id: const Uuid().v4(),
-                      dealerId: dealer?.id ?? '',
-                      dealerName: dealerName,
-                      dealerGstin: dealer?.gstin ?? '',
-                      invoiceNo: invoiceNo,
-                      // Non-null: an invoice number with no date was refused
-                      // before saving started, and both were read then.
-                      invoiceDate: _isoDate(billDate!),
-                      // Where the goods were delivered to: the shop.
-                      placeOfSupply: _storePlaceOfSupply(),
-                      items: lines,
-                      createdAt: DateTime.now(),
-                    ),
-                  );
+                  for (final part in parts.entries) {
+                    if (part.value.isEmpty) continue;
+                    await LocalDbService.insertPurchase(
+                      Purchase(
+                        id: const Uuid().v4(),
+                        dealerId: dealer?.id ?? '',
+                        dealerName: dealerName,
+                        dealerGstin: dealer?.gstin ?? '',
+                        invoiceNo: invoiceNo,
+                        gstReport: part.key,
+                        // Non-null: an invoice number with no date was
+                        // refused before saving started, and both were read
+                        // then.
+                        invoiceDate: _isoDate(billDate!),
+                        // Where the goods were delivered to: the shop.
+                        placeOfSupply: _storePlaceOfSupply(),
+                        items: part.value,
+                        createdAt: DateTime.now(),
+                      ),
+                    );
+                  }
                 } catch (_) {
                   purchaseNote =
                       'Products saved, but invoice $invoiceNo could not be '
@@ -20970,6 +21188,7 @@ end tell
                           ),
                         ),
                         SizedBox(width: wGst, child: gstCell(i)),
+                        SizedBox(width: wReport, child: reportCell(i)),
                         SizedBox(
                           width: wStock,
                           child: cellField(
@@ -21226,16 +21445,18 @@ end tell
             // both edges at once, so the grid walks freely.
             final ctrl = ctrlsOf(rows[row])[col];
 
-            // The tax toggle has no caret to walk, so the row steps straight
-            // through it. Space flips it without leaving the cell, and Enter
-            // carries on along the row the way it does everywhere else.
+            // The GST cell has no caret to walk, so the row steps straight
+            // through it. Space steps to the next rate without leaving the
+            // cell, and Enter carries on along the row as everywhere else.
             if (ctrl == null) {
-              // Guarded the same way the switch itself is: with no store
-              // rate there is nothing to take out, so the toggle is dead.
               if (key == LogicalKeyboardKey.space) {
-                if (gstRate > 0) {
-                  setRowGst(rows[row], !rows[row].taxed);
-                }
+                final r = rows[row];
+                final now = r.rate ?? gstRate;
+                final i = _kGstRates.indexOf(now);
+                final next = _kGstRates[(i + 1) % _kGstRates.length];
+                // Landing back on the store rate leaves it following the
+                // store, the same as a row never touched.
+                setRowGst(r, next == gstRate ? null : next);
                 return KeyEventResult.handled;
               }
               if (key == LogicalKeyboardKey.enter ||
@@ -21491,6 +21712,10 @@ end tell
                                     SizedBox(
                                       width: wGst,
                                       child: colLabel(_taxLabel.toUpperCase()),
+                                    ),
+                                    SizedBox(
+                                      width: wReport,
+                                      child: colLabel('REPORT'),
                                     ),
                                     SizedBox(
                                       width: wStock,
@@ -24502,9 +24727,13 @@ end tell
     try {
       final (from, to, _) = _gstRangeFor(_gstPeriod);
       final txns = await LocalDbService.getTransactionsForRange(from, to);
+      // The Purchase tab's register for the same period, built by the same
+      // function the purchase export uses.
+      final purchases = await _purchaseRegister();
       if (!mounted) return;
       setState(() {
         _gstTxList = txns;
+        _gstPurchaseRows = purchases;
         _gstLoading = false;
       });
     } catch (e) {
@@ -24949,7 +25178,73 @@ end tell
   ///   tax is worked out from it;
   /// - IGST when the dealer's GSTIN is from another state than the store's,
   ///   otherwise CGST + SGST.
+  ///
+  /// The register itself is built by [_purchaseRegister], which the GST page's
+  /// Purchase tab shows on screen, so the file and the screen always agree.
   Future<void> _exportPurchaseCsv() async {
+    final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
+    final rows = await _purchaseRegister();
+    if (rows.isEmpty) {
+      if (mounted) {
+        _showToast(
+          'No purchases with a value in $periodLabel',
+          isError: true,
+        );
+      }
+      return;
+    }
+
+    String n(double v) {
+      final s = v.toStringAsFixed(2);
+      final t = s.replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
+      return t == '-0' ? '0' : t;
+    }
+
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    String d(String iso) {
+      final t = _parseDate(iso)?.toLocal();
+      if (t == null) return '';
+      return '${t.day.toString().padLeft(2, '0')}-${months[t.month - 1]}-'
+          '${(t.year % 100).toString().padLeft(2, '0')}';
+    }
+
+    final b = StringBuffer();
+    b.writeln(
+      'GST,NAME,INV_NO,INV_DATE,NET_AMT,RC,APP_TAX,ITYPE,EC,TAX,TAXABLE,'
+      // SUPPLIER_STATE is appended AFTER the standard columns so the layout
+      // an accountant reads stays exactly where it was.
+      'TAX_AMT,IGST,CGST,SGST,SUPPLIER_STATE',
+    );
+    for (final r in rows) {
+      b.writeln(
+        '${_csvCell(r.gstin)},${_csvCell(r.dealer)},${_csvCell(r.invoiceNo)},'
+        '${d(r.date)},${n(r.net)},N,,Regular,,'
+        '${_formatRate(r.rate)},${n(r.taxable)},${n(r.tax)},'
+        '${n(r.igst)},${n(r.cgst)},${n(r.sgst)},'
+        '${_csvCell(r.supplierState)}',
+      );
+    }
+
+    // Named for the period it covers, like every other export here, so two
+    // months' files cannot be mistaken for each other.
+    final withExt = await _pickSavePath('purchases', periodLabel, 'csv');
+    if (withExt == null) return;
+    try {
+      await File(withExt).writeAsString(b.toString());
+      if (mounted) _showToast('Saved $withExt');
+    } catch (e) {
+      if (mounted) _showToast('Could not save: $e', isError: true);
+    }
+  }
+
+  /// The GST purchase register for the period the GST page is showing: one
+  /// row per invoice per GST rate, oldest first. Shared by the CSV export and
+  /// the Purchase tab. Rows worth nothing are left out, so an empty list
+  /// means there is nothing to report.
+  Future<List<_PurchaseRegRow>> _purchaseRegister() async {
     // Stored dates can be a plain yyyy-MM-dd or a full UTC timestamp, so
     // order by the local calendar day.
     String? localDay(String iso) {
@@ -24957,7 +25252,7 @@ end tell
       return t == null ? null : _isoDate(t.toLocal());
     }
 
-    final (rangeFrom, rangeTo, periodLabel) = _gstRangeFor(_gstPeriod);
+    final (rangeFrom, rangeTo, _) = _gstRangeFor(_gstPeriod);
     // Compared as yyyy-MM-dd strings so both ends are inclusive whole days,
     // the same way the rest of this page treats a stored date.
     final fromDay = _isoDate(rangeFrom);
@@ -24994,32 +25289,17 @@ end tell
             .where((l) => l.$1.compareTo(stampDay) >= 0)
             .fold<double>(0, (s, l) => s + l.$2);
 
+    // Stock entered with the GST report switch off stays out of the export.
+    // Its units still count in recordedLots above, so they are never
+    // estimated back in as a GST purchase either.
+    final reported = recorded.where((pu) => pu.gstReport).toList();
     final bought = _products.where((p) {
+      if (!p.gstPurchase) return false;
       final day = localDay(p.purchaseDate);
       if (day == null) return false;
       return day.compareTo(fromDay) >= 0 && day.compareTo(toDay) <= 0;
     }).toList();
-    if (bought.isEmpty && recorded.isEmpty) {
-      _showToast('No purchases in $periodLabel', isError: true);
-      return;
-    }
-
-    String n(double v) {
-      final s = v.toStringAsFixed(2);
-      final t = s.replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
-      return t == '-0' ? '0' : t;
-    }
-
-    const months = [
-      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-    ];
-    String d(String iso) {
-      final t = _parseDate(iso)?.toLocal();
-      if (t == null) return '';
-      return '${t.day.toString().padLeft(2, '0')}-${months[t.month - 1]}-'
-          '${(t.year % 100).toString().padLeft(2, '0')}';
-    }
+    if (bought.isEmpty && reported.isEmpty) return const [];
 
     // Products carry only the dealer's name; the GSTIN lives in the dealer
     // directory.
@@ -25042,14 +25322,14 @@ end tell
     // Recorded purchases, as entered. The GSTIN is the one captured with the
     // bill; only when none was captured does the dealer directory fill in,
     // so correcting a dealer later never rewrites a bill already recorded.
-    for (final pu in recorded) {
+    for (final pu in reported) {
       final byRate = <double, double>{};
       for (final it in pu.items) {
         byRate[it.taxPercent] = (byRate[it.taxPercent] ?? 0) + it.taxable;
       }
       final dealer = pu.dealerName.trim();
       invoices.add((
-        dealer: dealer,
+        dealer: dealer.isEmpty ? _kUnknownDealer : dealer,
         gstin: pu.dealerGstin.trim().isNotEmpty
             ? pu.dealerGstin.trim()
             : (gstinByDealer[dealer.toLowerCase()] ?? ''),
@@ -25064,8 +25344,14 @@ end tell
     final estimated = <String, Map<double, double>>{};
     final estimatedFirst = <String, Product>{};
     for (final p in bought) {
-      final key =
-          '${p.dealerName.trim().toLowerCase()}|${localDay(p.purchaseDate) ?? ''}';
+      // Stock with no dealer is grouped per PRODUCT, not per day: nothing
+      // says two such products came from the same supplier, so merging them
+      // into one invoice would invent a bill. Each stands alone, reported
+      // as "Unknown dealer".
+      final dealerKey = p.dealerName.trim().toLowerCase();
+      final key = dealerKey.isEmpty
+          ? '|${p.id}|${localDay(p.purchaseDate) ?? ''}'
+          : '$dealerKey|${localDay(p.purchaseDate) ?? ''}';
       final rate = p.rateWith(storeRate);
       final byRate = estimated.putIfAbsent(key, () => <double, double>{});
       estimatedFirst.putIfAbsent(key, () => p);
@@ -25083,7 +25369,7 @@ end tell
       final first = estimatedFirst[e.key]!;
       final dealer = first.dealerName.trim();
       invoices.add((
-        dealer: dealer,
+        dealer: dealer.isEmpty ? _kUnknownDealer : dealer,
         gstin: gstinByDealer[dealer.toLowerCase()] ?? '',
         invoiceNo: '',
         date: localDay(first.purchaseDate) ?? '',
@@ -25097,14 +25383,7 @@ end tell
       return c != 0 ? c : a.dealer.compareTo(b.dealer);
     });
 
-    final b = StringBuffer();
-    b.writeln(
-      'GST,NAME,INV_NO,INV_DATE,NET_AMT,RC,APP_TAX,ITYPE,EC,TAX,TAXABLE,'
-      // SUPPLIER_STATE is appended AFTER the standard columns so the layout
-      // an accountant reads stays exactly where it was.
-      'TAX_AMT,IGST,CGST,SGST,SUPPLIER_STATE',
-    );
-    var rows = 0;
+    final out = <_PurchaseRegRow>[];
     for (final inv in invoices) {
       final dealer = inv.dealer;
       final gstin = inv.gstin;
@@ -25129,37 +25408,23 @@ end tell
       );
       for (final e in slabs) {
         final tax = e.value * e.key / 100;
-        b.writeln(
-          '${_csvCell(gstin)},${_csvCell(dealer)},${_csvCell(inv.invoiceNo)},'
-          '${d(inv.date)},${n(net)},N,,Regular,,'
-          '${_formatRate(e.key)},${n(e.value)},${n(tax)},'
-          '${interState ? n(tax) : '0'},'
-          '${interState ? '0' : n(tax / 2)},${interState ? '0' : n(tax / 2)},'
-          '${_csvCell(supplierState)}',
-        );
-        rows++;
+        out.add((
+          date: inv.date,
+          invoiceNo: inv.invoiceNo,
+          dealer: dealer,
+          gstin: gstin,
+          supplierState: supplierState,
+          rate: e.key,
+          taxable: e.value,
+          tax: tax,
+          igst: interState ? tax : 0.0,
+          cgst: interState ? 0.0 : tax / 2,
+          sgst: interState ? 0.0 : tax / 2,
+          net: net,
+        ));
       }
     }
-    if (rows == 0) {
-      if (mounted) {
-        _showToast(
-          'No purchases with a value in $periodLabel',
-          isError: true,
-        );
-      }
-      return;
-    }
-
-    // Named for the period it covers, like every other export here, so two
-    // months' files cannot be mistaken for each other.
-    final withExt = await _pickSavePath('purchases', periodLabel, 'csv');
-    if (withExt == null) return;
-    try {
-      await File(withExt).writeAsString(b.toString());
-      if (mounted) _showToast('Saved $withExt');
-    } catch (e) {
-      if (mounted) _showToast('Could not save: $e', isError: true);
-    }
+    return out;
   }
 
   /// One row per invoice, with CGST/SGST derived from the rate each line
@@ -25239,6 +25504,329 @@ end tell
 
   /// Invoice-wise register for the period. Virtualised, so a month with
   /// thousands of bills scrolls without building every row up front.
+  /// Sales | Purchase switch at the top of the GST page: output tax on the
+  /// shop's own bills, or input tax on what it bought.
+  Widget _gstTabSwitch() {
+    Widget tab(String label) {
+      final selected = _gstTab == label;
+      return GestureDetector(
+        onTap: () => setState(() {
+          _gstTab = label;
+          _gstInvoiceSearch = '';
+        }),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 8),
+          decoration: BoxDecoration(
+            color: selected ? Colors.white : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+            boxShadow: selected
+                ? [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.06),
+                      blurRadius: 4,
+                      offset: const Offset(0, 1),
+                    ),
+                  ]
+                : null,
+          ),
+          child: Text(
+            label,
+            style: GoogleFonts.inter(
+              fontSize: 13,
+              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+              color: selected ? AppColors.textDark : AppColors.textMuted,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [tab('Sales'), tab('Purchase')],
+      ),
+    );
+  }
+
+  /// The Purchase tab: the GST purchase register for the selected period —
+  /// the same rows the purchase export writes — with input-tax totals.
+  Widget _gstPurchaseBody() {
+    final all = _gstPurchaseRows;
+    if (_gstLoading || all == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final q = _gstInvoiceSearch.trim().toLowerCase();
+    final rows = q.isEmpty
+        ? all
+        : all
+              .where(
+                (r) =>
+                    r.invoiceNo.toLowerCase().contains(q) ||
+                    r.dealer.toLowerCase().contains(q) ||
+                    r.gstin.toLowerCase().contains(q),
+              )
+              .toList();
+    double sum(double Function(_PurchaseRegRow) f) =>
+        all.fold<double>(0, (s, r) => s + f(r));
+
+    Widget cell(
+      String t,
+      int flex, {
+      bool right = false,
+      bool bold = false,
+      bool muted = false,
+    }) => Expanded(
+      flex: flex,
+      child: Text(
+        t,
+        textAlign: right ? TextAlign.right : TextAlign.left,
+        overflow: TextOverflow.ellipsis,
+        style: GoogleFonts.inter(
+          fontSize: 12.5,
+          fontWeight: bold ? FontWeight.w700 : FontWeight.w500,
+          color: muted ? AppColors.textMuted : AppColors.textDark,
+        ),
+      ),
+    );
+
+    String day(String iso) {
+      final t = _parseDate(iso);
+      if (t == null) return '';
+      return '${t.day.toString().padLeft(2, '0')}/'
+          '${t.month.toString().padLeft(2, '0')}/'
+          '${(t.year % 100).toString().padLeft(2, '0')}';
+    }
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              _reportSummaryCard(
+                'Taxable Value',
+                _fmt(sum((r) => r.taxable)),
+                Icons.sell_outlined,
+                AppColors.accentBlue,
+                currencyIcon: _currencySymbol,
+              ),
+              const SizedBox(width: 16),
+              _reportSummaryCard(
+                '$_taxLabel Paid',
+                _fmt(sum((r) => r.tax)),
+                Icons.account_balance_outlined,
+                AppColors.accent,
+                currencyIcon: _currencySymbol,
+              ),
+              const SizedBox(width: 16),
+              _reportSummaryCard(
+                'IGST',
+                _fmt(sum((r) => r.igst)),
+                Icons.public_rounded,
+                const Color(0xFF8B5CF6),
+              ),
+              const SizedBox(width: 16),
+              _reportSummaryCard(
+                'CGST',
+                _fmt(sum((r) => r.cgst)),
+                Icons.call_split_rounded,
+                const Color(0xFF8B5CF6),
+              ),
+              const SizedBox(width: 16),
+              _reportSummaryCard(
+                'SGST',
+                _fmt(sum((r) => r.sgst)),
+                Icons.call_split_rounded,
+                const Color(0xFF8B5CF6),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: AppColors.border),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      'Purchases',
+                      style: GoogleFonts.manrope(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.textDark,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      '${rows.length} line${rows.length == 1 ? '' : 's'}',
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                    const Spacer(),
+                    SizedBox(
+                      width: 260,
+                      height: 36,
+                      child: TextField(
+                        onChanged: (v) =>
+                            setState(() => _gstInvoiceSearch = v),
+                        style: GoogleFonts.inter(fontSize: 12.5),
+                        decoration: InputDecoration(
+                          isDense: true,
+                          filled: true,
+                          fillColor: Colors.white,
+                          hintText: 'Search invoice, supplier or GSTIN',
+                          hintStyle: GoogleFonts.inter(
+                            fontSize: 12.5,
+                            color: AppColors.textMuted,
+                          ),
+                          prefixIcon: const Icon(
+                            Icons.search_rounded,
+                            color: AppColors.textMuted,
+                            size: 17,
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                            vertical: 10,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide: const BorderSide(
+                              color: AppColors.border,
+                            ),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide: const BorderSide(
+                              color: AppColors.border,
+                            ),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide: const BorderSide(
+                              color: AppColors.primary,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(flex: 2, child: _dashColHeader('DATE')),
+                    Expanded(flex: 3, child: _dashColHeader('INVOICE')),
+                    Expanded(flex: 4, child: _dashColHeader('SUPPLIER')),
+                    Expanded(flex: 4, child: _dashColHeader('GSTIN')),
+                    Expanded(
+                      flex: 2,
+                      child: _dashColHeader('RATE', right: true),
+                    ),
+                    Expanded(
+                      flex: 3,
+                      child: _dashColHeader('TAXABLE', right: true),
+                    ),
+                    Expanded(
+                      flex: 3,
+                      child: _dashColHeader('IGST', right: true),
+                    ),
+                    Expanded(
+                      flex: 3,
+                      child: _dashColHeader('CGST', right: true),
+                    ),
+                    Expanded(
+                      flex: 3,
+                      child: _dashColHeader('SGST', right: true),
+                    ),
+                    Expanded(
+                      flex: 3,
+                      child: _dashColHeader('TOTAL TAX', right: true),
+                    ),
+                  ],
+                ),
+                const Divider(height: 18, color: AppColors.border),
+                if (rows.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 28),
+                    child: Center(
+                      child: Text(
+                        all.isEmpty
+                            ? 'No purchases in this period'
+                            : 'Nothing matches the search',
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  for (final r in rows)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 9),
+                      child: Row(
+                        children: [
+                          cell(day(r.date), 2),
+                          // No invoice number: estimated from stock entered
+                          // without one, as the export also reports it.
+                          r.invoiceNo.isEmpty
+                              ? cell('estimated', 3, muted: true)
+                              : cell(r.invoiceNo, 3, bold: true),
+                          cell(r.dealer.isEmpty ? '—' : r.dealer, 4),
+                          cell(
+                            r.gstin.isEmpty
+                                ? '—'
+                                : r.supplierState.isEmpty
+                                ? r.gstin
+                                : '${r.gstin} · ${r.supplierState}',
+                            4,
+                            muted: r.gstin.isEmpty,
+                          ),
+                          cell('${_formatRate(r.rate)}%', 2, right: true),
+                          cell(_fmt(r.taxable), 3, right: true),
+                          cell(_fmt(r.igst), 3, right: true),
+                          cell(_fmt(r.cgst), 3, right: true),
+                          cell(_fmt(r.sgst), 3, right: true),
+                          cell(_fmt(r.tax), 3, right: true, bold: true),
+                        ],
+                      ),
+                    ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Lines marked "estimated" come from stock entered without a '
+            'supplier invoice number: one invoice per dealer and purchase day, '
+            'valued at buying price. Stock switched out of the GST report in '
+            'Bulk Add is not shown. IGST applies when the supplier\'s GSTIN is '
+            'from another state than the shop\'s.',
+            style: GoogleFonts.inter(
+              fontSize: 11.5,
+              height: 1.5,
+              color: AppColors.textMuted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _gstInvoiceTable(List<TransactionRecord> txns) {
     final data = _gstInvoiceRows(txns, only: _gstRateFilter);
     final q = _gstInvoiceSearch.trim().toLowerCase();
@@ -25421,7 +26009,9 @@ end tell
     final taxable = <TransactionRecord>[];
     var excluded = 0;
     for (final t in all) {
-      if (_salesRowGst(t) != null) {
+      // Marked "not GST billed" at Confirm Payment: left out of this page
+      // and everything exported from it, counted as excluded.
+      if (t.gstBilled && _salesRowGst(t) != null) {
         taxable.add(t);
       } else {
         excluded++;
@@ -25441,25 +26031,38 @@ end tell
         children: [
           Row(
             children: [
-              Text(
-                'For $periodLabel',
-                style: GoogleFonts.inter(
-                  fontSize: 13,
-                  color: AppColors.textMuted,
+              Expanded(
+                child: Text(
+                  'For $periodLabel',
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textMuted,
+                  ),
                 ),
               ),
-              const Spacer(),
-              _gstPeriodBtn('This Month'),
-              const SizedBox(width: 8),
-              _gstPeriodBtn('Last Month'),
-              const SizedBox(width: 8),
-              _gstCustomBtn(),
-              const SizedBox(width: 14),
-              _gstExportMenu(),
+              // Centred between the two flexible sides.
+              _gstTabSwitch(),
+              Expanded(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    _gstPeriodBtn('This Month'),
+                    const SizedBox(width: 8),
+                    _gstPeriodBtn('Last Month'),
+                    const SizedBox(width: 8),
+                    _gstCustomBtn(),
+                    const SizedBox(width: 14),
+                    _gstExportMenu(),
+                  ],
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 20),
-          if (_gstLoading)
+          if (_gstTab == 'Purchase')
+            Expanded(child: _gstPurchaseBody())
+          else if (_gstLoading)
             const Expanded(child: Center(child: CircularProgressIndicator()))
           else if (_gstError != null)
             Expanded(
@@ -25678,9 +26281,10 @@ end tell
           if (excludedBills > 0) ...[
             Text(
               '$excludedBills bill${excludedBills == 1 ? '' : 's'} in this '
-              'period carried no $_taxLabel and '
-              '${excludedBills == 1 ? 'is' : 'are'} not included above, in the '
-              'exports, or in the ZIP.',
+              'period carried no $_taxLabel or '
+              '${excludedBills == 1 ? 'was' : 'were'} marked not GST billed, '
+              'and ${excludedBills == 1 ? 'is' : 'are'} not included above, '
+              'in the exports, or in the ZIP.',
               style: GoogleFonts.inter(
                 fontSize: 11.5,
                 height: 1.5,
@@ -31742,6 +32346,24 @@ class _ExchangeAdd {
   int get stock => variant?.stock ?? product.stock;
 }
 
+/// One row of the GST purchase register: one supplier invoice at one GST
+/// rate. [net] is the whole invoice's value with tax, repeated on each of its
+/// rows the way the B2BINV layout states it; [date] is yyyy-MM-dd.
+typedef _PurchaseRegRow = ({
+  String date,
+  String invoiceNo,
+  String dealer,
+  String gstin,
+  String supplierState,
+  double rate,
+  double taxable,
+  double tax,
+  double igst,
+  double cgst,
+  double sgst,
+  double net,
+});
+
 /// One in-progress line of the Bulk Add Products grid. Each row owns its
 /// controllers so it keeps whatever was typed while other rows are added or
 /// removed around it. Rows sharing a product name are saved as one product,
@@ -31797,14 +32419,18 @@ class _BulkProductRow {
   bool priceAuto = true;
   bool buyingAuto = true;
 
-  /// Whether this product is taxed at all. On — the default, and nearly every
-  /// product — it is sold at the store's tax rate, contained in the price.
-  /// Off marks it tax-free: no tax at the till whatever the store charges,
-  /// for goods that genuinely attract none.
+  /// The GST rate picked for this product, in percent. Null — the default —
+  /// means it follows the store-wide rate, now and if that rate changes
+  /// later. 0 marks it tax-free; anything else is the product's own rate.
   ///
   /// The price typed is saved exactly as typed either way; this says only
-  /// whether tax sits inside it.
-  bool taxed = true;
+  /// how much tax sits inside it.
+  double? rate;
+
+  /// Whether this product's stock goes in the GST purchase report. Off for
+  /// stock bought without a GST bill: still saved, priced and counted, and
+  /// kept on the supplier bill's record, but left out of the GST export.
+  bool inGstReport = true;
 
   /// Why this row failed the last save attempt, shown beneath it.
   String? error;

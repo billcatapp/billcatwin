@@ -44,6 +44,13 @@ class Product {
   /// (empty when unknown).
   final String purchaseDate;
 
+  /// Whether this stock's last purchase belongs in the GST purchase report.
+  /// True unless switched off when the stock was entered, and on every
+  /// product saved before the switch existed. Local-only, like
+  /// [purchaseDate]: it describes that same last purchase, and the register
+  /// is built from this till's own records.
+  final bool gstPurchase;
+
   const Product({
     required this.id,
     required this.name,
@@ -59,6 +66,7 @@ class Product {
     this.barcodeNo = '',
     this.dealerName = '',
     this.purchaseDate = '',
+    this.gstPurchase = true,
   });
 
   Map<String, dynamic> toMap() => {
@@ -76,6 +84,7 @@ class Product {
     'barcode_no': barcodeNo,
     'dealer_name': dealerName,
     'purchase_date': purchaseDate,
+    'gst_purchase': gstPurchase ? 1 : 0,
     'synced': 0,
   };
 
@@ -94,6 +103,7 @@ class Product {
     barcodeNo: (m['barcode_no'] as String?) ?? '',
     dealerName: (m['dealer_name'] as String?) ?? '',
     purchaseDate: (m['purchase_date'] as String?) ?? '',
+    gstPurchase: ((m['gst_purchase'] as num?)?.toInt() ?? 1) != 0,
   );
 
   Product copyWith({
@@ -104,6 +114,7 @@ class Product {
     String? purchaseDate,
     String? category,
     String? hsnCode,
+    bool? gstPurchase,
   }) => Product(
     id: id,
     name: name,
@@ -119,6 +130,7 @@ class Product {
     barcodeNo: barcodeNo ?? this.barcodeNo,
     dealerName: dealerName ?? this.dealerName,
     purchaseDate: purchaseDate ?? this.purchaseDate,
+    gstPurchase: gstPurchase ?? this.gstPurchase,
   );
 }
 

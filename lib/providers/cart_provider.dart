@@ -191,6 +191,7 @@ class CartProvider extends ChangeNotifier {
     String? invoiceNumber,
     double? amountPaid,
     String salesperson = '',
+    bool gstBilled = true,
   }) async {
     // Default to full payment; anything less is recorded as a balance owed.
     final paid = amountPaid ?? total;
@@ -206,6 +207,7 @@ class CartProvider extends ChangeNotifier {
       hybridCash: isHybrid ? hybridCash : 0,
       hybridUpi: isHybrid ? hybridUpi : 0,
       salesperson: salesperson,
+      gstBilled: gstBilled,
       customerName: customerName.isEmpty ? null : customerName,
       customerPhone: customerPhone.isEmpty ? null : customerPhone,
       items: _items.map((i) => TransactionItem(

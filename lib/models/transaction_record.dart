@@ -85,6 +85,13 @@ class TransactionRecord {
   /// and on any till that has not set one.
   final String salesperson;
 
+  /// Whether this bill belongs in the GST return. True on every bill unless
+  /// it was marked otherwise at Confirm Payment, and on every bill taken
+  /// before the switch existed. A false bill is charged, printed and counted
+  /// in sales, profit and stock exactly as any other; only the GST page and
+  /// its exports leave it out.
+  final bool gstBilled;
+
   const TransactionRecord({
     required this.id,
     this.invoiceNumber,
@@ -102,6 +109,7 @@ class TransactionRecord {
     this.hybridCash = 0,
     this.hybridUpi = 0,
     this.salesperson = '',
+    this.gstBilled = true,
   });
 
   /// Fractional tolerance keeps rounding noise from flagging a paid bill.
@@ -200,6 +208,7 @@ class TransactionRecord {
     'hybrid_cash': hybridCash,
     'hybrid_upi': hybridUpi,
     'salesperson': salesperson,
+    'gst_billed': gstBilled ? 1 : 0,
   };
 
   factory TransactionRecord.fromMap(Map<String, dynamic> m) {
@@ -221,6 +230,9 @@ class TransactionRecord {
       hybridCash: (m['hybrid_cash'] as num?)?.toDouble() ?? 0,
       hybridUpi: (m['hybrid_upi'] as num?)?.toDouble() ?? 0,
       salesperson: (m['salesperson'] as String?) ?? '',
+      // Absent on rows written before the column existed: those were all
+      // GST bills.
+      gstBilled: ((m['gst_billed'] as num?)?.toInt() ?? 1) != 0,
     );
   }
 }

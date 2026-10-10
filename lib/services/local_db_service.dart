@@ -65,6 +65,7 @@ class LocalDbService {
       'barcode_no': "TEXT NOT NULL DEFAULT ''",
       'dealer_name': "TEXT NOT NULL DEFAULT ''",
       'purchase_date': "TEXT NOT NULL DEFAULT ''",
+      'gst_purchase': 'INTEGER NOT NULL DEFAULT 1',
       'rev': 'INTEGER NOT NULL DEFAULT 0',
     },
     'product_variants': {
@@ -79,6 +80,7 @@ class LocalDbService {
       'hybrid_cash': 'REAL NOT NULL DEFAULT 0',
       'hybrid_upi': 'REAL NOT NULL DEFAULT 0',
       'salesperson': "TEXT NOT NULL DEFAULT ''",
+      'gst_billed': 'INTEGER NOT NULL DEFAULT 1',
     },
     'customers': {
       'address': 'TEXT',
@@ -98,6 +100,7 @@ class LocalDbService {
       'place_of_supply': "TEXT NOT NULL DEFAULT ''",
       'reverse_charge': 'INTEGER NOT NULL DEFAULT 0',
       'notes': "TEXT NOT NULL DEFAULT ''",
+      'gst_report': 'INTEGER NOT NULL DEFAULT 1',
       'deleted': 'INTEGER NOT NULL DEFAULT 0',
       'rev': 'INTEGER NOT NULL DEFAULT 0',
     },
@@ -146,7 +149,7 @@ class LocalDbService {
   static Future<Database> _openVersioned(String dbPath, String userId) async {
     return openDatabase(
       join(dbPath, 'billcat_$userId.db'),
-      version: 21,
+      version: 23,
       // Hardening against "database is locked" (SQLITE_BUSY) when another
       // process briefly holds the file (leftover instance, antivirus scan):
       // WAL lets readers and writers coexist, and busy_timeout makes a write
@@ -351,6 +354,33 @@ class LocalDbService {
             );
           } catch (_) {}
         }
+        if (oldVersion < 22) {
+          // Whether a bill belongs in the GST return. Every existing bill
+          // did, so the default is 1.
+          try {
+            await db.execute(
+              'ALTER TABLE transactions ADD COLUMN gst_billed INTEGER NOT NULL '
+              'DEFAULT 1',
+            );
+          } catch (_) {}
+        }
+        if (oldVersion < 23) {
+          // Whether stock bought belongs in the GST purchase report: on the
+          // product (local-only, beside purchase_date) and on recorded
+          // supplier bills. Everything stored so far did, so both default 1.
+          try {
+            await db.execute(
+              'ALTER TABLE products ADD COLUMN gst_purchase INTEGER NOT NULL '
+              'DEFAULT 1',
+            );
+          } catch (_) {}
+          try {
+            await db.execute(
+              'ALTER TABLE purchases ADD COLUMN gst_report INTEGER NOT NULL '
+              'DEFAULT 1',
+            );
+          } catch (_) {}
+        }
       },
       onCreate: (db, _) => _createTables(db),
     );
@@ -408,6 +438,7 @@ class LocalDbService {
       notes TEXT NOT NULL DEFAULT '',
       items TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL DEFAULT '',
+      gst_report INTEGER NOT NULL DEFAULT 1,
       synced INTEGER NOT NULL DEFAULT 0,
       deleted INTEGER NOT NULL DEFAULT 0,
       rev INTEGER NOT NULL DEFAULT 0
@@ -447,6 +478,7 @@ class LocalDbService {
         barcode_no TEXT NOT NULL DEFAULT '',
         dealer_name TEXT NOT NULL DEFAULT '',
         purchase_date TEXT NOT NULL DEFAULT '',
+        gst_purchase INTEGER NOT NULL DEFAULT 1,
         synced INTEGER NOT NULL DEFAULT 0,
         deleted INTEGER NOT NULL DEFAULT 0,
         rev INTEGER NOT NULL DEFAULT 0
@@ -471,7 +503,8 @@ class LocalDbService {
         balance_due REAL NOT NULL DEFAULT 0,
         hybrid_cash REAL NOT NULL DEFAULT 0,
         hybrid_upi REAL NOT NULL DEFAULT 0,
-        salesperson TEXT NOT NULL DEFAULT ''
+        salesperson TEXT NOT NULL DEFAULT '',
+        gst_billed INTEGER NOT NULL DEFAULT 1
       )
     ''');
     await db.execute('''
@@ -560,6 +593,36 @@ class LocalDbService {
     return '$head${(highest + 1).toString().padLeft(4, '0')}';
   }
 
+  /// Whether [number] belongs to the series for bills kept out of the GST
+  /// return: 'INV/' then digits only, e.g. 'INV/0001'. The GST series always
+  /// carries a financial year between two slashes, so the two never overlap.
+  static bool isNonGstInvoice(String number) =>
+      RegExp(r'^INV/\d+$').hasMatch(number);
+
+  /// The next number for a bill marked "not GST billed", e.g. 'INV/0001'.
+  ///
+  /// A series of its own, so the GST series stays gapless for the return
+  /// while these bills are still numbered in order. One continuous run, not
+  /// split by financial year: the owner asked for 'INV/0001', and these bills
+  /// file nowhere that needs the year. Same rules as the GST series otherwise
+  /// — read back from the stored bills, deleted ones counted, never wrapping.
+  static Future<String> nextNonGstInvoiceNumber() async {
+    final database = await db;
+    final rows = await database.query(
+      'transactions',
+      columns: ['invoice_number'],
+      where: "invoice_number LIKE 'INV/%' AND invoice_number NOT LIKE 'INV/%/%'",
+    );
+    var highest = 0;
+    for (final r in rows) {
+      final number = r['invoice_number'] as String?;
+      if (number == null || !isNonGstInvoice(number)) continue;
+      final seq = int.tryParse(number.substring('$invoicePrefix/'.length));
+      if (seq != null && seq > highest) highest = seq;
+    }
+    return '$invoicePrefix/${(highest + 1).toString().padLeft(4, '0')}';
+  }
+
   /// How many bills were already raised in [on]'s financial year, under any
   /// numbering. Used once, to seed the sequence on a till that is meeting the
   /// INV series for the first time.
@@ -577,7 +640,9 @@ class LocalDbService {
       "AND COALESCE(invoice_number, '') NOT LIKE 'RTN-%' "
       "AND COALESCE(invoice_number, '') NOT LIKE 'EXC-%' "
       "AND COALESCE(invoice_number, '') NOT LIKE 'RTN/%' "
-      "AND COALESCE(invoice_number, '') NOT LIKE 'EXC/%'",
+      "AND COALESCE(invoice_number, '') NOT LIKE 'EXC/%' "
+      // Bills kept out of the GST return have their own series.
+      'AND gst_billed = 1',
       ['$startYear-04-01', '${startYear + 1}-03-31'],
     );
     return (rows.first['c'] as int?) ?? 0;
@@ -613,14 +678,18 @@ class LocalDbService {
         n.startsWith(TransactionRecord.exchangeSeries);
 
     await database.transaction((txn) async {
+      // Every column, so a database without gst_billed (a test, or one not
+      // yet migrated) still reads; such rows are all GST bills.
       final rows = await txn.query(
         'transactions',
-        columns: ['id', 'invoice_number', 'created_at'],
         where: 'deleted = 0',
         orderBy: 'created_at ASC',
       );
 
       final perYear = <String, int>{};
+      // Bills kept out of the GST return run in their own series, 'INV/0001'
+      // onwards, so they never take a place in the GST one.
+      var nonGst = 0;
       final renamed = <String, String>{};
       final updates = <(String, String)>[];
 
@@ -631,11 +700,16 @@ class LocalDbService {
         if (old.isNotEmpty && isReversal(old)) continue;
         final created = DateTime.tryParse((r['created_at'] as String?) ?? '');
         if (created == null) continue;
-        final fy = financialYear(created);
-        final seq = (perYear[fy] ?? 0) + 1;
-        perYear[fy] = seq;
-        final number =
-            '$invoicePrefix/$fy/${seq.toString().padLeft(4, '0')}';
+        final String number;
+        if (((r['gst_billed'] as num?)?.toInt() ?? 1) == 0) {
+          nonGst++;
+          number = '$invoicePrefix/${nonGst.toString().padLeft(4, '0')}';
+        } else {
+          final fy = financialYear(created);
+          final seq = (perYear[fy] ?? 0) + 1;
+          perYear[fy] = seq;
+          number = '$invoicePrefix/$fy/${seq.toString().padLeft(4, '0')}';
+        }
         if (old.isNotEmpty) renamed[old] = number;
         // A bill already carrying its correct number is left alone, so a
         // second run writes nothing at all. That is what makes this safe to
@@ -1239,6 +1313,9 @@ class LocalDbService {
           // the local value. barcode_no now syncs, but an empty cloud value
           // must never clobber a locally assigned number.
           map.remove('purchase_date');
+          // Local-only alongside it: the cloud never carries this, so its
+          // default must not overwrite what this till recorded.
+          map.remove('gst_purchase');
           if ((map['barcode_no'] as String? ?? '').isEmpty) {
             map.remove('barcode_no');
           }

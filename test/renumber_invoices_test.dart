@@ -184,4 +184,38 @@ void main() {
         columns: ['synced'], where: 'id = ?', whereArgs: ['a']);
     expect(untouched.first['synced'], 1, reason: 'correct bill left clean');
   });
+
+  test('bills kept out of the GST return get their own INV/0001 series',
+      () async {
+    await db.execute(
+      'ALTER TABLE transactions ADD COLUMN gst_billed INTEGER NOT NULL '
+      'DEFAULT 1',
+    );
+    Future<void> addBill(String id, String number, String at, int gst) =>
+        db.insert('transactions', {
+          'id': id,
+          'invoice_number': number,
+          'created_at': at,
+          'gst_billed': gst,
+        });
+    await addBill('g1', 'INV/26-27/0001', '2026-05-01T10:00:00', 1);
+    // A non-GST bill wrongly sitting in the GST series, as one taken before
+    // the second series existed would.
+    await addBill('n1', 'INV/26-27/0002', '2026-05-02T10:00:00', 0);
+    await addBill('g2', 'INV/26-27/0003', '2026-05-03T10:00:00', 1);
+    await addBill('n2', 'INV/0007', '2026-05-04T10:00:00', 0);
+    // A return of the non-GST bill follows it into its series.
+    await addBill('r1', 'RTN/26-27/0002', '2026-05-05T10:00:00', 0);
+
+    await LocalDbService.renumberExistingInvoices(into: db);
+    final n = await numbers();
+    expect(n['g1'], 'INV/26-27/0001');
+    expect(n['g2'], 'INV/26-27/0002', reason: 'GST series closes the gap');
+    expect(n['n1'], 'INV/0001');
+    expect(n['n2'], 'INV/0002');
+    expect(n['r1'], 'RTN/0001', reason: 'return follows its bill');
+
+    expect(LocalDbService.isNonGstInvoice('INV/0001'), isTrue);
+    expect(LocalDbService.isNonGstInvoice('INV/26-27/0001'), isFalse);
+  });
 }

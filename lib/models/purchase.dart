@@ -110,6 +110,10 @@ class Purchase {
   final DateTime createdAt;
   final bool synced;
 
+  /// Whether this bill belongs in the GST purchase report. False when it was
+  /// entered with the report switch off; still kept as a record either way.
+  final bool gstReport;
+
   const Purchase({
     required this.id,
     this.dealerId = '',
@@ -123,6 +127,7 @@ class Purchase {
     this.items = const [],
     required this.createdAt,
     this.synced = false,
+    this.gstReport = true,
   });
 
   /// Total value before tax.
@@ -162,6 +167,7 @@ class Purchase {
     'items': jsonEncode(items.map((i) => i.toMap()).toList()),
     'created_at': createdAt.toIso8601String(),
     'synced': synced ? 1 : 0,
+    'gst_report': gstReport ? 1 : 0,
   };
 
   factory Purchase.fromMap(Map<String, dynamic> m) {
@@ -192,6 +198,13 @@ class Purchase {
           DateTime.tryParse((m['created_at'] as String?) ?? '') ??
           DateTime.now(),
       synced: ((m['synced'] as num?)?.toInt() ?? 0) == 1,
+      // 1/0 from the local table, true/false from the cloud, absent on rows
+      // written before the flag existed — all of which were in the report.
+      gstReport: switch (m['gst_report']) {
+        final bool b => b,
+        final num n => n != 0,
+        _ => true,
+      },
     );
   }
 
@@ -208,6 +221,7 @@ class Purchase {
     List<PurchaseItem>? items,
     DateTime? createdAt,
     bool? synced,
+    bool? gstReport,
   }) => Purchase(
     id: id ?? this.id,
     dealerId: dealerId ?? this.dealerId,
@@ -221,5 +235,6 @@ class Purchase {
     items: items ?? this.items,
     createdAt: createdAt ?? this.createdAt,
     synced: synced ?? this.synced,
+    gstReport: gstReport ?? this.gstReport,
   );
 }

@@ -601,6 +601,7 @@ class ConnectivityService extends ChangeNotifier {
                         'hybrid_cash': t.hybridCash,
                         'hybrid_upi': t.hybridUpi,
                         'salesperson': t.salesperson,
+                        'gst_billed': t.gstBilled,
                       },
                     )
                     .toList(),
@@ -664,6 +665,7 @@ class ConnectivityService extends ChangeNotifier {
                         'notes': p.notes,
                         'items': p.items.map((i) => i.toMap()).toList(),
                         'created_at': p.createdAt.toIso8601String(),
+                        'gst_report': p.gstReport,
                       },
                     )
                     .toList(),
@@ -1083,6 +1085,9 @@ class ConnectivityService extends ChangeNotifier {
       createdAt:
           DateTime.tryParse((r['created_at'] as String?) ?? '') ??
           DateTime.now(),
+      // In the report unless the cloud says otherwise — including when the
+      // column is absent because add_gst_purchase.sql has not been run.
+      gstReport: r['gst_report'] != false,
     );
   }
 
@@ -1111,6 +1116,9 @@ class ConnectivityService extends ChangeNotifier {
       // Empty when the cloud column is absent, so a pull still succeeds
       // against a project that has not run the salesperson migration yet.
       salesperson: (r['salesperson'] as String?) ?? '',
+      // A GST bill unless the cloud says otherwise — including when the
+      // column is absent because add_gst_billed.sql has not been run.
+      gstBilled: r['gst_billed'] != false,
     );
   }
 
