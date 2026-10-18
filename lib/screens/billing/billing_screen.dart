@@ -517,6 +517,11 @@ class _BillingScreenState extends State<BillingScreen> {
   String _waGroupLink = '';
   String _editWaGroupLink = '';
 
+  /// The approved Cloud API template the group invite is sent with, and its
+  /// language code. Its body must hold one variable, {{1}}, for the link.
+  String _waInviteTemplate = '';
+  String _waTemplateLang = 'en';
+
   /// Customer id -> the day BillCat last sent them the group invite.
   ///
   /// This records who was INVITED, not who joined: WhatsApp exposes no way to
@@ -695,6 +700,9 @@ class _BillingScreenState extends State<BillingScreen> {
       _waPhoneNumberId = s['wa_phone_number_id'] ?? '';
       _waAccessToken = s['wa_access_token'] ?? '';
       _waGroupLink = s['wa_group_link'] ?? '';
+      _waInviteTemplate = s['wa_invite_template'] ?? '';
+      final lang = (s['wa_template_lang'] ?? '').trim();
+      _waTemplateLang = lang.isEmpty ? 'en' : lang;
       try {
         final raw = s['wa_invited'] ?? '';
         _waInvited = raw.isEmpty
@@ -2407,6 +2415,76 @@ class _BillingScreenState extends State<BillingScreen> {
             Expanded(
               child: Consumer<CartProvider>(
                 builder: (context, cart, _) {
+                  // An empty catalogue would otherwise leave a blank page
+                  // with no hint of what to do next.
+                  if (_products.isEmpty) {
+                    return Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 72,
+                            height: 72,
+                            decoration: BoxDecoration(
+                              color: AppColors.accentBlue.withValues(
+                                alpha: 0.08,
+                              ),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: const Icon(
+                              Icons.inventory_2_outlined,
+                              size: 34,
+                              color: AppColors.accentBlue,
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            'No products yet',
+                            style: GoogleFonts.manrope(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: AppColors.textDark,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Add products to your inventory to start billing.',
+                            style: GoogleFonts.inter(
+                              fontSize: 13,
+                              color: AppColors.textMuted,
+                            ),
+                          ),
+                          const SizedBox(height: 18),
+                          ElevatedButton.icon(
+                            onPressed: () => setState(() => _selectedTab = 2),
+                            icon: const Icon(
+                              Icons.inventory_2_outlined,
+                              size: 18,
+                            ),
+                            label: Text(
+                              'Go to Inventory',
+                              style: GoogleFonts.inter(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.primary,
+                              foregroundColor: Colors.white,
+                              elevation: 0,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 22,
+                                vertical: 14,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }
                   final controller = ScrollController();
                   return Scrollbar(
                     controller: controller,
@@ -5642,18 +5720,63 @@ class _BillingScreenState extends State<BillingScreen> {
     // it was a dead end. Pre-filled from Settings when one is saved, and
     // whatever is used here is saved back for next time.
     final linkCtrl = TextEditingController(text: _waGroupLink);
-    final withPhone = _reportCustomers
-        .where((c) => (c.phone ?? '').trim().isNotEmpty)
-        .toList();
+    // One row per phone number, not per customer record: the same person
+    // saved three times would otherwise get the invite three times. The
+    // first record keeps the row; [sameNumber] holds every record id that
+    // shares its number, so all of them are marked invited together.
+    final sameNumber = <String, List<String>>{};
+    final withPhone = <Customer>[];
+    final rowOfNumber = <String, String>{};
+    for (final c in _reportCustomers) {
+      final phone = (c.phone ?? '').trim();
+      if (phone.isEmpty) continue;
+      final number = _waNumber(phone);
+      final key = number.isEmpty ? 'id:${c.id}' : number;
+      final row = rowOfNumber[key];
+      if (row == null) {
+        rowOfNumber[key] = c.id;
+        sameNumber[c.id] = [c.id];
+        withPhone.add(c);
+      } else {
+        sameNumber[row]!.add(c.id);
+      }
+    }
     if (withPhone.isEmpty) {
       _showToast('No customers have a phone number', isError: true);
       return;
     }
+    String? invitedOnOf(Customer c) {
+      for (final id in sameNumber[c.id]!) {
+        final on = _waInvited[id];
+        if (on != null) return on;
+      }
+      return null;
+    }
+
+    void markInvited(Customer c) {
+      final on = _fmtDMY(DateTime.now());
+      for (final id in sameNumber[c.id]!) {
+        _waInvited[id] = on;
+      }
+    }
+
     // Someone already invited is left unticked, so pressing Send again goes
     // only to the people who have not had it yet.
-    final selected = {
-      for (final c in withPhone) c.id: !_waInvited.containsKey(c.id),
-    };
+    final selected = {for (final c in withPhone) c.id: invitedOnOf(c) == null};
+    // The Cloud API sends to everyone in one press, with no chat windows.
+    // It needs the credentials from Settings and a template Meta has
+    // approved: a business may only start a conversation with a template.
+    final api = _wa.WhatsAppService(
+      phoneNumberId: _waPhoneNumberId,
+      accessToken: _waAccessToken,
+    );
+    final tplCtrl = TextEditingController(text: _waInviteTemplate);
+    final langCtrl = TextEditingController(text: _waTemplateLang);
+    var sending = false;
+    var sentViaApi = false;
+    // A failure that would repeat for every customer (template missing,
+    // token expired, offline). Shown once and the run is stopped.
+    String? apiError;
     // Sent through WhatsApp's own click-to-chat link (wa.me) rather than the
     // Cloud API: the link needs no credentials, no approved template and no
     // 24-hour window, which is where the API route dead-ended. The trade is
@@ -5703,15 +5826,67 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    'WhatsApp → group → Invite via link → Copy link. Each '
-                    'press below opens one customer\'s chat with the invite '
-                    'ready — press Send in WhatsApp, then come back for the '
-                    'next.',
+                    api.isConfigured
+                        ? 'WhatsApp → group → Invite via link → Copy link. '
+                              'Send to all delivers it through the WhatsApp '
+                              'API using your approved template.'
+                        : 'WhatsApp → group → Invite via link → Copy link. Each '
+                              'press below opens one customer\'s chat with the invite '
+                              'ready — press Send in WhatsApp, then come back for the '
+                              'next. Add the WhatsApp API in Settings to send to '
+                              'everyone at once.',
                     style: GoogleFonts.inter(
                       fontSize: 11,
                       color: AppColors.textMuted,
                     ),
                   ),
+                  if (api.isConfigured) ...[
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: tplCtrl,
+                            style: GoogleFonts.inter(fontSize: 13),
+                            decoration: _dlgInputDecor(
+                              'Template name, e.g. group_invite',
+                            ),
+                            onChanged: (_) => setLocal(() {}),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        SizedBox(
+                          width: 76,
+                          child: TextField(
+                            controller: langCtrl,
+                            style: GoogleFonts.inter(fontSize: 13),
+                            decoration: _dlgInputDecor('en'),
+                            onChanged: (_) => setLocal(() {}),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'The template\'s text must contain {{1}} where the '
+                      'group link goes.',
+                      style: GoogleFonts.inter(
+                        fontSize: 11,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ],
+                  if (apiError != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      apiError!,
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.error,
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 14),
                   Text(
                     opened.isEmpty
@@ -5720,7 +5895,8 @@ class _BillingScreenState extends State<BillingScreen> {
                         // customer after opening theirs cannot make it read
                         // more opened than selected.
                         : '${opened.where((id) => selected[id] == true).length}'
-                              ' of $picked opened in WhatsApp',
+                              ' of $picked '
+                              '${sentViaApi ? 'sent' : 'opened in WhatsApp'}',
                     style: GoogleFonts.inter(
                       fontSize: 12.5,
                       color: AppColors.textMuted,
@@ -5733,7 +5909,8 @@ class _BillingScreenState extends State<BillingScreen> {
                       shrinkWrap: true,
                       children: withPhone.map((c) {
                         final failed = failures[c.id];
-                        final invitedOn = _waInvited[c.id];
+                        final invitedOn = invitedOnOf(c);
+                        final dupes = sameNumber[c.id]!.length;
                         return CheckboxListTile(
                           dense: true,
                           contentPadding: EdgeInsets.zero,
@@ -5746,9 +5923,9 @@ class _BillingScreenState extends State<BillingScreen> {
                           ),
                           subtitle: Text(
                             failed ??
-                                (invitedOn != null
-                                    ? '${c.phone ?? ''} · invited $invitedOn'
-                                    : (c.phone ?? '')),
+                                '${c.phone ?? ''}'
+                                    '${dupes > 1 ? ' · saved $dupes times' : ''}'
+                                    '${invitedOn != null ? ' · invited $invitedOn' : ''}',
                             style: GoogleFonts.inter(
                               fontSize: 11.5,
                               color: failed != null
@@ -5767,7 +5944,9 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(ctx),
+                // Held while a bulk send runs: the run updates this dialog
+                // after every message and must not outlive it.
+                onPressed: sending ? null : () => Navigator.pop(ctx),
                 child: Text(
                   'Close',
                   style: GoogleFonts.inter(
@@ -5776,6 +5955,108 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                 ),
               ),
+              if (api.isConfigured)
+                Builder(
+                  builder: (_) {
+                    // Everyone ticked who has not been sent to or failed
+                    // this time round, so a second press after fixing a
+                    // template retries only what did not go.
+                    final todo = withPhone
+                        .where(
+                          (c) =>
+                              selected[c.id] == true &&
+                              !opened.contains(c.id) &&
+                              !failures.containsKey(c.id),
+                        )
+                        .toList();
+                    final canSend =
+                        !sending &&
+                        !launching &&
+                        todo.isNotEmpty &&
+                        linkCtrl.text.trim().isNotEmpty &&
+                        tplCtrl.text.trim().isNotEmpty;
+                    return TextButton(
+                      onPressed: !canSend
+                          ? null
+                          : () async {
+                              final link = linkCtrl.text.trim();
+                              final tpl = tplCtrl.text.trim();
+                              final langIn = langCtrl.text.trim();
+                              final lang = langIn.isEmpty ? 'en' : langIn;
+                              setLocal(() {
+                                sending = true;
+                                sentViaApi = true;
+                                apiError = null;
+                              });
+                              // Remembered for next time; a failed save
+                              // must not stop the send.
+                              _waGroupLink = link;
+                              _waInviteTemplate = tpl;
+                              _waTemplateLang = lang;
+                              try {
+                                await LocalDbService.saveSettings({
+                                  'wa_group_link': link,
+                                  'wa_invite_template': tpl,
+                                  'wa_template_lang': lang,
+                                });
+                              } catch (_) {}
+                              for (final c in todo) {
+                                final number = _waNumber(c.phone ?? '');
+                                final err = number.isEmpty
+                                    ? 'No usable phone number'
+                                    : await api.sendTemplate(
+                                        toPhone: number,
+                                        templateName: tpl,
+                                        languageCode: lang,
+                                        bodyParams: [link],
+                                      );
+                                if (!ctx.mounted) return;
+                                // These fail the same way for every
+                                // customer, so the run stops at the first
+                                // one instead of marking the whole list red.
+                                final fatal =
+                                    err != null &&
+                                    (err.startsWith('Template') ||
+                                        err.startsWith('Access token') ||
+                                        err == 'Could not reach WhatsApp' ||
+                                        err == 'WhatsApp API is not set up');
+                                setLocal(() {
+                                  if (err == null) {
+                                    opened.add(c.id);
+                                    markInvited(c);
+                                  } else if (fatal) {
+                                    apiError = err;
+                                  } else {
+                                    failures[c.id] = err;
+                                  }
+                                });
+                                if (fatal) break;
+                              }
+                              try {
+                                await LocalDbService.saveSettings({
+                                  'wa_invited': jsonEncode(_waInvited),
+                                });
+                              } catch (_) {}
+                              if (!ctx.mounted) return;
+                              setLocal(() => sending = false);
+                            },
+                      child: Text(
+                        sending
+                            ? 'Sending…'
+                            : todo.isEmpty && opened.isNotEmpty
+                            ? 'All sent'
+                            : 'Send to all (${todo.length})',
+                        style: GoogleFonts.inter(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: !canSend
+                              ? AppColors.textMuted
+                              : AppColors.accentBlue,
+                        ),
+                      ),
+                    );
+                  },
+                ),
               Builder(
                 builder: (_) {
                   // The next ticked customer not yet opened this time round.
@@ -5790,6 +6071,7 @@ class _BillingScreenState extends State<BillingScreen> {
                   );
                   final canGo =
                       !launching &&
+                      !sending &&
                       next != null &&
                       linkCtrl.text.trim().isNotEmpty;
                   final label = next == null
@@ -5856,7 +6138,7 @@ class _BillingScreenState extends State<BillingScreen> {
                                 // opened with the message ready: the app
                                 // cannot see the Send press in WhatsApp
                                 // itself, and this is the closest it gets.
-                                _waInvited[next.id] = _fmtDMY(DateTime.now());
+                                markInvited(next);
                               } else {
                                 failures[next.id] = number.isEmpty
                                     ? 'No usable phone number'
@@ -24851,9 +25133,9 @@ end tell
     if (t.items.any((i) => i.taxPercent > 0)) return storeRate;
     final net = t.subtotal - t.discountAmount;
     if (t.taxAmount.abs() < 0.005 || net.abs() < 0.005) return storeRate;
-    // The rate is read against the line values BEFORE any discount, since a
-    // discount does not reduce the tax, so the subtotal is the base here.
-    final taxable = t.subtotal;
+    // The rate is read against what was paid after the discount, the same
+    // base the bill's own tax was worked out on.
+    final taxable = net;
     if (taxable.abs() < 0.005) return storeRate;
     final derived = t.taxAmount / taxable * 100;
     if (!derived.isFinite || derived <= 0 || derived > 100) return storeRate;
@@ -24878,11 +25160,10 @@ end tell
     final inclusive = tx.priceIncludesTax;
     for (final i in tx.items) {
       final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
-      // Tax is read against the line's FULL value — a discount does not
-      // reduce it — while the value the customer actually paid is the
-      // discounted one, which is what the taxable figure comes out of.
-      final tax = i.total * rate / 100;
+      // Tax is read against what the customer actually paid on this line,
+      // after its share of the discount, the same base the bill used.
       final paid = i.total * factor;
+      final tax = paid * rate / 100;
       final prev = out[rate] ?? (0.0, 0.0);
       out[rate] = (prev.$1 + (inclusive ? paid - tax : paid), prev.$2 + tax);
     }

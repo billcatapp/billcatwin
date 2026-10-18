@@ -334,9 +334,8 @@ class ThermalPrinter {
       final discountFactor = subtotal > 0
           ? (subtotal - tx.discountAmount) / subtotal
           : 1.0;
-      // rate -> (value paid, tax). Tax is read against the line's FULL
-      // value, since a discount does not reduce it; the paid value is the
-      // discounted one, which is what the slab's amount has to add up to.
+      // rate -> (value paid, tax). Both are read against what was actually
+      // paid: the discount is spread across the lines and reduces the tax.
       final byRate = <double, ({double paid, double tax})>{};
       for (final i in tx.items) {
         final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
@@ -344,7 +343,7 @@ class ThermalPrinter {
         final prev = byRate[rate] ?? (paid: 0.0, tax: 0.0);
         byRate[rate] = (
           paid: prev.paid + i.total * discountFactor,
-          tax: prev.tax + i.total * rate / 100,
+          tax: prev.tax + i.total * discountFactor * rate / 100,
         );
       }
       if (byRate.isNotEmpty) {

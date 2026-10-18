@@ -75,6 +75,76 @@ class WhatsAppService {
     }
   }
 
+  /// Sends an approved message template. Returns null on success, or the
+  /// reason it failed in words a shopkeeper can act on.
+  ///
+  /// Templates are the only messages Meta delivers to someone who has not
+  /// messaged this number in the last 24 hours, which is why a bulk send to
+  /// a customer list must use one. [bodyParams] fill the template's body
+  /// variables {{1}}, {{2}}, ... in order, so their count must match the
+  /// template exactly. [toPhone] must already carry its country code.
+  Future<String?> sendTemplate({
+    required String toPhone,
+    required String templateName,
+    required String languageCode,
+    List<String> bodyParams = const [],
+  }) async {
+    if (!isConfigured) return 'WhatsApp API is not set up';
+    final normalized = toPhone.replaceAll(RegExp(r'[^\d]'), '');
+    if (normalized.isEmpty) return 'No phone number';
+    try {
+      final res = await http.post(
+        Uri.parse('https://graph.facebook.com/v19.0/$phoneNumberId/messages'),
+        headers: {
+          'Authorization': 'Bearer $accessToken',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'messaging_product': 'whatsapp',
+          'to': normalized,
+          'type': 'template',
+          'template': {
+            'name': templateName,
+            'language': {'code': languageCode},
+            if (bodyParams.isNotEmpty)
+              'components': [
+                {
+                  'type': 'body',
+                  'parameters': [
+                    for (final p in bodyParams) {'type': 'text', 'text': p},
+                  ],
+                },
+              ],
+          },
+        }),
+      );
+      if (res.statusCode == 200) return null;
+      try {
+        final e = (jsonDecode(res.body) as Map<String, dynamic>)['error']
+            as Map<String, dynamic>?;
+        final code = (e?['code'] as num?)?.toInt();
+        switch (code) {
+          case 132001:
+            return 'Template "$templateName" not found or not approved for '
+                'language "$languageCode"';
+          case 132000:
+            return 'Template expects a different number of values';
+          case 131026:
+            return 'Not reachable on WhatsApp';
+          case 190:
+            return 'Access token expired — update it in Settings';
+          case 131056:
+            return 'Too many messages to this number — try later';
+        }
+        return (e?['message'] as String?) ?? 'HTTP ${res.statusCode}';
+      } catch (_) {
+        return 'HTTP ${res.statusCode}';
+      }
+    } catch (_) {
+      return 'Could not reach WhatsApp';
+    }
+  }
+
   /// Send a PDF invoice to a WhatsApp number via the Business API.
   /// Returns true on success.
   Future<bool> sendInvoicePdf({

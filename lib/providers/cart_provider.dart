@@ -64,22 +64,24 @@ class CartProvider extends ChangeNotifier {
   /// reconcile to the stated rate. Do not "correct" this back without
   /// asking: it is deliberate.
   ///
-  /// A discount does NOT reduce the tax — also the owner's instruction
-  /// (8 Oct). The rate is read against the line's full value, so a 1000 line
-  /// discounted by 100 still carries 50 of tax while the customer pays 900,
-  /// leaving 850 of taxable value. GST ordinarily treats an invoice discount
-  /// as reducing the taxable value, so this too is deliberate and departs
-  /// from it: the discount comes out of the shop's own margin, not the tax.
+  /// A discount DOES reduce the tax: the rate is read against what the
+  /// customer actually pays. 5300 of goods with a 530 discount pays 4770,
+  /// and the tax is 5% of 4770 = 238.50. The owner's instruction of 17 Oct,
+  /// replacing one of 8 Oct that held the tax at the pre-discount figure.
+  /// The discount is spread across the lines in proportion to their value,
+  /// so on a bill mixing rates each slab is taxed on its own share.
   Map<double, double> get taxBreakdown {
     final sub = subtotal;
     final result = <double, double>{};
     if (sub <= 0) return result;
+    final discountFactor = (sub - discountAmount) / sub;
     for (final item in _items) {
       // A tax-free product resolves to 0 here and is skipped, so it
       // contributes nothing to the bill's tax.
       final rate = item.product.rateWith(taxRate);
       if (rate <= 0) continue;
-      result[rate] = (result[rate] ?? 0) + item.total * rate / 100;
+      result[rate] =
+          (result[rate] ?? 0) + item.total * discountFactor * rate / 100;
     }
     return result;
   }
