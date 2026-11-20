@@ -220,9 +220,15 @@ class ThermalPrinter {
     // figure. Bills taken before prices became tax-inclusive stored the
     // line before tax, so those still have it added on.
     final inclusivePricing = tx.priceIncludesTax;
+    // As billing charged it: on a bill with any rated line, a line at 0 is
+    // a tax-free product. Only a bill with no rates at all uses the store
+    // rate.
+    final anyRated = tx.items.any((i) => i.taxPercent > 0);
     double lineInclusive(TransactionItem i) {
       if (inclusivePricing) return i.total;
-      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+      final rate = i.taxPercent > 0
+          ? i.taxPercent
+          : (anyRated ? 0.0 : fallbackRate);
       return i.total * (1 + rate / 100);
     }
 
@@ -282,6 +288,12 @@ class ThermalPrinter {
     if (tx.discountAmount > 0) {
       _line(b, _row('Discount', '-${money(tx.discountAmount)}'));
     }
+    // Rounded down by hand in the cart (₹0.50 or more under subtotal -
+    // discount, which automatic rounding never is), so the receipt adds up.
+    final handRound = tx.total - (tx.subtotal - tx.discountAmount);
+    if (handRound <= -0.5) {
+      _line(b, _row('Round off', '-${money(-handRound)}'));
+    }
     _sep(b);
 
     // ── Grand total — label bold, value big ──────────────────────────────
@@ -331,14 +343,20 @@ class ThermalPrinter {
     // column of zeroes without clipping the amounts that matter.
     if (hasTax) {
       final subtotal = tx.items.fold<double>(0, (s, i) => s + i.total);
+      // A bill rounded down by hand (total ₹0.50 or more under subtotal -
+      // discount, which automatic rounding never is) is taxed on the
+      // rounded amount.
+      final net = subtotal - tx.discountAmount;
       final discountFactor = subtotal > 0
-          ? (subtotal - tx.discountAmount) / subtotal
+          ? (tx.total - net <= -0.5 ? tx.total : net) / subtotal
           : 1.0;
       // rate -> (value paid, tax). Both are read against what was actually
       // paid: the discount is spread across the lines and reduces the tax.
       final byRate = <double, ({double paid, double tax})>{};
       for (final i in tx.items) {
-        final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+        final rate = i.taxPercent > 0
+            ? i.taxPercent
+            : (anyRated ? 0.0 : fallbackRate);
         if (rate <= 0) continue;
         final prev = byRate[rate] ?? (paid: 0.0, tax: 0.0);
         byRate[rate] = (

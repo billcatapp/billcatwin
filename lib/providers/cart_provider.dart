@@ -62,7 +62,8 @@ class CartProvider extends ChangeNotifier {
   /// figure that makes the tax exactly 5% OF the taxable value. Here 50 is
   /// 5.26% of 950, so the taxable and tax columns on a return do not
   /// reconcile to the stated rate. Do not "correct" this back without
-  /// asking: it is deliberate.
+  /// asking: it is deliberate. (Switched to 5/105 on 19 Nov and reverted
+  /// the same day at the owner's word: "old method is correct".)
   ///
   /// A discount DOES reduce the tax: the rate is read against what the
   /// customer actually pays. 5300 of goods with a 530 discount pays 4770,
@@ -70,11 +71,17 @@ class CartProvider extends ChangeNotifier {
   /// replacing one of 8 Oct that held the tax at the pre-discount figure.
   /// The discount is spread across the lines in proportion to their value,
   /// so on a bill mixing rates each slab is taxed on its own share.
+  ///
+  /// A bill the cashier rounded down by hand ([setRoundedTotal]) is taxed on
+  /// the rounded amount, the same way a discount lowers the tax — the
+  /// owner's choice of 19 Nov. The automatic nearest-rupee rounding does
+  /// not change the tax.
   Map<double, double> get taxBreakdown {
     final sub = subtotal;
     final result = <double, double>{};
     if (sub <= 0) return result;
-    final discountFactor = (sub - discountAmount) / sub;
+    final paid = _roundApplies ? _roundedTo! : sub - discountAmount;
+    final discountFactor = paid / sub;
     for (final item in _items) {
       // A tax-free product resolves to 0 here and is skipped, so it
       // contributes nothing to the bill's tax.
@@ -93,9 +100,49 @@ class CartProvider extends ChangeNotifier {
   /// already part of [subtotal], so it is not added again here.
   double get rawTotal => subtotal - discountAmount;
 
-  /// Payable total, rounded to the nearest rupee (Indian retail standard).
+  /// Payable total, rounded to the nearest rupee (Indian retail standard),
+  /// unless the cashier typed a lower final amount to round the bill down.
   /// This is what gets charged, saved and split — not the paise-exact figure.
-  double get total => rawTotal.roundToDouble();
+  double get total => _roundApplies ? _roundedTo! : rawTotal.roundToDouble();
+
+  /// The final amount typed in the cart's ROUND OFF box, e.g. 1040 for a
+  /// 1047 bill. Kept with the nearest-rupee total it was typed against, so
+  /// it applies only to that exact bill: adding an item or changing the
+  /// discount afterwards drops it by itself, and a stale figure can never
+  /// carry over to a different bill.
+  double? _roundedTo;
+  double _roundBase = 0;
+
+  bool get _roundApplies {
+    final r = _roundedTo;
+    if (r == null) return false;
+    final normal = rawTotal.roundToDouble();
+    return _roundBase == normal && r > 0 && r <= normal;
+  }
+
+  /// The typed final amount while it applies, else null.
+  double? get roundedTo => _roundApplies ? _roundedTo : null;
+
+  /// Rounds the bill down to [amount] (null = normal rounding). Only a
+  /// figure above 0 and not more than the normal total takes effect.
+  void setRoundedTotal(double? amount) {
+    _roundedTo = amount;
+    _roundBase = rawTotal.roundToDouble();
+    notifyListeners();
+  }
+
+  /// Every change to the cart ends in a notify. One that moved the bill
+  /// total away from the figure a round-off was typed against forgets that
+  /// round-off for good, so taking an item off again can never bring a
+  /// stale rounded amount back. Changes that leave the total as it was
+  /// (payment method, customer) keep it.
+  @override
+  void notifyListeners() {
+    if (_roundedTo != null && _roundBase != rawTotal.roundToDouble()) {
+      _roundedTo = null;
+    }
+    super.notifyListeners();
+  }
 
   /// Signed adjustment between the exact and payable totals, e.g. +0.44 when
   /// 1234.56 rounds up to 1235.
@@ -250,6 +297,7 @@ class CartProvider extends ChangeNotifier {
     discountValue = 0;
     hybridCash = 0;
     hybridUpi = 0;
+    _roundedTo = null;
     notifyListeners();
   }
 }

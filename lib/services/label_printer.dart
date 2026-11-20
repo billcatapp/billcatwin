@@ -114,6 +114,12 @@ class LabelPrinter {
     double rowGapMm = 3.0,
     String currencySymbol = '',
     String storeName = '',
+    // A 2D QR code (TSPL QRCODE) holding the same value instead of the 1D
+    // bars, when the shop chose 2D under Print Barcodes' gear.
+    bool qr = false,
+    // Moves the whole print down (positive) or up (negative) on the
+    // sticker, in mm, for a printer that places it off the label.
+    double shiftMm = 0,
   }) {
     if (labels.isEmpty) return true;
     final webWmm = labelWmm * perRow + _colGapMm * (perRow - 1);
@@ -129,12 +135,7 @@ class LabelPrinter {
         (start + perRow).clamp(0, labels.length),
       );
       buf
-        ..write(
-          'SIZE ${webWmm.toStringAsFixed(1)} mm,'
-          '${labelHmm.toStringAsFixed(1)} mm\r\n',
-        )
-        ..write('GAP ${rowGapMm.toStringAsFixed(1)} mm,0\r\n')
-        ..write('DIRECTION 1\r\n')
+        ..write(_setup(webWmm, labelHmm, rowGapMm, shiftMm))
         ..write('CLS\r\n');
       for (var col = 0; col < row.length; col++) {
         final label = row[col];
@@ -143,6 +144,23 @@ class LabelPrinter {
         final barcodeVal = _tsplSafe(
           label.barcode.isNotEmpty ? label.barcode : label.sku,
         );
+
+        if (qr) {
+          _writeQrLabel(
+            buf,
+            cellX: cellX,
+            cellW: cellW,
+            cellH: (labelHmm * _dpmm).round(),
+            value: barcodeVal,
+            store: store,
+            name: _tsplSafe(label.name),
+            // No paise on a whole-rupee price, as on the shop's design.
+            price: _tsplSafe(
+              '$currency${label.price == label.price.roundToDouble() ? label.price.toStringAsFixed(0) : label.price.toStringAsFixed(2)}',
+            ),
+          );
+          continue;
+        }
 
         // 12-digit numeric → EAN-13 (95 modules incl. check digit the
         // printer appends); anything else → Code 128 set B.
@@ -218,6 +236,194 @@ class LabelPrinter {
       }
       buf.write('PRINT 1\r\n');
     }
+    return sendRaw(printerName, buf.toString());
+  }
+
+  /// One 2D sticker, in the shop's design: the business name large across
+  /// the top; below it, product name, variant and a big price on the left
+  /// and the QR code on the right. Each line takes the largest built-in
+  /// printer font (and size multiplier) that fits its space, so a short name
+  /// prints big and a long one still fits.
+  static void _writeQrLabel(
+    StringBuffer buf, {
+    required int cellX,
+    required int cellW,
+    required int cellH,
+    required String value,
+    required String store,
+    required String name,
+    required String price,
+  }) {
+    const margin = 2 * _dpmm;
+    // Built-in TSPL fonts with a size multiplier, largest first:
+    // (font, multiplier, character width, height) in dots at 203 dpi.
+    // Font 5 is left out: it has no lower-case letters.
+    const sizes = <(String, int, int, int)>[
+      ('3', 2, 32, 48),
+      ('2', 2, 24, 40),
+      ('4', 1, 24, 32),
+      ('3', 1, 16, 24),
+      ('2', 1, 12, 20),
+      ('1', 1, 8, 12),
+    ];
+    (String, int, int, int) fitting(String t, int width, {int maxH = 999}) {
+      for (final s in sizes) {
+        if (t.length * s.$3 <= width && s.$4 <= maxH) return s;
+      }
+      return sizes.last;
+    }
+
+    String clip(String t, int width, int charW) {
+      final max = (width / charW).floor().clamp(1, 1000);
+      return t.length > max ? t.substring(0, max) : t;
+    }
+
+    // Writes [t] centred in [x]..[x]+[width] at [y]; bold overprints it one
+    // dot to the right (TSPL has no bold).
+    int line(String t, int x, int width, int y, {int maxH = 999, bool bold = true}) {
+      final s = fitting(t, width, maxH: maxH);
+      final text = clip(t, width, s.$3);
+      final w = text.length * s.$3;
+      final tx = x + ((width - w) / 2).round().clamp(0, width);
+      buf.write('TEXT $tx,$y,"${s.$1}",0,${s.$2},${s.$2},"$text"\r\n');
+      if (bold) {
+        buf.write('TEXT ${tx + 1},$y,"${s.$1}",0,${s.$2},${s.$2},"$text"\r\n');
+      }
+      return s.$4;
+    }
+
+    final innerW = cellW - 2 * margin;
+    var top = margin;
+    // ── Business name, across the top ──
+    if (store.isNotEmpty) {
+      top += line(store, cellX + margin, innerW, top, maxH: 40) + 6;
+    }
+
+    // ── QR code on the right ──
+    // Modules across at error level M, byte mode (the worst case): version
+    // 1 holds 14 characters, 2 holds 26, 3 holds 42.
+    final modules = value.length <= 14
+        ? 21
+        : value.length <= 26
+        ? 25
+        : 29;
+    final room = cellH - margin - top;
+    final widthCap = (innerW * 0.42).round();
+    final maxSide = room < widthCap ? room : widthCap;
+    final cell = (maxSide ~/ modules).clamp(2, 10);
+    final side = modules * cell;
+    final qx = cellX + cellW - margin - side;
+    final qy = top + ((room - side) / 2).round();
+    buf.write('QRCODE $qx,$qy,M,$cell,A,0,"$value"\r\n');
+
+    // ── Name, variant and price on the left ──
+    var mainName = name;
+    String? variant;
+    final vm = RegExp(r'^(.*)\s*\((.+)\)\s*$').firstMatch(mainName);
+    if (vm != null) {
+      mainName = vm.group(1)!.trim();
+      variant = vm.group(2)!.trim();
+    }
+    final lx = cellX + margin;
+    final lw = qx - 3 * _dpmm - lx;
+    final nameS = fitting(mainName, lw, maxH: 24);
+    final variantS = variant == null || variant.isEmpty
+        ? null
+        : fitting(variant, lw, maxH: 24);
+    final priceS = fitting(price, lw, maxH: 48);
+    const gap = 6;
+    final blockH =
+        nameS.$4 + (variantS == null ? 0 : gap + variantS.$4) + gap * 2 +
+        priceS.$4;
+    // Centred against the QR code, never above the space under the name.
+    var y = qy + ((side - blockH) / 2).round();
+    if (y < top) y = top;
+    y += line(mainName, lx, lw, y, maxH: 24) + gap;
+    if (variant != null && variant.isNotEmpty) {
+      y += line(variant, lx, lw, y, maxH: 24) + gap;
+    }
+    line(price, lx, lw, y + gap, maxH: 48);
+  }
+
+  /// Page set-up sent before every row of labels: the sticker size and gap
+  /// exactly as the shop set them, the print origin at the label's corner,
+  /// and the vertical position. The SHIFT is always sent, so a stored offset
+  /// from an earlier roll or setting cannot push the print off the sticker.
+  ///
+  /// Sizes go in whole millimetres: printers that only emulate TSPL (SNBC,
+  /// among others) reject a decimal like "35.0 mm", silently drop the SIZE
+  /// line and print on their stored default label — commonly 4 x 1 inch —
+  /// cutting every taller sticker off at about 25 mm.
+  static String _setup(
+    double webWmm,
+    double labelHmm,
+    double gapMm,
+    double shiftMm,
+  ) =>
+      'SIZE ${webWmm.round()} mm,${labelHmm.round()} mm\r\n'
+      'GAP ${gapMm.round()} mm,0 mm\r\n'
+      'DIRECTION 1\r\n'
+      'REFERENCE 0,0\r\n'
+      'SHIFT ${(shiftMm * _dpmm).round()}\r\n';
+
+  /// Has a TSPL label printer measure the loaded roll again, told the label
+  /// height and gap to look for (GAPDETECT with lengths) rather than left to
+  /// guess: it feeds a few labels, finds the real label edges, and
+  /// remembers them. Needed when a roll of a different size is loaded: a
+  /// printer still set for the old label prints only that much of each
+  /// sticker, off its edge. Returns true when the commands went.
+  static bool calibrate(
+    String printerName, {
+    required double labelWmm,
+    required double labelHmm,
+    required int perRow,
+    double gapMm = 3.0,
+  }) {
+    final webWmm = labelWmm * perRow + _colGapMm * (perRow - 1);
+    // Whole millimetres, for the reason given on [_setup].
+    return sendRaw(
+      printerName,
+      'SIZE ${webWmm.round()} mm,${labelHmm.round()} mm\r\n'
+      'GAP ${gapMm.round()} mm,0 mm\r\n'
+      'GAPDETECT ${(labelHmm * _dpmm).round()},${(gapMm * _dpmm).round()}\r\n',
+    );
+  }
+
+  /// One row of test stickers: a box drawn 1 mm inside every edge of each
+  /// sticker, with TOP and BOTTOM written against those edges and the size
+  /// in the middle. Shows exactly where the printer puts the print, so the
+  /// position can be corrected before real labels are wasted.
+  static bool printTestLabel(
+    String printerName, {
+    required double labelWmm,
+    required double labelHmm,
+    required int perRow,
+    double gapMm = 3.0,
+    double shiftMm = 0,
+  }) {
+    final webWmm = labelWmm * perRow + _colGapMm * (perRow - 1);
+    final w = (labelWmm * _dpmm).round();
+    final h = (labelHmm * _dpmm).round();
+    const m = 1 * _dpmm;
+    final buf = StringBuffer()
+      ..write(_setup(webWmm, labelHmm, gapMm, shiftMm))
+      ..write('CLS\r\n');
+    for (var col = 0; col < perRow; col++) {
+      final x = (col * (labelWmm + _colGapMm) * _dpmm).round();
+      final size =
+          '${labelWmm.toStringAsFixed(0)} x ${labelHmm.toStringAsFixed(0)} mm';
+      buf
+        ..write('BOX ${x + m},$m,${x + w - m},${h - m},3\r\n')
+        ..write('TEXT ${x + (w - 3 * 12) ~/ 2},${m + 6},"2",0,1,1,"TOP"\r\n')
+        ..write(
+          'TEXT ${x + (w - size.length * 12) ~/ 2},${(h - 20) ~/ 2},'
+          '"2",0,1,1,"$size"\r\n',
+        )
+        ..write(
+          'TEXT ${x + (w - 6 * 12) ~/ 2},${h - m - 26},"2",0,1,1,"BOTTOM"\r\n',
+        );
+    }
+    buf.write('PRINT 1\r\n');
     return sendRaw(printerName, buf.toString());
   }
 

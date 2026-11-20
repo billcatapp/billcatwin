@@ -290,6 +290,8 @@ class ReceiptPrinter {
             if (tx.discountAmount > 0)
               _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', regular, fs,
                   valueColor: PdfColors.green800),
+            if (_handRoundOff(tx) > 0)
+              _totalRow('Round off', '-$currencySymbol${_handRoundOff(tx).toStringAsFixed(2)}', regular, fs),
             ..._taxRows(tx, taxLabel, taxRate, currencySymbol, regular, fs),
             pw.SizedBox(height: 4),
             pw.Divider(thickness: 1, color: PdfColors.black),
@@ -429,6 +431,7 @@ class ReceiptPrinter {
               pw.SizedBox(width: 200, child: pw.Column(children: [
                 _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
                 if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
+                if (_handRoundOff(tx) > 0) _totalRow('Round off', '-$currencySymbol${_handRoundOff(tx).toStringAsFixed(2)}', r, fs),
                 ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
                 pw.Divider(thickness: 1.5, color: const PdfColor.fromInt(0xFF2D2D2D)),
                 pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
@@ -505,6 +508,7 @@ class ReceiptPrinter {
             child: pw.Column(children: [
               _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
               if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
+              if (_handRoundOff(tx) > 0) _totalRow('Round off', '-$currencySymbol${_handRoundOff(tx).toStringAsFixed(2)}', r, fs),
               ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
               pw.Divider(thickness: 0.5),
               pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
@@ -567,6 +571,7 @@ class ReceiptPrinter {
         pw.Divider(color: PdfColors.grey400, thickness: 0.5),
         _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
         if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
+        if (_handRoundOff(tx) > 0) _totalRow('Round off', '-$currencySymbol${_handRoundOff(tx).toStringAsFixed(2)}', r, fs),
         ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
         pw.Divider(thickness: 1, color: PdfColors.black),
         pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
@@ -637,6 +642,7 @@ class ReceiptPrinter {
           pw.SizedBox(width: 200, child: pw.Column(children: [
             _totalRow('Subtotal', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs),
             if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs, valueColor: PdfColors.green800),
+            if (_handRoundOff(tx) > 0) _totalRow('Round off', '-$currencySymbol${_handRoundOff(tx).toStringAsFixed(2)}', r, fs),
             ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs),
             pw.Divider(thickness: 1, color: PdfColors.black),
             pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
@@ -788,6 +794,7 @@ class ReceiptPrinter {
               pw.SizedBox(width: 220, child: pw.Column(children: [
                 _totalRow('Taxable Value', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', r, fs - 0.5),
                 if (tx.discountAmount > 0) _totalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', r, fs - 0.5, valueColor: PdfColors.green800),
+                if (_handRoundOff(tx) > 0) _totalRow('Round off', '-$currencySymbol${_handRoundOff(tx).toStringAsFixed(2)}', r, fs - 0.5),
                 ..._taxRows(tx, taxLabel, taxRate, currencySymbol, r, fs - 0.5),
                 pw.Divider(thickness: 1, color: PdfColors.black),
                 pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
@@ -1205,6 +1212,8 @@ class ReceiptPrinter {
                   totRow('Sub Total', tx.subtotal.toStringAsFixed(2)),
                   if (tx.discountAmount > 0)
                     totRow('Discount', tx.discountAmount.toStringAsFixed(2), vc: PdfColors.green800),
+                  if (_handRoundOff(tx) > 0)
+                    totRow('Round off', '-${_handRoundOff(tx).toStringAsFixed(2)}'),
                   totRow('Tax ($taxRate%)', tx.taxAmount.toStringAsFixed(2)),
                   pw.Divider(thickness: 0.5, color: PdfColors.grey400),
                   totRow('Total', '$currencySymbol ${tx.total.toStringAsFixed(2)}',
@@ -1590,6 +1599,8 @@ class ReceiptPrinter {
                         _tiTotalRow('Sub Total', '$currencySymbol${tx.subtotal.toStringAsFixed(2)}', regular, fs - 0.5),
                         if (tx.discountAmount > 0)
                           _tiTotalRow('Discount', '-$currencySymbol${tx.discountAmount.toStringAsFixed(2)}', regular, fs - 0.5, valueColor: PdfColors.green800),
+                        if (_handRoundOff(tx) > 0)
+                          _tiTotalRow('Round off', '-$currencySymbol${_handRoundOff(tx).toStringAsFixed(2)}', regular, fs - 0.5),
                         _tiTotalRow('Tax ($taxRate%)', '$currencySymbol${tx.taxAmount.toStringAsFixed(2)}', regular, fs - 0.5),
                         pw.Divider(thickness: 0.5, color: PdfColors.grey400),
                         _tiTotalRow('Total', '$currencySymbol${tx.total.toStringAsFixed(2)}', bold, fs + 1),
@@ -1726,16 +1737,34 @@ class ReceiptPrinter {
   /// invoice with mixed rates prints one line per rate instead of labelling
   /// everything with the store-wide rate. Items saved before per-line rates
   /// existed report 0 and fall back to [fallbackRate].
+  /// How much a bill was rounded down by hand in the cart's ROUND OFF box
+  /// (a positive figure, e.g. 7.00 for 1047 charged as 1040), or 0. The
+  /// automatic nearest-rupee rounding is never ₹0.50 or more below
+  /// subtotal - discount, so it does not count here and existing bills
+  /// print exactly as before.
+  static double _handRoundOff(TransactionRecord tx) {
+    final gap = tx.total - (tx.subtotal - tx.discountAmount);
+    return gap <= -0.5 ? -gap : 0;
+  }
+
   static Map<double, double> _taxByRate(
       TransactionRecord tx, double fallbackRate) {
     final out = <double, double>{};
     final sub = tx.items.fold<double>(0, (s, i) => s + i.total);
     if (sub <= 0) return out;
     // Read against what was actually paid: the discount is spread across
-    // the lines and reduces the tax with them.
-    final factor = (sub - tx.discountAmount) / sub;
+    // the lines and reduces the tax with them. A bill rounded down by hand
+    // (the total is ₹0.50 or more under subtotal - discount, which the
+    // automatic rounding never is) is taxed on the rounded amount.
+    final net = sub - tx.discountAmount;
+    final factor = (tx.total - net <= -0.5 ? tx.total : net) / sub;
+    // As billing charged it: on a bill with any rated line, a line at 0 is a
+    // tax-free product. Only a bill with no rates at all uses the fallback.
+    final anyRated = tx.items.any((i) => i.taxPercent > 0);
     for (final i in tx.items) {
-      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+      final rate = i.taxPercent > 0
+          ? i.taxPercent
+          : (anyRated ? 0.0 : fallbackRate);
       if (rate <= 0) continue;
       out[rate] = (out[rate] ?? 0) + i.total * factor * rate / 100;
     }
@@ -2194,6 +2223,8 @@ class ReceiptPrinter {
                   totRow('Sub Total', '$currencySymbol ${tx.subtotal.toStringAsFixed(2)}'),
                   if (tx.discountAmount > 0)
                     totRow('Discount', '- $currencySymbol ${tx.discountAmount.toStringAsFixed(2)}', vc: PdfColors.green800),
+                  if (_handRoundOff(tx) > 0)
+                    totRow('Round off', '- $currencySymbol ${_handRoundOff(tx).toStringAsFixed(2)}'),
                   totRow('Tax ($taxRate%)', '$currencySymbol ${tx.taxAmount.toStringAsFixed(2)}'),
                   pw.Divider(thickness: 0.5, color: PdfColors.grey400),
                   totRow('Total', '$currencySymbol ${tx.total.toStringAsFixed(2)}', bold: true, sz: fs + 1),
@@ -2542,6 +2573,7 @@ class ReceiptPrinter {
           pw.Expanded(flex: 45, child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.stretch, children: [
             totRow('Sub Total', fmt(tx.subtotal)),
             if (tx.discountAmount > 0) totRow('Discount', '- ${fmt(tx.discountAmount)}'),
+            if (_handRoundOff(tx) > 0) totRow('Round off', '- ${fmt(_handRoundOff(tx))}'),
             if (tx.taxAmount > 0)      totRow(taxLabel.isNotEmpty ? taxLabel : 'Tax', fmt(tx.taxAmount)),
             totRow('Total',    fmt(tx.total),    bold: true),
             totRow('Received', fmt(tx.total)),
@@ -3148,6 +3180,8 @@ class ReceiptPrinter {
                   amtRow('Sub Total', fmtAmt(tx.subtotal)),
                   if (tx.discountAmount > 0)
                     amtRow('Discount', '-${fmtAmt(tx.discountAmount)}', vc: PdfColors.green800),
+                  if (_handRoundOff(tx) > 0)
+                    amtRow('Round off', '-${fmtAmt(_handRoundOff(tx))}'),
                   if (tx.taxAmount > 0)
                     amtRow('$taxLabel ($taxRate%)', fmtAmt(tx.taxAmount)),
                   pw.Divider(thickness: 0.5, color: PdfColors.grey400),
@@ -3438,6 +3472,8 @@ class ReceiptPrinter {
               summaryRow('SUBTOTAL:', fmtAmt(tx.subtotal)),
               if (tx.discountAmount > 0)
                 summaryRow('DISCOUNT:', '-${fmtAmt(tx.discountAmount)}'),
+              if (_handRoundOff(tx) > 0)
+                summaryRow('ROUND OFF:', '-${fmtAmt(_handRoundOff(tx))}'),
               if (tx.taxAmount > 0)
                 summaryRow('TAX ($taxRate%):', fmtAmt(tx.taxAmount)),
               pw.Divider(thickness: 0.5, color: PdfColors.grey400),

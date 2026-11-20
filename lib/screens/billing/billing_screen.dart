@@ -1,5 +1,5 @@
 ﻿import 'dart:async';
-import 'dart:convert' show jsonEncode, jsonDecode;
+import 'dart:convert' show jsonEncode, jsonDecode, utf8;
 import 'dart:io';
 import 'dart:math' show max;
 import 'dart:typed_data';
@@ -222,6 +222,23 @@ class _BillingScreenState extends State<BillingScreen> {
 
   // Reports state
   String _reportView = 'Sales';
+
+  /// Units of each product sold across every bill, net of returns (a
+  /// return is stored with negative quantities). Shown in the Inventory
+  /// report as sold out of the total ever stocked.
+  Map<String, int> _soldByProduct = {};
+
+  Future<void> _loadSoldByProduct() async {
+    final all = await LocalDbService.getTransactions();
+    final sold = <String, int>{};
+    for (final t in all) {
+      for (final i in t.items) {
+        sold[i.productId] = (sold[i.productId] ?? 0) + i.quantity;
+      }
+    }
+    if (!mounted) return;
+    setState(() => _soldByProduct = sold);
+  }
   String _utilitiesView = 'Delivery';
   // GST page state. Deliberately separate from the Sales report's
   // _reportSalesPeriod/_customTxList — those are rewritten by _reportPeriodBtn
@@ -288,10 +305,21 @@ class _BillingScreenState extends State<BillingScreen> {
   bool _hybridKeepCash = true;
   final _customerNameFocus = FocusNode();
   final _customerPhoneFocus = FocusNode();
+
+  // The cart's ROUND OFF box: the final amount typed to round a bill down.
+  final _roundCtrl = TextEditingController();
+  final _roundFocus = FocusNode();
+
+  /// Whether the cart's breakdown (subtotal, discount, tax, round off) is
+  /// open. Remembered between sessions.
+  bool _summaryOpen = true;
   final _addCustomerFocus = FocusNode();
 
   // Dynamic categories (user can add more)
   List<String> _userCategories = [];
+
+  /// Bulk Add's unsaved entry, reopened as it was left.
+  _BulkAddDraft? _bulkDraft;
 
   // Dashboard state (real data)
   double _dashSales = 0;
@@ -405,6 +433,10 @@ class _BillingScreenState extends State<BillingScreen> {
   double _barcodeLabelH = 30;
   int _barcodePerRow = 1;
   String _barcodePrinter = 'System Default';
+  /// '1d' (linear barcode) or '2d' (QR code) on printed labels.
+  String _barcodeType = '1d';
+  /// Label printer position correction, mm: + moves the print down.
+  double _barcodeShiftMm = 0;
 
   // Bulk barcode print view
   Map<String, int> _bulkPrintQtys = {};
@@ -656,6 +688,9 @@ class _BillingScreenState extends State<BillingScreen> {
       _barcodePerRow =
           int.tryParse(s['barcode_per_row'] ?? '') ?? _barcodePerRow;
       _barcodePrinter = s['barcode_printer'] ?? _barcodePrinter;
+      _barcodeType = s['barcode_type'] == '2d' ? '2d' : '1d';
+      _barcodeShiftMm =
+          double.tryParse(s['barcode_shift_mm'] ?? '') ?? _barcodeShiftMm;
       _printOrientation = s['print_orientation'] ?? _printOrientation;
       final savedLayout = s['invoice_layout'] ?? _invoiceLayout;
       const _validLayouts = [
@@ -700,6 +735,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _waPhoneNumberId = s['wa_phone_number_id'] ?? '';
       _waAccessToken = s['wa_access_token'] ?? '';
       _waGroupLink = s['wa_group_link'] ?? '';
+      _summaryOpen = (s['cart_summary_open'] ?? '1') != '0';
       _waInviteTemplate = s['wa_invite_template'] ?? '';
       final lang = (s['wa_template_lang'] ?? '').trim();
       _waTemplateLang = lang.isEmpty ? 'en' : lang;
@@ -948,6 +984,11 @@ class _BillingScreenState extends State<BillingScreen> {
       dialogEnter();
       return true;
     }
+    // A dialog that takes scans (Return / Exchange) is open: a scanner
+    // burst is caught here, out of sight, and handed to it, so only what is
+    // typed on the keyboard ever shows in that dialog's search bar.
+    final scanSink = _dialogScanSink;
+    if (scanSink != null) return _scanStep(event, scanSink);
     // Only active on the Billing tab, and not while a modal dialog is open.
     if (_selectedTab != 1 || ModalRoute.of(context)?.isCurrent != true) {
       return false;
@@ -982,7 +1023,16 @@ class _BillingScreenState extends State<BillingScreen> {
         return true;
       }
       if (key == LogicalKeyboardKey.keyD) {
-        _discountKey.currentState?.openInput();
+        // With the bill details folded away the discount box is not on
+        // screen; open them first, then the box once it is built.
+        if (!_summaryOpen) {
+          _setSummaryOpen(true);
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _discountKey.currentState?.openInput(),
+          );
+        } else {
+          _discountKey.currentState?.openInput();
+        }
         return true;
       }
       // Ctrl+= opens the inline custom-item row. Unlike bare "+", this works
@@ -1055,67 +1105,175 @@ class _BillingScreenState extends State<BillingScreen> {
       }
     }
 
+    if (_scanStep(event, _onBillingScan)) return true;
+    if (key != LogicalKeyboardKey.enter &&
+        key != LogicalKeyboardKey.numpadEnter) {
+      return false;
+    }
+    // Not a scan. Enter belongs to whatever field is being typed in —
+    // APPLY on the discount, the customer fields' own submit — so only
+    // claim it for the lit card when the cashier is not in one.
+    if (_typingInAnotherField) return false;
+    final catCursor = _categoryCursor;
+    if (catCursor != null) {
+      final categories = _displayCategories;
+      if (catCursor < categories.length) {
+        setState(() {
+          _selectedCategory = categories[catCursor];
+          // The grid renumbers under the new filter.
+          _gridCursor = null;
+        });
+      }
+      return true;
+    }
+    final cursor = _gridCursor;
+    final items = _displayGridItems;
+    if (cursor != null && cursor < items.length) {
+      _activateGridItem(items[cursor], context.read<CartProvider>());
+      return true;
+    }
+    return false;
+  }
+
+  /// Where a dialog that accepts scans wants them; null when none is open.
+  /// Returns true when it took the code, false to hand the keys back to the
+  /// field the cursor is in (an unknown code then shows there as typed).
+  bool Function(String code)? _dialogScanSink;
+
+  /// Characters of the current burst that were held back from the focused
+  /// field. Given back whenever the burst turns out not to be a scan, so a
+  /// failed or misread scan — or fast typing — never loses a character.
+  String _scanSwallowed = '';
+  Timer? _scanFlushTimer;
+
+  /// One key through the scanner detection, shared by the billing screen and
+  /// any dialog that takes scans. Keys arriving close together are a scanner
+  /// burst and are held back; Enter at the end of one hands the code to
+  /// [onScan]. Returns true when the key was taken as part of a scan.
+  ///
+  /// A burst starts with two keys under 60 ms apart, then tolerates gaps up
+  /// to 100 ms: a wireless scanner, or a PC busy redrawing after the previous
+  /// scan, can leave the odd slow key, and that used to cut the code in two
+  /// so the scan silently failed. Shift (sent for capital letters in a code)
+  /// no longer breaks a burst. The first key of a burst cannot be told from a
+  /// keystroke yet and still reaches the field; the scan handler removes it.
+  bool _scanStep(KeyEvent event, bool Function(String code) onScan) {
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.shiftLeft ||
+        key == LogicalKeyboardKey.shiftRight ||
+        key == LogicalKeyboardKey.capsLock) {
+      return false;
+    }
     final now = DateTime.now();
     final gapMs = now.difference(_lastScanKeyTime).inMilliseconds;
     _lastScanKeyTime = now;
 
     if (key == LogicalKeyboardKey.enter ||
         key == LogicalKeyboardKey.numpadEnter) {
+      _scanFlushTimer?.cancel();
       final code = _scanBuffer;
       final wasRapid = _scanBurstRapid;
       _scanBuffer = '';
       _scanBurstRapid = false;
-      // Treat as a scan only if the buffer built up rapidly and looks like a
-      // real code (long enough, alphanumeric). Otherwise let Enter behave
-      // normally (e.g. submitting a typed search / customer field).
-      if (wasRapid && code.length >= 6 && _looksLikeCode(code)) {
-        _addScannedCodeToCart(code);
-        return true; // consume the scanner's Enter so fields don't also submit
+      if (wasRapid && code.length >= 6 && _looksLikeCode(code) &&
+          onScan(code)) {
+        _scanSwallowed = '';
+        return true; // the scanner's Enter must not also submit a field
       }
-      // Not a scan. Enter belongs to whatever field is being typed in —
-      // APPLY on the discount, the customer fields' own submit — so only
-      // claim it for the lit card when the cashier is not in one.
-      if (_typingInAnotherField) return false;
-      final catCursor = _categoryCursor;
-      if (catCursor != null) {
-        final categories = _displayCategories;
-        if (catCursor < categories.length) {
-          setState(() {
-            _selectedCategory = categories[catCursor];
-            // The grid renumbers under the new filter.
-            _gridCursor = null;
-          });
-        }
-        return true;
-      }
-      final cursor = _gridCursor;
-      final items = _displayGridItems;
-      if (cursor != null && cursor < items.length) {
-        _activateGridItem(items[cursor], context.read<CartProvider>());
-        return true;
-      }
+      // Not taken as a scan (too short, unknown, or typed by hand): the held
+      // keys go back first, so the field's own Enter sees the whole text.
+      _giveBackSwallowed();
       return false;
     }
 
     final ch = event.character;
     if (ch == null || ch.length != 1 || !_isCodeChar(ch)) {
+      _giveBackSwallowed();
       _scanBuffer = '';
       _scanBurstRapid = false;
       return false;
     }
 
-    // > ~60ms since the previous key = a fresh keystroke. Could be a human, or
-    // the first char of a scan. Start a new buffer but let this one through
-    // (we still keep it buffered so the full code is intact for matching).
-    if (gapMs > 60) {
+    final limit = _scanBurstRapid ? 100 : 60;
+    if (gapMs > limit) {
+      // A fresh keystroke: a human, or the first key of a scan. Anything
+      // held from a burst that never finished goes back before it, in order.
+      _giveBackSwallowed();
       _scanBuffer = ch;
       _scanBurstRapid = false;
       return false;
     }
-    // Rapid successor = part of a scanner burst. Buffer and swallow it.
     _scanBuffer += ch;
+    _scanSwallowed += ch;
     _scanBurstRapid = true;
+    // Two fast keystrokes by hand look like the start of a burst; if no more
+    // keys follow, show what was typed rather than holding it back.
+    _scanFlushTimer?.cancel();
+    _scanFlushTimer = Timer(const Duration(milliseconds: 150), () {
+      if (_scanSwallowed.isEmpty) return;
+      _giveBackSwallowed();
+      _scanBuffer = '';
+      _scanBurstRapid = false;
+    });
     return true;
+  }
+
+  /// The text field that has the cursor, if any.
+  EditableText? _focusedEditable() {
+    final ctx = FocusManager.instance.primaryFocus?.context;
+    if (ctx == null) return null;
+    final w = ctx.widget;
+    if (w is EditableText) return w;
+    return ctx.findAncestorWidgetOfExactType<EditableText>();
+  }
+
+  /// Puts the held-back burst characters into the focused field at its
+  /// cursor, as if they had been typed there.
+  void _giveBackSwallowed() {
+    final s = _scanSwallowed;
+    _scanSwallowed = '';
+    if (s.isEmpty) return;
+    final editable = _focusedEditable();
+    if (editable == null || editable.readOnly) return;
+    final c = editable.controller;
+    final v = c.value;
+    final sel = v.selection;
+    final start = sel.isValid ? sel.start : v.text.length;
+    final end = sel.isValid ? sel.end : v.text.length;
+    final text = v.text.replaceRange(start, end, s);
+    c.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: start + s.length),
+    );
+    // The search box filters the grid from its onChanged, which a direct
+    // controller write does not call.
+    if (identical(c, _searchController) && mounted) {
+      setState(() {
+        _searchQuery = text;
+        _gridCursor = null;
+      });
+    }
+  }
+
+  /// Whether a scanned code belongs to a product or variant in this shop.
+  bool _hasScanMatch(String code) =>
+      _matchVariantByCode(code) != null ||
+      _products.any(
+        (p) =>
+            _barcodeMatches(p.barcodeNo, code) ||
+            p.sku.toLowerCase() == code.toLowerCase(),
+      );
+
+  /// A scan on the billing screen. A known code goes into the cart. An
+  /// unknown one is handed back to the field the cursor is in, so it shows
+  /// in full and that field's Enter answers it (the search box says "No
+  /// product found"); with no field to take it, the message comes from here.
+  bool _onBillingScan(String code) {
+    if (_hasScanMatch(code) || _focusedEditable() == null) {
+      _addScannedCodeToCart(code);
+      return true;
+    }
+    return false;
   }
 
   bool _isCodeChar(String ch) => RegExp(r'^[0-9A-Za-z\-]$').hasMatch(ch);
@@ -1163,14 +1321,26 @@ class _BillingScreenState extends State<BillingScreen> {
   void _afterScanAdd(String code) {
     _lastScanAddedAt = DateTime.now();
     _scanDebounce?.cancel();
-    void scrub(TextEditingController c) {
+    void scrub(TextEditingController c, FocusNode focus) {
       final t = c.text;
-      if (t == code || (t.length >= 6 && _looksLikeCode(t))) c.clear();
+      if (t == code || (t.length >= 6 && _looksLikeCode(t))) {
+        c.clear();
+        return;
+      }
+      // The burst's first key reaches the focused field before it can be
+      // recognised as a scan, so one character of every scan was left
+      // behind ("22222" after five scans of a code starting with 2). Only
+      // the field that had the cursor can have caught it.
+      if (focus.hasFocus && code.isNotEmpty && t.endsWith(code[0])) {
+        c.text = t.substring(0, t.length - 1);
+        c.selection = TextSelection.collapsed(offset: c.text.length);
+      }
     }
 
-    scrub(_searchController);
-    scrub(_customerNameCtrl);
-    scrub(_customerPhoneCtrl);
+    scrub(_searchController, _searchFocus);
+    scrub(_customerNameCtrl, _customerNameFocus);
+    scrub(_customerPhoneCtrl, _customerPhoneFocus);
+    scrub(_roundCtrl, _roundFocus);
     if (mounted) setState(() => _searchQuery = '');
     Future.microtask(() {
       if (mounted) _searchFocus.requestFocus();
@@ -1428,11 +1598,11 @@ class _BillingScreenState extends State<BillingScreen> {
         for (final i in t.items) {
           cogs += (buyingPriceMap[i.productId] ?? 0.0) * i.quantity;
         }
-        // GST is collected for the government, not earned: the bill total is
-        // subtotal - discount + tax, so tax has to come back out before the
-        // cost of goods is taken off. Round-off stays in, since the shop was
-        // actually paid the rounded amount.
-        profit += (t.total - t.taxAmount) - cogs;
+        // Profit is the bill total less the cost of goods, GST included:
+        // the owner wants the full margin on the product shown, not the
+        // margin after the GST collected is set aside (18 Nov). Round-off
+        // stays in, since the shop was actually paid the rounded amount.
+        profit += t.total - cogs;
       }
       return profit;
     }
@@ -1597,6 +1767,7 @@ class _BillingScreenState extends State<BillingScreen> {
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     _printSafetyTimer?.cancel();
     _scanDebounce?.cancel();
+    _scanFlushTimer?.cancel();
     _updateCheckTimer?.cancel();
     ConnectivityService.instance.removeListener(_onSyncComplete);
     _searchController.dispose();
@@ -1607,6 +1778,8 @@ class _BillingScreenState extends State<BillingScreen> {
     _hybridUpiCtrl.dispose();
     _customerNameFocus.dispose();
     _customerPhoneFocus.dispose();
+    _roundCtrl.dispose();
+    _roundFocus.dispose();
     _addCustomerFocus.dispose();
     _customNameCtrl.dispose();
     _customPriceCtrl.dispose();
@@ -2104,6 +2277,7 @@ class _BillingScreenState extends State<BillingScreen> {
           _reportView = value;
         });
         if (value == 'Customers') _loadReportCustomers();
+        if (value == 'Inventory') _loadSoldByProduct();
       },
       itemBuilder: (_) => ['Sales', 'Customers', 'Inventory', 'Dealers']
           .map(
@@ -3630,7 +3804,7 @@ class _BillingScreenState extends State<BillingScreen> {
 
   Widget _buildSummary(CartProvider cart) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 10),
       decoration: const BoxDecoration(
         color: Colors.white,
         border: Border(top: BorderSide(color: AppColors.border)),
@@ -3644,60 +3818,17 @@ class _BillingScreenState extends State<BillingScreen> {
       ),
       child: Column(
         children: [
-          _summaryRow('SUBTOTAL', cart.subtotal),
-          const SizedBox(height: 10),
-          // Discount row
-          Row(
-            children: [
-              Text(
-                'DISCOUNT',
-                style: GoogleFonts.inter(
-                  fontSize: 10,
-                  fontWeight: FontWeight.w500,
-                  color: AppColors.textMuted,
-                  letterSpacing: 1.5,
-                ),
-              ),
-              const SizedBox(width: 10),
-              _DiscountToggle(
-                key: _discountKey,
-                cart: cart,
-                currencySymbol: _currencySymbol,
-              ),
-              const Spacer(),
-              Text(
-                '-${_fmt(cart.discountAmount)}',
-                style: GoogleFonts.inter(
-                  fontSize: 13,
-                  color: AppColors.success,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          // One tax row with an on/off switch, shown whether or not the cart
-          // has anything taxable yet. The rate itself lives in Settings.
-          ...() {
-            // Store doesn't use tax at all — drop the row from the bill
-            // entirely instead of showing a dead line.
-            if ((double.tryParse(_taxRateDisplay) ?? 0) <= 0) {
-              return <Widget>[];
-            }
-            return [
-              _gstToggleRow(
-                cart.taxBreakdown.values.fold<double>(0, (s, v) => s + v),
-              ),
-            ];
-          }(),
-          // Nearest-rupee adjustment between the exact figure and what the
-          // customer actually pays; hidden when the total is already whole.
-          if (cart.roundOff.abs() >= 0.005) ...[
-            const SizedBox(height: 10),
+          // The handle folds the breakdown (subtotal, discount, tax, round
+          // off) away to give the cart more room; Total Payable stays.
+          _summaryToggle(),
+          if (_summaryOpen) ...[
+            _summaryRow('SUBTOTAL', cart.subtotal),
+            const SizedBox(height: 6),
+            // Discount row
             Row(
               children: [
                 Text(
-                  'ROUND OFF',
+                  'DISCOUNT',
                   style: GoogleFonts.inter(
                     fontSize: 10,
                     fontWeight: FontWeight.w500,
@@ -3705,21 +3836,76 @@ class _BillingScreenState extends State<BillingScreen> {
                     letterSpacing: 1.5,
                   ),
                 ),
+                const SizedBox(width: 10),
+                _DiscountToggle(
+                  key: _discountKey,
+                  cart: cart,
+                  currencySymbol: _currencySymbol,
+                ),
                 const Spacer(),
                 Text(
-                  '${cart.roundOff >= 0 ? '+' : '-'}${_fmt(cart.roundOff.abs())}',
+                  '-${_fmt(cart.discountAmount)}',
                   style: GoogleFonts.inter(
                     fontSize: 13,
-                    color: AppColors.textDark,
+                    color: AppColors.success,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
               ],
             ),
+            const SizedBox(height: 6),
+            // One tax row with an on/off switch, shown whether or not the cart
+            // has anything taxable yet. The rate itself lives in Settings.
+            ...() {
+              // Store doesn't use tax at all — drop the row from the bill
+              // entirely instead of showing a dead line.
+              if ((double.tryParse(_taxRateDisplay) ?? 0) <= 0) {
+                return <Widget>[];
+              }
+              return [
+                _gstToggleRow(
+                  cart.taxBreakdown.values.fold<double>(0, (s, v) => s + v),
+                ),
+              ];
+            }(),
+            // Round off: the nearest-rupee adjustment, and a box to round the
+            // bill down to a figure the cashier types (e.g. 1040 for 1047).
+            // Shown whenever there is something in the cart.
+            if (cart.items.isNotEmpty || cart.roundOff.abs() >= 0.005) ...[
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Text(
+                    'ROUND OFF',
+                    style: GoogleFonts.inter(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w500,
+                      color: AppColors.textMuted,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  _roundOffBox(cart),
+                  const Spacer(),
+                  Text(
+                    cart.roundOff.abs() < 0.005
+                        ? _fmt(0)
+                        : '${cart.roundOff >= 0 ? '+' : '-'}${_fmt(cart.roundOff.abs())}',
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      color: cart.roundOff.abs() < 0.005
+                          ? AppColors.textMuted
+                          : AppColors.textDark,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ],
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           const Divider(height: 1, color: AppColors.border),
-          const SizedBox(height: 14),
+          const SizedBox(height: 8),
           Row(
             children: [
               Column(
@@ -3981,6 +4167,84 @@ class _BillingScreenState extends State<BillingScreen> {
   // Splits a "Product Name (Variant)" label into a product-name line and, if
   // present, a separate variant line below it — so the variant never gets
   // truncated off the edge of a barcode label.
+  /// A label's price: no paise when it is a whole amount (₹1000), as on the
+  /// shop's sticker design; otherwise in full.
+  String _labelPrice(double v) => v == v.roundToDouble()
+      ? '$_currencySymbol${v.toStringAsFixed(0)}'
+      : _fmt(v);
+
+  /// A 2D sticker for the PDF route and the Print Preview, in the shop's
+  /// design (the same layout the TSPL label printer prints): the business
+  /// name large across the top; product name, variant and a big price on
+  /// the left; the QR code on the right.
+  pw.Widget _qrLabelPdf({
+    required double cellW,
+    required double cellH,
+    required String svg,
+    required String name,
+    required String price,
+    required pw.Font bold,
+  }) {
+    final m = 2 * PdfPageFormat.mm;
+    var mainName = name;
+    String? variant;
+    final vm = RegExp(r'^(.*)\s*\((.+)\)\s*$').firstMatch(mainName);
+    if (vm != null) {
+      mainName = vm.group(1)!.trim();
+      variant = vm.group(2)!.trim();
+    }
+    final store = _storeName.trim();
+    // Room under the business name, for the QR code's side.
+    final storeH = store.isEmpty ? 0.0 : 6 * PdfPageFormat.mm;
+    final room = cellH - 2 * m - storeH;
+    final side = room < (cellW - 2 * m) * 0.42 ? room : (cellW - 2 * m) * 0.42;
+    pw.Widget fitted(String t, double maxSize) => pw.FittedBox(
+      fit: pw.BoxFit.scaleDown,
+      child: pw.Text(
+        t,
+        style: pw.TextStyle(font: bold, fontSize: maxSize),
+        maxLines: 1,
+      ),
+    );
+    return pw.Container(
+      width: cellW,
+      height: cellH,
+      padding: pw.EdgeInsets.all(m),
+      child: pw.Column(
+        children: [
+          if (store.isNotEmpty)
+            pw.SizedBox(
+              height: storeH,
+              child: pw.Center(child: fitted(store, 12)),
+            ),
+          pw.Expanded(
+            child: pw.Row(
+              crossAxisAlignment: pw.CrossAxisAlignment.center,
+              children: [
+                pw.Expanded(
+                  child: pw.Column(
+                    mainAxisAlignment: pw.MainAxisAlignment.center,
+                    children: [
+                      fitted(mainName, 8),
+                      if (variant != null && variant.isNotEmpty) ...[
+                        pw.SizedBox(height: 1),
+                        fitted(variant, 8),
+                      ],
+                      pw.SizedBox(height: 2),
+                      fitted(price, 16),
+                    ],
+                  ),
+                ),
+                pw.SizedBox(width: 3 * PdfPageFormat.mm),
+                pw.SvgImage(svg: svg, width: side, height: side),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   List<pw.Widget> _labelNameWidgets(String fullName, pw.Font bold) {
     String main = fullName;
     String? variant;
@@ -4042,6 +4306,125 @@ class _BillingScreenState extends State<BillingScreen> {
   /// decides whether the running bill carries it.
   /// GST is no longer switchable per bill: the shop's configured rate always
   /// applies, so this is a plain readout of what it came to.
+  /// Opens or folds the cart's breakdown, and remembers the choice.
+  void _setSummaryOpen(bool open) {
+    setState(() => _summaryOpen = open);
+    LocalDbService.saveSettings({'cart_summary_open': open ? '1' : '0'});
+  }
+
+  /// A small handle at the top of the cart's totals: a chevron that folds
+  /// the breakdown away (pointing up while it is open) and brings it back.
+  Widget _summaryToggle() {
+    return Center(
+      child: Tooltip(
+        message: _summaryOpen ? 'Hide bill details' : 'Show bill details',
+        child: InkWell(
+          onTap: () => _setSummaryOpen(!_summaryOpen),
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(14, 0, 14, _summaryOpen ? 2 : 0),
+            child: Icon(
+              _summaryOpen
+                  ? Icons.keyboard_arrow_down_rounded
+                  : Icons.keyboard_arrow_up_rounded,
+              size: 18,
+              color: AppColors.textMuted,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// The ROUND OFF box: type the final amount to round the bill down, e.g.
+  /// 1040 for a 1047 bill. Empty means the usual nearest-rupee rounding. A
+  /// figure above the bill, or 0, is refused: red outline, bill unchanged.
+  Widget _roundOffBox(CartProvider cart) {
+    final normal = cart.rawTotal.roundToDouble();
+    // The cart forgets a typed figure once items or the discount change;
+    // clear the box to match, unless the cashier is typing in it right now.
+    if (cart.roundedTo == null &&
+        _roundCtrl.text.isNotEmpty &&
+        !_roundFocus.hasFocus) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted &&
+            context.read<CartProvider>().roundedTo == null &&
+            !_roundFocus.hasFocus) {
+          _roundCtrl.clear();
+        }
+      });
+    }
+    final text = _roundCtrl.text.trim();
+    final typed = double.tryParse(text);
+    final bad =
+        text.isNotEmpty && (typed == null || typed <= 0 || typed > normal);
+    // Styled like the discount control beside it: 28px, 6px corners, a thin
+    // border on white; blue when focused, red when the figure is refused.
+    OutlineInputBorder border(Color c, [double w = 1]) => OutlineInputBorder(
+      borderRadius: BorderRadius.circular(6),
+      borderSide: BorderSide(color: c, width: w),
+    );
+    return SizedBox(
+      width: 92,
+      height: 28,
+      child: TextField(
+        controller: _roundCtrl,
+        focusNode: _roundFocus,
+        enabled: cart.items.isNotEmpty,
+        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+        inputFormatters: [
+          FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d{0,2}')),
+        ],
+        textAlign: TextAlign.right,
+        style: GoogleFonts.inter(
+          fontSize: 12,
+          fontWeight: FontWeight.w600,
+          color: AppColors.textDark,
+        ),
+        onChanged: (v) {
+          final x = double.tryParse(v.trim());
+          cart.setRoundedTotal(x != null && x > 0 && x <= normal ? x : null);
+        },
+        // Enter puts the cursor back on the search box for the next item.
+        onSubmitted: (_) => _searchFocus.requestFocus(),
+        decoration: InputDecoration(
+          hintText: 'final',
+          hintStyle: GoogleFonts.inter(
+            fontSize: 11.5,
+            color: AppColors.textMuted.withValues(alpha: 0.6),
+          ),
+          // A prefix icon, not prefixText: prefixText only appears once the
+          // box is focused.
+          prefixIcon: Padding(
+            padding: const EdgeInsets.only(left: 8, right: 2),
+            child: Text(
+              _currencySymbol,
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                color: AppColors.textMuted,
+              ),
+            ),
+          ),
+          prefixIconConstraints: const BoxConstraints(),
+          isDense: true,
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 8,
+            vertical: 7,
+          ),
+          filled: true,
+          fillColor: Colors.white,
+          enabledBorder: bad
+              ? border(AppColors.error, 1.2)
+              : border(AppColors.border),
+          focusedBorder: bad
+              ? border(AppColors.error, 1.5)
+              : border(AppColors.accentBlue, 1.5),
+          disabledBorder: border(AppColors.border),
+        ),
+      ),
+    );
+  }
+
   Widget _gstToggleRow(double amount) {
     return Row(
       children: [
@@ -10201,8 +10584,11 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   // ── WhatsApp Settings ──
+  // One WhatsApp number is built into BillCat for every shop: e-bills go
+  // through BillCat's relay, so there is nothing for a shop to set up and no
+  // Meta credentials are asked for here. Only the group invite link is the
+  // shop's own.
   Widget _buildSettingsWhatsApp() {
-    final configured = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -10211,62 +10597,46 @@ class _BillingScreenState extends State<BillingScreen> {
         Padding(
           padding: const EdgeInsets.only(left: 2, bottom: 16),
           child: Text(
-            'Send invoices automatically via WhatsApp using Meta Cloud API. Free 1,000 conversations/month.',
+            'E-bills are sent on WhatsApp from BillCat\'s number, built into '
+            'the app. Nothing to set up.',
             style: GoogleFonts.inter(
               fontSize: 12.5,
               color: const Color(0xFF6E6E73),
             ),
           ),
         ),
-        if (configured) ...[
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF0FFF4),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(
-                color: const Color(0xFF34C759).withValues(alpha: 0.4),
-              ),
-            ),
-            child: Row(
-              children: [
-                const Icon(
-                  Icons.check_circle_rounded,
-                  size: 16,
-                  color: Color(0xFF1AAD56),
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  'WhatsApp API configured',
-                  style: GoogleFonts.inter(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF1AAD56),
-                  ),
-                ),
-              ],
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF0FFF4),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: const Color(0xFF34C759).withValues(alpha: 0.4),
             ),
           ),
-          const SizedBox(height: 16),
-        ],
-        _settingsSectionHeader('META CLOUD API'),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.check_circle_rounded,
+                size: 16,
+                color: Color(0xFF1AAD56),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'WhatsApp e-bills ready — sent from BillCat (+91 94890 47219)',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF1AAD56),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _settingsSectionHeader('GROUP INVITE'),
         const SizedBox(height: 12),
         _settingsCard([
-          _settingsTextField(
-            'Phone Number ID',
-            _editWaPhoneNumberId,
-            (v) => setState(() => _editWaPhoneNumberId = v),
-            hint: '1149269661601168',
-          ),
-          _settingsDivider(),
-          _settingsTextField(
-            'Access Token',
-            _editWaAccessToken,
-            (v) => setState(() => _editWaAccessToken = v),
-            hint: 'EAAxxxxxxxx...',
-            obscureText: true,
-          ),
-          _settingsDivider(),
           // Copied from WhatsApp: group name -> Invite via link -> Copy link.
           // WhatsApp has no way to add someone to a group from outside, so
           // the link is what gets sent; the customer taps it and joins.
@@ -10277,35 +10647,6 @@ class _BillingScreenState extends State<BillingScreen> {
             hint: 'https://chat.whatsapp.com/...',
           ),
         ]),
-        const SizedBox(height: 16),
-        Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: const Color(0xFFF0F4FF),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: AppColors.primary.withValues(alpha: 0.2)),
-          ),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Icon(
-                Icons.info_outline_rounded,
-                size: 16,
-                color: AppColors.primary,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  'Get Phone Number ID and Access Token from Meta for Developers → BillCat app → WhatsApp → API Setup.',
-                  style: GoogleFonts.inter(
-                    fontSize: 12,
-                    color: AppColors.primary,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
       ],
     );
   }
@@ -11004,6 +11345,9 @@ class _BillingScreenState extends State<BillingScreen> {
 
     bool _loadingPrinters = true;
 
+    // The printer list scrolls in its own fixed-height box.
+    final printerListCtrl = ScrollController();
+
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -11041,7 +11385,7 @@ class _BillingScreenState extends State<BillingScreen> {
             ),
             child: Container(
               width: 440,
-              padding: const EdgeInsets.all(32),
+              padding: const EdgeInsets.fromLTRB(28, 24, 28, 24),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -11111,21 +11455,41 @@ class _BillingScreenState extends State<BillingScreen> {
                       ),
                     )
                   else
-                    ...systemPrinters.map(
-                      (p) => printerRow(
-                        p.name,
-                        selected: !isPdfExport && selPrinter?.url == p.url,
-                        icon: Icons.print_rounded,
-                        onTap: () => setLocal(() {
-                          selPrinter = p;
-                          isPdfExport = false;
-                          // Auto-switch to Thermal when the printer name looks
-                          // like an 80mm thermal/receipt printer.
-                          if (_looksThermal(p.name)) {
-                            isThermal = true;
-                            paper = '3 inch';
-                          }
-                        }),
+                    // A fixed-height list that scrolls, about three printers
+                    // tall: a PC with many printers (PDF, OneNote, Fax…) used
+                    // to push the Save button off the bottom of the window.
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 200),
+                      child: Scrollbar(
+                        controller: printerListCtrl,
+                        thumbVisibility: systemPrinters.length > 3,
+                        child: ListView(
+                          controller: printerListCtrl,
+                          shrinkWrap: true,
+                          padding: EdgeInsets.only(
+                            right: systemPrinters.length > 3 ? 10 : 0,
+                          ),
+                          children: [
+                            for (final p in systemPrinters)
+                              printerRow(
+                                p.name,
+                                selected:
+                                    !isPdfExport && selPrinter?.url == p.url,
+                                icon: Icons.print_rounded,
+                                onTap: () => setLocal(() {
+                                  selPrinter = p;
+                                  isPdfExport = false;
+                                  // Auto-switch to Thermal when the printer
+                                  // name looks like an 80mm thermal/receipt
+                                  // printer.
+                                  if (_looksThermal(p.name)) {
+                                    isThermal = true;
+                                    paper = '3 inch';
+                                  }
+                                }),
+                              ),
+                          ],
+                        ),
                       ),
                     ),
 
@@ -11295,8 +11659,31 @@ class _BillingScreenState extends State<BillingScreen> {
                       Expanded(
                         child: OutlinedButton.icon(
                           onPressed: () {
+                            // Saves the choice, then prints the test the way
+                            // bills print — straight to the chosen printer.
+                            // It used to open the Windows print box and close
+                            // without saving, so a test could pass on one
+                            // printer while bills still went to another.
+                            final printerName = isPdfExport
+                                ? 'PDF Export'
+                                : (selPrinter?.name ?? 'System Default');
+                            setState(() {
+                              _activePrinter = selPrinter;
+                              _selectedPrinter = printerName;
+                              _paperSize = paper;
+                              _autoPrint = autoPrint;
+                            });
+                            LocalDbService.saveSettings({
+                              'selected_printer': printerName,
+                              'paper_size': paper,
+                              'auto_print': autoPrint ? '1' : '0',
+                            });
                             Navigator.pop(ctx);
-                            _printRecord(_testReceipt(), paperSize: paper);
+                            _printRecord(
+                              _testReceipt(),
+                              paperSize: paper,
+                              toPrinter: !isPdfExport,
+                            );
                           },
                           icon: const Icon(Icons.print_outlined, size: 16),
                           label: Text(
@@ -11706,14 +12093,20 @@ class _BillingScreenState extends State<BillingScreen> {
   _ExchangeAdd? _scanMatch(String raw) {
     final code = raw.trim();
     if (code.isEmpty) return null;
+    // Matched exactly the way the billing screen matches a scan: the
+    // scanner may add the EAN-13 check digit or drop a leading 0 (UPC-A), so
+    // an exact comparison missed every real scan; a typed SKU matches too.
+    bool hit(String barcode, String sku) =>
+        _barcodeMatches(barcode, code) ||
+        (sku.isNotEmpty && sku.toLowerCase() == code.toLowerCase());
     for (final p in _products) {
       final variants = _variantsByProduct[p.id] ?? const <ProductVariant>[];
       for (final v in variants) {
-        if (v.barcodeNo.isNotEmpty && v.barcodeNo == code) {
+        if (hit(v.barcodeNo, v.sku)) {
           return _ExchangeAdd(product: p, variant: v);
         }
       }
-      if (variants.isEmpty && p.barcodeNo.isNotEmpty && p.barcodeNo == code) {
+      if (variants.isEmpty && hit(p.barcodeNo, p.sku)) {
         return _ExchangeAdd(product: p);
       }
     }
@@ -11841,6 +12234,47 @@ class _BillingScreenState extends State<BillingScreen> {
               addQuery = '';
             });
           }
+
+          /// A scanner burst, caught in the background by [_scanStep]:
+          /// the product is added once and the search bar keeps only what was
+          /// typed by hand. Scanning an item already added does not raise its
+          /// quantity; the + beside it does that. An unknown code is handed
+          /// back (returns false), so it shows in the bar and its Enter says
+          /// "No product found".
+          bool scanAdd(String code) {
+            final hit = _scanMatch(code);
+            if (hit == null) return false;
+            // The burst's first key slipped into the bar before it could be
+            // recognised as a scan; take it back out.
+            final t = addCtrl.text;
+            if (t.isNotEmpty && t.endsWith(code[0])) {
+              addCtrl.text = t.substring(0, t.length - 1);
+              addCtrl.selection = TextSelection.collapsed(
+                offset: addCtrl.text.length,
+              );
+            }
+            if (hit.stock <= 0) {
+              setLocal(() => addQuery = addCtrl.text);
+              _showToast('${hit.name} is out of stock', isError: true);
+              return true;
+            }
+            final already = adds.any((e) => e.key == hit.key);
+            setLocal(() {
+              if (!already) adds.add(hit);
+              addQuery = addCtrl.text;
+            });
+            _showToast(
+              already
+                  ? '${hit.name} is already added — use + to change the '
+                        'quantity'
+                  : '${hit.name} added',
+            );
+            return true;
+          }
+
+          // Scans go to this dialog only once a bill is open in it; while
+          // bills are still being picked, keys behave normally.
+          _dialogScanSink = picked == null || busy ? null : scanAdd;
 
           /// Receipt for the whole operation: a pure refund shows the returned
           /// goods; an exchange shows the returned goods (negative) AND the new
@@ -12209,10 +12643,66 @@ class _BillingScreenState extends State<BillingScreen> {
                             autofocus: true,
                             enabled: !busy,
                             onChanged: (v) => setLocal(() => addQuery = v),
+                            // Keeps the cursor in the box after Enter, so the
+                            // next scan lands here too instead of nowhere.
+                            onEditingComplete: () {},
                             onSubmitted: (v) {
+                              if (v.trim().isEmpty) return;
+                              // A scanned (or typed) barcode / SKU adds the
+                              // product once and leaves the code in the bar,
+                              // selected, so it stays visible and the next
+                              // scan types straight over it. Scanning the
+                              // same item again does not raise its quantity;
+                              // the + button beside it does that.
+                              final scanned = _scanMatch(v);
+                              if (scanned != null && scanned.stock > 0) {
+                                final already = adds.any(
+                                  (e) => e.key == scanned.key,
+                                );
+                                setLocal(() {
+                                  if (!already) adds.add(scanned);
+                                  addCtrl.selection = TextSelection(
+                                    baseOffset: 0,
+                                    extentOffset: addCtrl.text.length,
+                                  );
+                                });
+                                _showToast(
+                                  already
+                                      ? '${scanned.name} is already added — '
+                                            'use + to change the quantity'
+                                      : '${scanned.name} added',
+                                );
+                                return;
+                              }
                               final hit =
-                                  _scanMatch(v) ?? _sellableMatches(v).firstOrNull;
-                              if (hit != null) addLine(hit);
+                                  scanned ?? _sellableMatches(v).firstOrNull;
+                              if (hit == null) {
+                                _showToast(
+                                  'No product found for "${v.trim()}"',
+                                  isError: true,
+                                );
+                                // A scanned code is cleared so the next scan
+                                // starts clean; a typed name stays to fix.
+                                if (_looksLikeCode(v.trim())) {
+                                  setLocal(() {
+                                    addCtrl.clear();
+                                    addQuery = '';
+                                  });
+                                }
+                                return;
+                              }
+                              if (hit.stock <= 0) {
+                                _showToast(
+                                  '${hit.product.name} is out of stock',
+                                  isError: true,
+                                );
+                                setLocal(() {
+                                  addCtrl.clear();
+                                  addQuery = '';
+                                });
+                                return;
+                              }
+                              addLine(hit);
                             },
                             style: GoogleFonts.inter(fontSize: 13),
                             decoration: _dlgInputDecor(
@@ -12571,6 +13061,8 @@ class _BillingScreenState extends State<BillingScreen> {
         },
       ),
     );
+    // Closed: scans go back to the billing screen.
+    _dialogScanSink = null;
     _disposeAfterDialog(addCtrl);
   }
 
@@ -12771,10 +13263,20 @@ class _BillingScreenState extends State<BillingScreen> {
     // Guards against a doubled Enter firing the print/send twice.
     bool submitted = false;
 
-    void confirm(BuildContext ctx) {
+    void confirm(BuildContext ctx) async {
       if (submitted) return;
       submitted = true;
-      final snapshot = _snapshotCart(cart);
+      // The same invoice number the printed copy reserves (and the bill is
+      // saved under at Confirm Payment), so the WhatsApp copy shows
+      // INV/26-27/00xx instead of the internal record id it used to fall
+      // back to.
+      if (sendWhatsApp) {
+        _pendingInvoiceNumber ??= await LocalDbService.nextInvoiceNumber();
+      }
+      final snapshot = _snapshotCart(
+        cart,
+        invoiceNumber: _pendingInvoiceNumber,
+      );
       // Remember the toggle states for next time.
       _sendToPrinterPref = sendToPrinter;
       _sendWhatsAppPref = sendWhatsApp;
@@ -12782,7 +13284,7 @@ class _BillingScreenState extends State<BillingScreen> {
         'print_send_to_printer': sendToPrinter ? '1' : '0',
         'print_send_whatsapp': sendWhatsApp ? '1' : '0',
       });
-      Navigator.pop(ctx);
+      if (ctx.mounted) Navigator.pop(ctx);
       if (sendToPrinter) {
         _printCurrentBill(cart, docType: docType, toPrinter: true);
       }
@@ -13275,7 +13777,9 @@ class _BillingScreenState extends State<BillingScreen> {
     // the GST page and its exports; nothing else about it changes.
     bool gstBilled = true;
     final hasPhone = cart.customerPhone.isNotEmpty;
-    final hasWa = _waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty;
+    // Every signed-in shop can send e-bills, from the WhatsApp number built
+    // into BillCat (through the relay).
+    const hasWa = true;
     final paidCtrl = TextEditingController(text: cart.total.toStringAsFixed(2));
     final paidFocus = FocusNode();
 
@@ -13815,135 +14319,75 @@ class _BillingScreenState extends State<BillingScreen> {
 
     // URL/message-safe: no leading '#'. The message adds its own '#'.
     final invoiceNo = tx.displayInvoice.replaceAll('#', '');
+    // The bill's public page, in the one shape billcat.in reads: account id
+    // (6) + branch (2) + bill id (6), lower case, no separators — the same
+    // code the cloud stores as the bill's site_link and the Mac app sends.
+    // The old "/UID/01/Bill-INV/26-27/0031" form never matched and 404'd.
     final rawUid = Supabase.instance.client.auth.currentUser?.id ?? 'unknown';
-    final shortUid = rawUid
-        .replaceAll('-', '')
-        .substring(0, rawUid.length >= 6 ? 6 : rawUid.length)
-        .toUpperCase();
-    final invoiceLink =
-        'https://billcat.in/invoices/$shortUid/$_branchNumber/Bill-$invoiceNo';
-
-    // If Meta API is configured, send directly
-    if (_waPhoneNumberId.isNotEmpty && _waAccessToken.isNotEmpty) {
-      _showToast('Sending via WhatsApp...');
-      try {
-        final pdfBytes = await ReceiptPrinter.buildPdf(
-          tx,
-          storeName: _storeName,
-          storeAddress: _storeAddress,
-          storePhone: _storePhone,
-          storeEmail: _storeEmail,
-          storeGstin: _storeGstin,
-          storeState: _storeState,
-          receiptFooter: _receiptFooter,
-          taxLabel: _taxLabel,
-          taxRate: _taxRateDisplay,
-          currencySymbol: _currencySymbol,
-          paperSize: _paperSize,
-          orientation: _printOrientation,
-          layout: _invoiceLayout,
-          storeTerms: _storeTerms,
-          logoPath: _logoPath,
-          storeUpiId: _storeUpiId,
-          docType: docType,
-        );
-        final svc = _wa.WhatsAppService(
-          phoneNumberId: _waPhoneNumberId,
-          accessToken: _waAccessToken,
-        );
-        final ok = await svc.sendInvoicePdf(
-          toPhone: phone,
-          pdfBytes: pdfBytes,
-          invoiceNo: invoiceNo,
-          storeName: _storeName,
-          customerName: tx.customerName ?? '',
-          amount: '${_fmt(tx.total)}',
-          date:
-              '${tx.createdAt.day}/${tx.createdAt.month}/${tx.createdAt.year}',
-          docType: docType,
-          invoiceLink: invoiceLink,
-        );
-        if (mounted)
-          _showToast(
-            ok ? 'Invoice sent via WhatsApp!' : 'WhatsApp send failed.',
-            isError: !ok,
-          );
-      } catch (e) {
-        if (mounted) _showToast('WhatsApp error: $e', isError: true);
-      }
-      return;
+    String first6(String s) {
+      final t = s.replaceAll('-', '').toLowerCase();
+      return t.length >= 6 ? t.substring(0, 6) : t;
     }
 
-    // Fallback: open WhatsApp Web with pre-filled message
+    final invoiceLink =
+        'https://billcat.in/invoices/${first6(rawUid)}'
+        '${_branchNumber.padLeft(2, '0')}${first6(tx.id)}';
+
+    // Sent through Meta's WhatsApp API with the approved invoice template, so
+    // it reaches a customer who has never messaged the shop. Every shop uses
+    // the one number built into BillCat, through BillCat's relay: the service
+    // is built with no credentials, so any Meta ID or token a shop saved in
+    // an older version is ignored. No WhatsApp Web window opens.
+    _showToast('Sending via WhatsApp...');
     try {
-      // Normalize: strip formatting, prepend dial code if no country code present
-      String normalized = phone.replaceAll(RegExp(r'[\s\-().]'), '');
-      if (!normalized.startsWith('+') && !normalized.startsWith('00')) {
-        normalized = _dialCode + normalized.replaceFirst(RegExp(r'^0'), '');
-      }
-      normalized = normalized.replaceAll('+', '');
-
-      final customerName = (tx.customerName?.isNotEmpty ?? false)
-          ? tx.customerName!
-          : 'Valued Customer';
-      final dateStr =
-          '${tx.createdAt.day}/${tx.createdAt.month}/${tx.createdAt.year}';
-      final message = Uri.encodeComponent(
-        'Hello $customerName,\n\n'
-        'Thank you for choosing $_storeName.\n'
-        'Your e-bill for $docType #$invoiceNo has been generated successfully.\n\n'
-        'Amount: ${_fmt(tx.total)}\n'
-        'Date: $dateStr\n'
-        'Payment Status: Paid\n\n'
-        'For any queries, feel free to contact us.\n'
-        'Thank you for your support!\n\n'
-        '— $_storeName\n\n'
-        '$invoiceLink',
+      final pdfBytes = await ReceiptPrinter.buildPdf(
+        tx,
+        storeName: _storeName,
+        storeAddress: _storeAddress,
+        storePhone: _storePhone,
+        storeEmail: _storeEmail,
+        storeGstin: _storeGstin,
+        storeState: _storeState,
+        receiptFooter: _receiptFooter,
+        taxLabel: _taxLabel,
+        taxRate: _taxRateDisplay,
+        currencySymbol: _currencySymbol,
+        paperSize: _paperSize,
+        orientation: _printOrientation,
+        layout: _invoiceLayout,
+        storeTerms: _storeTerms,
+        logoPath: _logoPath,
+        storeUpiId: _storeUpiId,
+        docType: docType,
       );
-      final url =
-          'https://web.whatsapp.com/send?phone=$normalized&text=$message';
-      if (Platform.isWindows) {
-        await Process.run('cmd', ['/c', 'start', '', url]);
-      } else {
-        // Reuse existing WhatsApp Web tab in Chrome if open, else open new tab
-        final appleScript =
-            '''
-tell application "Google Chrome"
-  set didReuse to false
-  repeat with w in windows
-    set tabIdx to 0
-    repeat with t in tabs of w
-      set tabIdx to tabIdx + 1
-      if (URL of t) starts with "https://web.whatsapp.com" then
-        set URL of t to "$url"
-        set index of w to 1
-        set active tab index of w to tabIdx
-        set didReuse to true
-        exit repeat
-      end if
-    end repeat
-    if didReuse then exit repeat
-  end repeat
-  if not didReuse then
-    if (count of windows) > 0 then
-      tell front window to make new tab with properties {URL:"$url"}
-    else
-      open location "$url"
-    end if
-  end if
-  activate
-end tell
-''';
-        final result = await Process.run('osascript', ['-e', appleScript]);
-        if (result.exitCode != 0) {
-          // Fallback if Chrome isn't running
-          await Process.run('open', [url]);
-        }
+      final svc = _wa.WhatsAppService(
+        phoneNumberId: '',
+        accessToken: '',
+      );
+      final dial = _dialCode.replaceAll(RegExp(r'\D'), '');
+      final ok = await svc.sendInvoicePdf(
+        toPhone: phone,
+        pdfBytes: pdfBytes,
+        invoiceNo: invoiceNo,
+        storeName: _storeName,
+        customerName: tx.customerName ?? '',
+        amount: _fmt(tx.total),
+        date: '${tx.createdAt.day}/${tx.createdAt.month}/${tx.createdAt.year}',
+        docType: docType,
+        invoiceLink: invoiceLink,
+        dialCode: dial.isEmpty ? '91' : dial,
+        groupLink: _waGroupLink,
+      );
+      if (mounted) {
+        _showToast(
+          ok
+              ? 'Invoice sent via WhatsApp!'
+              : 'WhatsApp send failed: ${svc.lastError ?? 'unknown error'}',
+          isError: !ok,
+        );
       }
-
-      if (mounted) _showToast('Opening WhatsApp Web...');
     } catch (e) {
-      if (mounted) _showToast('Error: $e', isError: true);
+      if (mounted) _showToast('WhatsApp error: $e', isError: true);
     }
   }
 
@@ -14243,6 +14687,16 @@ end tell
       ),
     );
     final perRowCtrl = TextEditingController(text: '$_barcodePerRow');
+    // Position correction; saved as it is typed, so the next print uses it.
+    final shiftCtrl = TextEditingController(
+      text: _barcodeShiftMm == 0 ? '0' : _barcodeShiftMm.toString(),
+    );
+    shiftCtrl.addListener(() {
+      final v = double.tryParse(shiftCtrl.text.trim());
+      if (v == null || v < -10 || v > 10 || v == _barcodeShiftMm) return;
+      _barcodeShiftMm = v;
+      LocalDbService.saveSettings({'barcode_shift_mm': v.toString()});
+    });
     final searchCtrl = TextEditingController();
     final qtys = Map<String, int>.from(_bulkPrintQtys);
     final selected = Map<String, bool>.from(_bulkPrintSelected);
@@ -14290,6 +14744,10 @@ end tell
         p.id: TextEditingController(text: '${qtys[p.id] ?? 1}'),
     };
 
+    // The label size / per-row / printer bar starts folded behind the gear.
+    var showBarSettings = false;
+    // 1D lines or 2D QR, as last printed.
+    var codeType = _barcodeType;
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -14330,7 +14788,9 @@ end tell
             ),
             child: SizedBox(
               width: 620,
-              child: Column(
+              child: Stack(
+                children: [
+              Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   // ── Header ──
@@ -14347,6 +14807,40 @@ end tell
                           ),
                         ),
                         const Spacer(),
+                        // Label size, labels per row and the printer live
+                        // in a menu that drops from this gear; hovering
+                        // shows what is set.
+                        Tooltip(
+                          message:
+                              'Label ${labelWCtrl.text} × ${labelHCtrl.text} mm'
+                              ' · ${perRowCtrl.text} per row · $printer',
+                          child: Builder(
+                            builder: (_) => InkWell(
+                            onTap: () => setLocal(
+                              () => showBarSettings = !showBarSettings,
+                            ),
+                            borderRadius: BorderRadius.circular(7),
+                            child: Container(
+                              width: 28,
+                              height: 28,
+                              decoration: BoxDecoration(
+                                color: showBarSettings
+                                    ? AppColors.primary.withValues(alpha: 0.1)
+                                    : AppColors.surfaceVariant,
+                                borderRadius: BorderRadius.circular(7),
+                              ),
+                              child: Icon(
+                                Icons.settings_outlined,
+                                size: 15,
+                                color: showBarSettings
+                                    ? AppColors.primary
+                                    : AppColors.textMuted,
+                              ),
+                            ),
+                          ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
                         InkWell(
                           onTap: () => Navigator.pop(ctx),
                           borderRadius: BorderRadius.circular(7),
@@ -14361,90 +14855,6 @@ end tell
                               Icons.close_rounded,
                               size: 15,
                               color: AppColors.textMuted,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  // ── Settings bar ──
-                  Container(
-                    margin: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 10,
-                    ),
-                    decoration: BoxDecoration(
-                      color: AppColors.surfaceVariant,
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Row(
-                      children: [
-                        Text(
-                          'Size',
-                          style: GoogleFonts.inter(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                            color: AppColors.textMuted,
-                          ),
-                        ),
-                        const SizedBox(width: 7),
-                        _miniNumField(labelWCtrl, 'W', 60),
-                        const SizedBox(width: 5),
-                        _miniNumField(labelHCtrl, 'H', 60),
-                        const SizedBox(width: 16),
-                        Text(
-                          'Per Row',
-                          style: GoogleFonts.inter(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                            color: AppColors.textMuted,
-                          ),
-                        ),
-                        const SizedBox(width: 7),
-                        _miniNumField(perRowCtrl, '', 44),
-                        const SizedBox(width: 16),
-                        const Icon(
-                          Icons.print_outlined,
-                          size: 14,
-                          color: AppColors.textMuted,
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<String>(
-                              value: printers.contains(printer)
-                                  ? printer
-                                  : 'System Default',
-                              isDense: true,
-                              isExpanded: true,
-                              icon: const Icon(
-                                Icons.keyboard_arrow_down_rounded,
-                                size: 14,
-                                color: AppColors.textMuted,
-                              ),
-                              items: printers
-                                  .map(
-                                    (n) => DropdownMenuItem(
-                                      value: n,
-                                      child: Text(
-                                        n,
-                                        style: GoogleFonts.inter(
-                                          fontSize: 12,
-                                          color: AppColors.textDark,
-                                        ),
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  )
-                                  .toList(),
-                              onChanged: (v) => setLocal(
-                                () => printer = v ?? 'System Default',
-                              ),
-                              style: GoogleFonts.inter(
-                                fontSize: 12,
-                                color: AppColors.textDark,
-                              ),
                             ),
                           ),
                         ),
@@ -14637,6 +15047,7 @@ end tell
                                                 child: CustomPaint(
                                                   painter: _BarcodePainter(
                                                     p.sku,
+                                                    qr: codeType == '2d',
                                                   ),
                                                 ),
                                               ),
@@ -14884,12 +15295,14 @@ end tell
                                     _barcodeLabelH = h;
                                     _barcodePerRow = perRow;
                                     _barcodePrinter = printer;
+                                    _barcodeType = codeType;
                                   });
                                   LocalDbService.saveSettings({
                                     'barcode_label_w': w.toString(),
                                     'barcode_label_h': h.toString(),
                                     'barcode_per_row': perRow.toString(),
                                     'barcode_printer': printer,
+                                    'barcode_type': codeType,
                                   });
                                   final selProducts = printItems
                                       .where((p) => selected[p.id] == true)
@@ -14901,6 +15314,7 @@ end tell
                                     labelH: h,
                                     labelsPerRow: perRow,
                                     printerName: printer,
+                                    barcodeType: codeType,
                                   );
                                 },
                           icon: const Icon(Icons.print_rounded, size: 15),
@@ -14929,9 +15343,315 @@ end tell
                   ),
                 ],
               ),
+              // The gear's settings, as a full-width card dropped over the
+              // product list just under the header. Clicking anywhere
+              // outside it closes it.
+              if (showBarSettings) ...[
+                Positioned.fill(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setLocal(() => showBarSettings = false),
+                  ),
+                ),
+                Positioned(
+                  left: 16,
+                  right: 16,
+                  top: 62,
+                  child: _barcodeSettingsPanel(
+                    labelWCtrl: labelWCtrl,
+                    labelHCtrl: labelHCtrl,
+                    perRowCtrl: perRowCtrl,
+                    shiftCtrl: shiftCtrl,
+                    printers: printers,
+                    printer: printer,
+                    onPrinter: (v) => setLocal(() => printer = v),
+                    codeType: codeType,
+                    // Saved at once, so a product's own label print (which
+                    // follows this choice) is right even if nothing is
+                    // printed from here.
+                    onCodeType: (v) {
+                      setLocal(() => codeType = v);
+                      _barcodeType = v;
+                      LocalDbService.saveSettings({'barcode_type': v});
+                    },
+                  ),
+                ),
+              ],
+                ],
+              ),
             ),
           );
         },
+      ),
+    );
+  }
+
+  /// The Print Barcodes gear's settings: a full-width card under the header
+  /// with the barcode type (1D lines or 2D QR), the label size, labels per
+  /// row and the printer. The fields edit the dialog's own values, so
+  /// whatever is set here is what the labels print with.
+  Widget _barcodeSettingsPanel({
+    required TextEditingController labelWCtrl,
+    required TextEditingController labelHCtrl,
+    required TextEditingController perRowCtrl,
+    required TextEditingController shiftCtrl,
+    required List<String> printers,
+    required String printer,
+    required ValueChanged<String> onPrinter,
+    required String codeType,
+    required ValueChanged<String> onCodeType,
+  }) {
+    // Recalibration only exists on TSPL label printers.
+    final canCalibrate =
+        Platform.isWindows && LabelPrinter.isTsplCompatible(printer);
+    Widget label(String t) => Text(
+      t,
+      style: GoogleFonts.inter(
+        fontSize: 11.5,
+        fontWeight: FontWeight.w500,
+        color: AppColors.textMuted,
+      ),
+    );
+    // One choice of the barcode type: title, a line on what it is, and a
+    // small picture of it, picked as a whole.
+    Widget typeOption(String value, String title, String note, IconData icon) {
+      final on = codeType == value;
+      return Expanded(
+        child: GestureDetector(
+          onTap: () => onCodeType(value),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: on
+                  ? AppColors.primary.withValues(alpha: 0.06)
+                  : Colors.white,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: on ? AppColors.primary : AppColors.border,
+                width: on ? 1.5 : 1,
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  icon,
+                  size: 22,
+                  color: on ? AppColors.primary : AppColors.textMuted,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: GoogleFonts.inter(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.textDark,
+                        ),
+                      ),
+                      Text(
+                        note,
+                        style: GoogleFonts.inter(
+                          fontSize: 10.5,
+                          color: AppColors.textMuted,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Material(
+      color: Colors.white,
+      elevation: 8,
+      shadowColor: const Color(0x33000000),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'LABEL SETTINGS',
+              style: GoogleFonts.inter(
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                color: AppColors.textMuted,
+                letterSpacing: 1.2,
+              ),
+            ),
+            const SizedBox(height: 12),
+            label('Barcode type'),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                typeOption(
+                  '1d',
+                  '1D barcode',
+                  'Lines — any scanner reads it',
+                  Icons.view_week_outlined,
+                ),
+                const SizedBox(width: 10),
+                typeOption(
+                  '2d',
+                  '2D QR code',
+                  'Square — needs a 2D scanner',
+                  Icons.qr_code_2_rounded,
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                label('Size (mm)'),
+                const SizedBox(width: 10),
+                _miniNumField(labelWCtrl, 'W', 60),
+                const SizedBox(width: 6),
+                _miniNumField(labelHCtrl, 'H', 60),
+                const SizedBox(width: 20),
+                label('Per row'),
+                const SizedBox(width: 10),
+                _miniNumField(perRowCtrl, '', 50),
+                const SizedBox(width: 20),
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppColors.surfaceVariant,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.print_outlined,
+                          size: 14,
+                          color: AppColors.textMuted,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: DropdownButtonHideUnderline(
+                            child: DropdownButton<String>(
+                              value: printers.contains(printer)
+                                  ? printer
+                                  : 'System Default',
+                              isDense: true,
+                              isExpanded: true,
+                              icon: const Icon(
+                                Icons.keyboard_arrow_down_rounded,
+                                size: 16,
+                                color: AppColors.textMuted,
+                              ),
+                              items: printers
+                                  .map(
+                                    (n) => DropdownMenuItem(
+                                      value: n,
+                                      child: Text(
+                                        n,
+                                        style: GoogleFonts.inter(
+                                          fontSize: 12,
+                                          color: AppColors.textDark,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  )
+                                  .toList(),
+                              onChanged: (v) => onPrinter(v ?? 'System Default'),
+                              style: GoogleFonts.inter(
+                                fontSize: 12,
+                                color: AppColors.textDark,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            if (canCalibrate) ...[
+              const SizedBox(height: 12),
+              const Divider(height: 1, color: AppColors.border),
+              const SizedBox(height: 12),
+              // Label position on the sticker: the test label shows where the
+              // print lands; Position nudges it down (+) or up (−) in mm.
+              // (No calibrate here: its GAPDETECT command froze this
+              // printer — calibration is done from the printer itself.)
+              Row(
+                children: [
+                  label('Position (mm)'),
+                  const SizedBox(width: 10),
+                  _miniNumField(shiftCtrl, '', 50),
+                  const SizedBox(width: 6),
+                  Text(
+                    '+ down  − up',
+                    style: GoogleFonts.inter(
+                      fontSize: 10.5,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                  const Spacer(),
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      final ok = LabelPrinter.printTestLabel(
+                        printer,
+                        labelWmm:
+                            double.tryParse(labelWCtrl.text) ?? _barcodeLabelW,
+                        labelHmm:
+                            double.tryParse(labelHCtrl.text) ?? _barcodeLabelH,
+                        perRow: int.tryParse(perRowCtrl.text) ?? _barcodePerRow,
+                        shiftMm: _barcodeShiftMm,
+                      );
+                      _showToast(
+                        ok
+                            ? 'Test label sent — the box should sit just '
+                                  'inside the sticker edges'
+                            : 'Could not reach $printer',
+                        isError: !ok,
+                      );
+                    },
+                    icon: const Icon(Icons.crop_free_rounded, size: 15),
+                    label: Text(
+                      'Test label',
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.textDark,
+                      side: const BorderSide(color: AppColors.border),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -14989,8 +15709,11 @@ end tell
     double labelH = 30,
     int labelsPerRow = 1,
     String? printerName,
+    // '2d' prints a QR code holding the same value instead of the 1D lines.
+    String barcodeType = '1d',
   }) async {
     if (products.isEmpty) return;
+    final qr = barcodeType == '2d';
 
     final regularData = await rootBundle.load(
       'assets/fonts/NotoSans-Regular.ttf',
@@ -15018,23 +15741,38 @@ end tell
       final count = qtys[p.id] ?? 1;
       final barcodeVal = p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku;
       String svgStr;
-      try {
-        svgStr = bc.Barcode.ean13().toSvg(
-          barcodeVal,
-          width: 200,
-          height: 80,
-          drawText: false,
-        );
-      } catch (_) {
-        svgStr = bc.Barcode.code128().toSvg(
-          barcodeVal,
-          width: 200,
-          height: 80,
-          drawText: false,
-        );
+      if (qr) {
+        // Same value as the 1D code, so the till's scan lookup is unchanged.
+        svgStr = bc.Barcode.qrCode().toSvg(barcodeVal, width: 80, height: 80);
+      } else {
+        try {
+          svgStr = bc.Barcode.ean13().toSvg(
+            barcodeVal,
+            width: 200,
+            height: 80,
+            drawText: false,
+          );
+        } catch (_) {
+          svgStr = bc.Barcode.code128().toSvg(
+            barcodeVal,
+            width: 200,
+            height: 80,
+            drawText: false,
+          );
+        }
       }
       final innerPad = 5.0 * PdfPageFormat.mm;
-      pw.Widget labelCell() => pw.Container(
+      final codeH = (cellH - 2 * PdfPageFormat.mm) * 0.58;
+      pw.Widget labelCell() => qr
+          ? _qrLabelPdf(
+              cellW: cellW,
+              cellH: cellH,
+              svg: svgStr,
+              name: p.name,
+              price: _labelPrice(_finalPriceOf(p)),
+              bold: bold,
+            )
+          : pw.Container(
         width: cellW,
         height: cellH,
         padding: pw.EdgeInsets.symmetric(
@@ -15057,8 +15795,9 @@ end tell
               ),
             pw.SvgImage(
               svg: svgStr,
-              width: (cellW - innerPad * 2),
-              height: (cellH - 2 * PdfPageFormat.mm) * 0.58,
+              // A QR code is square: as tall as the 1D bars, no wider.
+              width: qr ? codeH : (cellW - innerPad * 2),
+              height: codeH,
             ),
             ..._labelNameWidgets(p.name, bold),
             pw.Text(
@@ -15235,6 +15974,8 @@ end tell
                                 perRow: labelsPerRow,
                                 currencySymbol: _currencySymbol,
                                 storeName: _storeName,
+                                qr: qr,
+                                shiftMm: _barcodeShiftMm,
                               );
                             } else {
                               ok = await Printing.directPrintPdf(
@@ -16313,6 +17054,7 @@ end tell
                               child: CustomPaint(
                                 painter: _BarcodePainter(
                                   p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku,
+                                  qr: _barcodeType == '2d',
                                 ),
                               ),
                             ),
@@ -16630,21 +17372,28 @@ end tell
     String? printerName,
   }) async {
     final barcodeVal = p.barcodeNo.isNotEmpty ? p.barcodeNo : p.sku;
+    // Follows the 1D / 2D choice made under Print Barcodes' gear, so a
+    // product's own label prints the same kind of code as the bulk print.
+    final qr = _barcodeType == '2d';
     String svgStr;
-    try {
-      svgStr = bc.Barcode.ean13().toSvg(
-        barcodeVal,
-        width: 200,
-        height: 60,
-        drawText: false,
-      );
-    } catch (_) {
-      svgStr = bc.Barcode.code128().toSvg(
-        barcodeVal,
-        width: 200,
-        height: 60,
-        drawText: false,
-      );
+    if (qr) {
+      svgStr = bc.Barcode.qrCode().toSvg(barcodeVal, width: 80, height: 80);
+    } else {
+      try {
+        svgStr = bc.Barcode.ean13().toSvg(
+          barcodeVal,
+          width: 200,
+          height: 60,
+          drawText: false,
+        );
+      } catch (_) {
+        svgStr = bc.Barcode.code128().toSvg(
+          barcodeVal,
+          width: 200,
+          height: 60,
+          drawText: false,
+        );
+      }
     }
 
     final regularData = await rootBundle.load(
@@ -16667,7 +17416,16 @@ end tell
     final pageFormat = PdfPageFormat(pageW, pageH);
 
     final pad = 5.0 * PdfPageFormat.mm;
-    pw.Widget labelCell() => pw.Container(
+    pw.Widget labelCell() => qr
+        ? _qrLabelPdf(
+            cellW: cellW,
+            cellH: cellH,
+            svg: svgStr,
+            name: p.name,
+            price: _labelPrice(_finalPriceOf(p)),
+            bold: bold,
+          )
+        : pw.Container(
       width: cellW,
       height: cellH,
       padding: pw.EdgeInsets.symmetric(
@@ -16688,7 +17446,10 @@ end tell
             ),
           pw.SvgImage(
             svg: svgStr,
-            width: cellW - pad * 2,
+            // A QR code is square: as tall as the 1D bars, no wider.
+            width: qr
+                ? (cellH - 2 * PdfPageFormat.mm) * 0.58
+                : cellW - pad * 2,
             height: (cellH - 2 * PdfPageFormat.mm) * 0.58,
           ),
           // Same design as the bulk Print Barcodes label: variant on its own
@@ -16872,6 +17633,8 @@ end tell
                                 perRow: labelsPerRow,
                                 currencySymbol: _currencySymbol,
                                 storeName: _storeName,
+                                qr: qr,
+                                shiftMm: _barcodeShiftMm,
                               );
                             } else {
                               ok = await Printing.directPrintPdf(
@@ -20486,21 +21249,44 @@ end tell
     final defaultCategory = _userCategories.isNotEmpty
         ? _userCategories.first
         : '';
-    final rows = <_BulkProductRow>[
-      for (var i = 0; i < 3; i++) _BulkProductRow(category: defaultCategory),
-    ];
-    final dealerCtrl = TextEditingController();
+    // Whatever was left in the dialog last time comes back as it was; a
+    // fresh draft starts only after a save (or the first time).
+    final draft = _bulkDraft ??= _BulkAddDraft(defaultCategory);
+    final rows = draft.rows;
+    // How many blank rows one press of Add Row adds.
+    final addRowsCtrl = TextEditingController(text: '1');
+    final dealerCtrl = draft.dealerCtrl;
     // The supplier's invoice number, as printed on their bill. With it the
     // entry is saved as a purchase as well as stock.
-    final invoiceCtrl = TextEditingController();
+    final invoiceCtrl = draft.invoiceCtrl;
     // Taxable value to report for this supplier bill, typed off the bill.
     // Empty means report buying x stock, as before.
-    final reportAmtCtrl = TextEditingController();
+    final reportAmtCtrl = draft.reportAmtCtrl;
+    // Whether this supplier bill is a GST bill. Off, the whole entry is kept
+    // out of the GST purchase report (stock and the purchase are still
+    // saved), the same as "GST billed" off at Confirm Payment for a sale.
+    var gstBill = draft.gstBill;
+    // Set when Save finds a field a GST bill needs left empty: that field
+    // then asks for itself — red outline and a red prompt inside it — rather
+    // than a pop-up message. Each clears as soon as something is typed.
+    var askDealer = false;
+    var askInvoice = false;
+    var askAmt = false;
+    final invoiceFocus = FocusNode();
+    final amtFocus = FocusNode();
+    InputDecoration asking(InputDecoration d, String prompt) => d.copyWith(
+      hintText: prompt,
+      hintStyle: GoogleFonts.inter(fontSize: 13, color: AppColors.error),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(10),
+        borderSide: const BorderSide(color: AppColors.error, width: 1.5),
+      ),
+    );
     // Loaded async; the dropdown reads this lazily at tap time, so no rebuild
     // is needed when it resolves.
     final List<Dealer> dealerOptions = [];
     LocalDbService.getDealers().then(dealerOptions.addAll);
-    DateTime? purchaseDate = DateTime.now();
+    DateTime? purchaseDate = draft.purchaseDate;
     int filledCount = 0;
     int productCount = 0;
     bool saving = false;
@@ -20545,6 +21331,16 @@ end tell
       if (r.nameCtrl.text.trim().isEmpty) return '';
       return 'row${r.variantOf ?? r.id}';
     }
+
+    // A reopened draft already has rows filled in: count them now, so the
+    // footer and the Add Product button are right before anything is typed.
+    final enteredAtOpen = rows.where((r) => !r.isBlank).toList();
+    filledCount = enteredAtOpen.length;
+    productCount = enteredAtOpen
+        .map(groupKey)
+        .where((n) => n.isNotEmpty)
+        .toSet()
+        .length;
 
     showDialog(
       context: context,
@@ -21011,7 +21807,8 @@ end tell
                       ? _isoDate(purchaseDate!)
                       : '',
                   // The product row decides; its variants share one product.
-                  gstPurchase: head.inGstReport,
+                  // A bill switched off as not a GST bill keeps every row out.
+                  gstPurchase: gstBill && head.inGstReport,
                 ),
               );
               if (hasVariants) {
@@ -21041,7 +21838,7 @@ end tell
             // save runs, and the bill must record what was on screen when
             // Save was pressed — not whatever is there after the inserts.
             final invoiceNo = invoiceCtrl.text.trim();
-            final dealerName = dealerCtrl.text.trim();
+            var dealerName = dealerCtrl.text.trim();
             final billDate = purchaseDate;
             // A supplier bill is dated by the supplier. With an invoice number
             // but the date cleared there is no honest date to record, and
@@ -21050,10 +21847,58 @@ end tell
               _showToast('Pick the supplier invoice date', isError: true);
               return;
             }
+            // A GST bill has to carry everything the purchase report files:
+            // who sold it (dealer with a GSTIN), the supplier's invoice
+            // number and the taxable value printed on that bill. Checked in
+            // the order the fields sit on screen, one message at a time.
+            if (gstBill) {
+              final amt = double.tryParse(reportAmtCtrl.text.trim());
+              askDealer = dealerName.isEmpty;
+              askInvoice = invoiceNo.isEmpty;
+              askAmt = amt == null || amt <= 0;
+              if (askDealer || askInvoice || askAmt) {
+                // Every empty field asks at once; the cursor goes to the
+                // first of them.
+                setLocal(() {});
+                (askDealer
+                        ? _dealerFocusNodes[dealerCtrl]
+                        : askInvoice
+                        ? invoiceFocus
+                        : amtFocus)
+                    ?.requestFocus();
+                return;
+              }
+              // The dealer's GSTIN is asked for right here when it is
+              // missing — there is nowhere else to add it — and kept on the
+              // dealer, so the next bill from them needs nothing.
+              var known = dealerOptions.cast<Dealer?>().firstWhere(
+                (d) =>
+                    d!.name.trim().toLowerCase() == dealerName.toLowerCase(),
+                orElse: () => null,
+              );
+              if (known == null) {
+                known = await _showAddDealerDialog(initialName: dealerName);
+                if (known == null) return; // cancelled: nothing saved
+                dealerOptions.add(known);
+                // The bill is recorded under the name as saved.
+                dealerName = known.name;
+                setLocal(() => dealerCtrl.text = known!.name);
+              }
+              if (known.gstin.trim().isEmpty) {
+                final updated = await _askDealerGstin(known);
+                if (updated == null) return; // cancelled: nothing saved
+                final at = dealerOptions.indexOf(known);
+                if (at >= 0) dealerOptions[at] = updated;
+              }
+            }
             // A reported amount belongs to a supplier's bill; without an
             // invoice number the entry is no bill, and the figure would
             // have nowhere to go.
-            final reportAmt = double.tryParse(reportAmtCtrl.text.trim());
+            // Not a GST bill: nothing is reported, so a typed amount is
+            // ignored rather than put on an "as per supplier bill" line.
+            final reportAmt = gstBill
+                ? double.tryParse(reportAmtCtrl.text.trim())
+                : null;
             if (reportAmt != null && reportAmt > 0 && invoiceNo.isEmpty) {
               _showToast(
                 'Enter the supplier invoice number for the GST report amount',
@@ -21237,6 +22082,9 @@ end tell
               }
             }
             ConnectivityService.instance.syncNow();
+            // Saved: the next Bulk Add starts empty rather than reopening
+            // what has just gone into inventory.
+            if (identical(_bulkDraft, draft)) _bulkDraft = null;
             if (!ctx.mounted) return;
             setState(() {
               _products.addAll(prepared);
@@ -21478,6 +22326,13 @@ end tell
                             align: TextAlign.end,
                             focusNode: r.priceFocus,
                             onEnter: () => r.gstFocus.requestFocus(),
+                            // Digits and one decimal point, 2 places: a
+                            // letter typed here is simply not taken.
+                            formatters: [
+                              FilteringTextInputFormatter.allow(
+                                RegExp(r'^\d*\.?\d{0,2}'),
+                              ),
+                            ],
                             onChanged: (_) {
                               // Typing here sets a variant apart from its
                               // product; on a product row it carries the new
@@ -21501,6 +22356,10 @@ end tell
                             align: TextAlign.end,
                             focusNode: r.stockFocus,
                             onEnter: () => r.buyingFocus.requestFocus(),
+                            // Whole units only.
+                            formatters: [
+                              FilteringTextInputFormatter.digitsOnly,
+                            ],
                             onChanged: (_) => recount(),
                           ),
                         ),
@@ -21512,6 +22371,11 @@ end tell
                             numeric: true,
                             align: TextAlign.end,
                             focusNode: r.buyingFocus,
+                            formatters: [
+                              FilteringTextInputFormatter.allow(
+                                RegExp(r'^\d*\.?\d{0,2}'),
+                              ),
+                            ],
                             // End of the row: carry on to the next row's name,
                             // adding a row first when this is the last one, so
                             // Enter keeps the typing going down the grid.
@@ -21895,6 +22759,61 @@ end tell
                             ],
                           ),
                           const Spacer(),
+                          // Empties every product row back to three blank
+                          // ones; the dealer, invoice, date and GST fields
+                          // are left as they are. Greyed out with nothing to
+                          // clear.
+                          TextButton.icon(
+                            onPressed: saving || filledCount == 0
+                                ? null
+                                : () {
+                                    setLocal(() {
+                                      rows
+                                        ..clear()
+                                        ..addAll([
+                                          for (var i = 0; i < 3; i++)
+                                            _BulkProductRow(
+                                              category: defaultCategory,
+                                            ),
+                                        ]);
+                                    });
+                                    recount();
+                                  },
+                            // Quiet like the close button beside it: grey
+                            // text, no fill; it only turns red under the
+                            // mouse, as a hint of what it does.
+                            icon: const Icon(Icons.refresh_rounded, size: 16),
+                            label: Text(
+                              'Clear products',
+                              style: GoogleFonts.inter(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                            style: ButtonStyle(
+                              foregroundColor: WidgetStateProperty.resolveWith(
+                                (s) => s.contains(WidgetState.disabled)
+                                    ? AppColors.textMuted.withValues(alpha: 0.5)
+                                    : s.contains(WidgetState.hovered)
+                                    ? AppColors.error
+                                    : AppColors.textMuted,
+                              ),
+                              overlayColor: const WidgetStatePropertyAll(
+                                Colors.transparent,
+                              ),
+                              padding: const WidgetStatePropertyAll(
+                                EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 6,
+                                ),
+                              ),
+                              minimumSize: const WidgetStatePropertyAll(
+                                Size.zero,
+                              ),
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
                           IconButton(
                             onPressed: saving ? null : () => Navigator.pop(ctx),
                             icon: const Icon(
@@ -21936,6 +22855,12 @@ end tell
                               ctrl: dealerCtrl,
                               dealers: dealerOptions,
                               setLocal: setLocal,
+                              missingHint:
+                                  gstBill &&
+                                      askDealer &&
+                                      dealerCtrl.text.trim().isEmpty
+                                  ? 'Enter dealer name'
+                                  : null,
                             ),
                           ),
                           const SizedBox(width: 12),
@@ -21943,13 +22868,23 @@ end tell
                             flex: 2,
                             child: TextField(
                               controller: invoiceCtrl,
+                              focusNode: invoiceFocus,
                               style: GoogleFonts.inter(
                                 fontSize: 13,
                                 color: AppColors.textDark,
                               ),
-                              decoration: _dlgInputDecor(
-                                'Supplier invoice no.',
-                              ),
+                              onChanged: (_) {
+                                if (askInvoice) setLocal(() {});
+                              },
+                              decoration:
+                                  gstBill &&
+                                      askInvoice &&
+                                      invoiceCtrl.text.trim().isEmpty
+                                  ? asking(
+                                      _dlgInputDecor('Supplier invoice no.'),
+                                      'Enter supplier invoice no.',
+                                    )
+                                  : _dlgInputDecor('Supplier invoice no.'),
                             ),
                           ),
                           const SizedBox(width: 12),
@@ -21959,7 +22894,45 @@ end tell
                               ctx: ctx,
                               value: purchaseDate,
                               onChanged: (d) =>
-                                  setLocal(() => purchaseDate = d),
+                                  setLocal(() => draft.purchaseDate = purchaseDate = d),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          // Kept out of the focus walk like Confirm
+                          // Payment's switch, so Tab and Enter move through
+                          // the fields without landing on it.
+                          ExcludeFocus(
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(8),
+                              onTap: () => setLocal(() => draft.gstBill = gstBill = !gstBill),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 4,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      'GST Bill',
+                                      style: GoogleFonts.inter(
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: gstBill
+                                            ? AppColors.textDark
+                                            : AppColors.error,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    Switch(
+                                      value: gstBill,
+                                      activeThumbColor: Colors.white,
+                                      activeTrackColor: AppColors.accent,
+                                      onChanged: (v) =>
+                                          setLocal(() => draft.gstBill = gstBill = v),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ),
                           ),
                         ],
@@ -22048,16 +23021,32 @@ end tell
                                     10,
                                     7,
                                   ),
-                                  child: TextButton.icon(
+                                  // Adds as many blank rows as the box beside
+                                  // it says (1 when left empty), up to 100 at
+                                  // a time.
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                  TextButton.icon(
                                     onPressed: saving
                                         ? null
-                                        : () => setLocal(
-                                            () => rows.add(
-                                              _BulkProductRow(
-                                                category: defaultCategory,
-                                              ),
-                                            ),
-                                          ),
+                                        : () {
+                                            final n =
+                                                (int.tryParse(
+                                                          addRowsCtrl.text
+                                                              .trim(),
+                                                        ) ??
+                                                        1)
+                                                    .clamp(1, 100);
+                                            setLocal(
+                                              () => rows.addAll([
+                                                for (var i = 0; i < n; i++)
+                                                  _BulkProductRow(
+                                                    category: defaultCategory,
+                                                  ),
+                                              ]),
+                                            );
+                                          },
                                     icon: const Icon(
                                       Icons.add_rounded,
                                       size: 16,
@@ -22080,6 +23069,70 @@ end tell
                                       tapTargetSize:
                                           MaterialTapTargetSize.shrinkWrap,
                                     ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  SizedBox(
+                                    width: 44,
+                                    height: 28,
+                                    child: TextField(
+                                      controller: addRowsCtrl,
+                                      enabled: !saving,
+                                      textAlign: TextAlign.center,
+                                      keyboardType: TextInputType.number,
+                                      inputFormatters: [
+                                        FilteringTextInputFormatter.digitsOnly,
+                                        LengthLimitingTextInputFormatter(3),
+                                      ],
+                                      style: GoogleFonts.inter(
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: AppColors.textDark,
+                                      ),
+                                      decoration: InputDecoration(
+                                        hintText: '1',
+                                        hintStyle: GoogleFonts.inter(
+                                          fontSize: 12.5,
+                                          color: AppColors.textMuted,
+                                        ),
+                                        isDense: true,
+                                        contentPadding:
+                                            const EdgeInsets.symmetric(
+                                              vertical: 6,
+                                            ),
+                                        enabledBorder: OutlineInputBorder(
+                                          borderRadius:
+                                              BorderRadius.circular(6),
+                                          borderSide: const BorderSide(
+                                            color: AppColors.border,
+                                          ),
+                                        ),
+                                        focusedBorder: OutlineInputBorder(
+                                          borderRadius:
+                                              BorderRadius.circular(6),
+                                          borderSide: const BorderSide(
+                                            color: AppColors.accentBlue,
+                                            width: 1.5,
+                                          ),
+                                        ),
+                                        disabledBorder: OutlineInputBorder(
+                                          borderRadius:
+                                              BorderRadius.circular(6),
+                                          borderSide: const BorderSide(
+                                            color: AppColors.border,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'rows',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12,
+                                      color: AppColors.textMuted,
+                                    ),
+                                  ),
+                                    ],
                                   ),
                                 ),
                               ),
@@ -22121,6 +23174,13 @@ end tell
                             height: 40,
                             child: TextField(
                               controller: reportAmtCtrl,
+                              focusNode: amtFocus,
+                              onChanged: (_) {
+                                if (askAmt) setLocal(() {});
+                              },
+                              // Nothing is reported for a bill that is not
+                              // a GST bill, so the amount has no use then.
+                              enabled: gstBill,
                               keyboardType:
                                   const TextInputType.numberWithOptions(
                                     decimal: true,
@@ -22135,7 +23195,15 @@ end tell
                                 fontWeight: FontWeight.w700,
                                 color: AppColors.textDark,
                               ),
-                              decoration: _dlgInputDecor('taxable value')
+                              decoration:
+                                  (gstBill &&
+                                              askAmt &&
+                                              reportAmtCtrl.text.trim().isEmpty
+                                          ? asking(
+                                              _dlgInputDecor('taxable value'),
+                                              'enter taxable value',
+                                            )
+                                          : _dlgInputDecor('taxable value'))
                                   .copyWith(
                                     isDense: true,
                                     contentPadding:
@@ -22429,6 +23497,9 @@ end tell
     required TextEditingController ctrl,
     required List<Dealer> dealers,
     required StateSetter setLocal,
+    // When set, the field is asking to be filled: red outline and this
+    // prompt in red in place of the usual hint.
+    String? missingHint,
   }) {
     final selectedName = ctrl.text.trim();
     final menu = PopupMenuButton<String>(
@@ -22542,7 +23613,9 @@ end tell
       decoration: BoxDecoration(
         color: AppColors.surfaceVariant,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: AppColors.border),
+        border: missingHint != null
+            ? Border.all(color: AppColors.error, width: 1.5)
+            : Border.all(color: AppColors.border),
       ),
       child: Row(
         children: [
@@ -22594,15 +23667,19 @@ end tell
                 controller: c,
                 focusNode: f,
                 onSubmitted: (_) => onSubmit(),
+                // Redrawn while asking, so the prompt clears on typing.
+                onChanged: missingHint != null ? (_) => setLocal(() {}) : null,
                 style: GoogleFonts.inter(
                   fontSize: 13,
                   color: AppColors.textDark,
                 ),
                 decoration: InputDecoration(
-                  hintText: 'Select or type dealer',
+                  hintText: missingHint ?? 'Select or type dealer',
                   hintStyle: GoogleFonts.inter(
                     fontSize: 13,
-                    color: AppColors.textMuted,
+                    color: missingHint != null
+                        ? AppColors.error
+                        : AppColors.textMuted,
                   ),
                   isDense: true,
                   border: InputBorder.none,
@@ -22707,6 +23784,115 @@ end tell
   /// Small form to save a new dealer to the local directory. Returns the
   /// saved dealer, or null when cancelled. [initialName] pre-fills the name,
   /// for when the dealer was first typed into a dealer field.
+  /// Asks for the GSTIN of a saved dealer who has none, and stores it on that
+  /// dealer (same id, so nothing is duplicated). Returns the updated dealer,
+  /// or null if cancelled. Used when a GST bill is entered for them.
+  Future<Dealer?> _askDealerGstin(Dealer dealer) async {
+    final ctrl = TextEditingController();
+    String? error;
+    final saved = await showDialog<Dealer>(
+      context: context,
+      builder: (dctx) => StatefulBuilder(
+        builder: (dctx, setD) {
+          Future<void> save() async {
+            final gstin = ctrl.text.replaceAll(' ', '').toUpperCase();
+            if (!RegExp(r'^[0-9]{2}[A-Z0-9]{13}$').hasMatch(gstin)) {
+              setD(
+                () => error =
+                    'GSTIN must be 15 letters/numbers, starting with the '
+                    '2-digit state code.',
+              );
+              return;
+            }
+            final updated = Dealer(
+              id: dealer.id,
+              name: dealer.name,
+              phone: dealer.phone,
+              gstin: gstin,
+              notes: dealer.notes,
+              createdAt: dealer.createdAt,
+            );
+            await LocalDbService.insertDealer(updated);
+            if (dctx.mounted) Navigator.pop(dctx, updated);
+          }
+
+          final g = ctrl.text.replaceAll(' ', '');
+          final code = g.length < 2 ? '' : _gstStateCode(g);
+          return AlertDialog(
+            backgroundColor: Colors.white,
+            surfaceTintColor: Colors.transparent,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            title: Text(
+              'GSTIN for ${dealer.name}',
+              style: GoogleFonts.manrope(
+                fontWeight: FontWeight.w700,
+                fontSize: 15,
+              ),
+            ),
+            content: SizedBox(
+              width: 360,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'A GST bill needs the dealer\'s GSTIN. It is saved on '
+                    'the dealer for next time.',
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: ctrl,
+                    autofocus: true,
+                    textCapitalization: TextCapitalization.characters,
+                    style: GoogleFonts.inter(fontSize: 13),
+                    decoration: _dlgInputDecor('e.g. 33ABCDE1234F1Z5'),
+                    onChanged: (_) => setD(() => error = null),
+                    onSubmitted: (_) => save(),
+                  ),
+                  if (code.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      'State: $code-${_gstStates[code] ?? 'unknown'}',
+                      style: GoogleFonts.inter(
+                        fontSize: 11.5,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ],
+                  if (error != null) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      error!,
+                      style: GoogleFonts.inter(
+                        fontSize: 11.5,
+                        color: AppColors.error,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dctx),
+                child: const Text('Cancel'),
+              ),
+              TextButton(onPressed: save, child: const Text('Save')),
+            ],
+          );
+        },
+      ),
+    );
+    ctrl.dispose();
+    return saved;
+  }
+
   Future<Dealer?> _showAddDealerDialog({String initialName = ''}) async {
     final nameCtrl = TextEditingController(text: initialName);
     final phoneCtrl = TextEditingController();
@@ -23949,14 +25135,15 @@ end tell
   Future<String?> _pickSavePath(
     String prefix,
     String periodLabel,
-    String ext,
-  ) async {
+    String ext, {
+    String? fileName,
+  }) async {
     final slug = periodLabel
         .replaceAll(RegExp(r'[^A-Za-z0-9]+'), '-')
         .toLowerCase();
     final path = await FilePicker.platform.saveFile(
       dialogTitle: 'Save $prefix',
-      fileName: '$prefix-$slug.$ext',
+      fileName: fileName != null ? '$fileName.$ext' : '$prefix-$slug.$ext',
       type: FileType.custom,
       allowedExtensions: [ext],
       // Owned by the BillCat window, so the box opens in front of it.
@@ -24095,13 +25282,26 @@ end tell
   /// skipped and counted rather than aborting the whole archive.
   Future<void> _zipAllInvoices(
     List<TransactionRecord> txList,
-    String periodLabel,
-  ) async {
+    String periodLabel, {
+    String? fileName,
+    // When given, the PDFs go into this archive (the GST report bundle)
+    // instead of a ZIP of their own: no Save box, nothing written here.
+    Archive? into,
+    // A folder inside the archive for the PDFs, e.g. "November 2026 Bills".
+    String? folder,
+  }) async {
     if (txList.isEmpty) {
       _showToast('No invoices to bundle', isError: true);
       return;
     }
-    final path = await _pickSavePath('invoices', periodLabel, 'zip');
+    final path = into != null
+        ? ''
+        : await _pickSavePath(
+            'invoices',
+            periodLabel,
+            'zip',
+            fileName: fileName,
+          );
     if (path == null || !mounted) return;
 
     // Captured before the awaits so the progress dialog can be dismissed
@@ -24144,7 +25344,7 @@ end tell
       ),
     );
 
-    final archive = Archive();
+    final archive = into ?? Archive();
     final used = <String>{};
     var failed = 0;
     try {
@@ -24175,14 +25375,14 @@ end tell
             storeUpiId: _storeUpiId,
             docType: 'Invoice',
           );
-          // Same name the single-invoice save uses, so a file pulled out of
-          // the archive is indistinguishable from one saved on its own.
-          var name =
-              'Receipt-${t.displayInvoice.replaceAll('#', '')}'.replaceAll(
-                RegExp(r'[^A-Za-z0-9._-]'),
-                '',
-              );
-          if (name.isEmpty) name = 'Receipt';
+          // Named as the invoice number itself, e.g. INV-26-27-0030.pdf for
+          // INV/26-27/0030. A "/" cannot be in a Windows file name, and in
+          // a ZIP it would make sub-folders, so each becomes a hyphen.
+          var name = t.displayInvoice
+              .replaceAll('#', '')
+              .replaceAll('/', '-')
+              .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '');
+          if (name.isEmpty) name = 'Invoice';
           // Two bills sharing a number would collide inside the archive.
           var unique = name;
           var dup = 2;
@@ -24190,13 +25390,20 @@ end tell
             unique = '$name-$dup';
             dup++;
           }
-          archive.addFile(ArchiveFile.bytes('$unique.pdf', bytes));
+          archive.addFile(
+            ArchiveFile.bytes(
+              folder != null ? '$folder/$unique.pdf' : '$unique.pdf',
+              bytes,
+            ),
+          );
         } catch (_) {
           failed++;
         }
         progress.value = progress.value + 1;
       }
-      await File(path).writeAsBytes(ZipEncoder().encodeBytes(archive));
+      if (into == null) {
+        await File(path).writeAsBytes(ZipEncoder().encodeBytes(archive));
+      }
     } catch (e) {
       nav.pop();
       progress.dispose();
@@ -24205,6 +25412,8 @@ end tell
     }
     nav.pop();
     progress.dispose();
+    // Part of a bundle: the caller writes the file and reports it.
+    if (into != null) return;
     final saved = txList.length - failed;
     if (mounted) {
       _showToast(
@@ -25151,15 +26360,26 @@ end tell
     final out = <double, (double, double)>{};
     final sub = tx.items.fold<double>(0, (s, i) => s + i.total);
     if (sub.abs() < 0.005) return (byRate: out, split: false);
-    final factor = (sub - tx.discountAmount) / sub;
+    // A bill rounded down by hand (total ₹0.50 or more under subtotal -
+    // discount, which automatic rounding never is) is taxed on the rounded
+    // amount, as the till charged it.
+    final net = sub - tx.discountAmount;
+    final factor =
+        (sub > 0 && tx.total - net <= -0.5 ? tx.total : net) / sub;
     if (!factor.isFinite || factor < 0 || factor > 1.000001) {
       return (byRate: out, split: false);
     }
     // An inclusive line carries its tax inside its total, so the tax comes
     // back out of it; an older additive line has the tax added on top.
     final inclusive = tx.priceIncludesTax;
+    // Same reading as billing: on a bill with any rated line, a line saved at
+    // 0 is a tax-free product and carries no GST. Only a bill with no rate on
+    // any line (made before per-line rates) falls back to [fallbackRate].
+    final anyRated = tx.items.any((i) => i.taxPercent > 0);
     for (final i in tx.items) {
-      final rate = i.taxPercent > 0 ? i.taxPercent : fallbackRate;
+      final rate = i.taxPercent > 0
+          ? i.taxPercent
+          : (anyRated ? 0.0 : fallbackRate);
       // Tax is read against what the customer actually paid on this line,
       // after its share of the discount, the same base the bill used.
       final paid = i.total * factor;
@@ -25188,11 +26408,17 @@ end tell
     var recTaxable = 0.0;
     var recTax = 0.0;
     for (final t in txns) {
-      recTaxable += t.subtotal - t.discountAmount;
+      // On a tax-inclusive bill the amount paid contains the tax, so the
+      // taxable value is what is left once the stored tax is taken out.
+      // Without this the Taxable Value card showed the full 1000 of a bill
+      // whose table row (and export) showed its taxable part.
+      final taxable =
+          t.subtotal - t.discountAmount - (t.priceIncludesTax ? t.taxAmount : 0);
+      recTaxable += taxable;
       recTax += t.taxAmount;
       final r = _gstSplitBill(t, _gstFallbackRate(t));
       if (!r.split) {
-        unTaxable += t.subtotal - t.discountAmount;
+        unTaxable += taxable;
         unTax += t.taxAmount;
         continue;
       }
@@ -25334,108 +26560,35 @@ end tell
   }
 
   Future<void> _showGstExportDialog() async {
-    final items = <(String, IconData, String, String)>[
-      (
-        'zip',
-        Icons.folder_zip_outlined,
-        'All bills as PDF (ZIP)',
-        'Every $_taxLabel bill in this period, one PDF each',
-      ),
-      (
-        'csv',
-        Icons.table_chart_outlined,
-        'CSV report',
-        'Invoice list for your accountant, opens in Excel',
-      ),
-      (
-        'pdf',
-        Icons.picture_as_pdf_outlined,
-        'PDF report',
-        '$_taxLabel summary to print or share',
-      ),
+    // One box of toggles: tick what is wanted and export it all in one go.
+    // Each file still gets its own Save box, opened one after another.
+    final options = <(String, IconData, String)>[
+      ('zip', Icons.folder_zip_outlined, 'Bill PDFs (ZIP)'),
+      ('csv', Icons.table_chart_outlined, 'Sales report'),
+      ('purchase', Icons.local_shipping_outlined, 'Purchase report'),
     ];
-    // First step: sales bills (made in BillCat) or purchases (stock bought
-    // from dealers).
-    final sections = <(String, IconData, String, String)>[
-      (
-        'sales',
-        Icons.receipt_long_outlined,
-        'Sales bills',
-        'Bills you made in BillCat, with $_taxLabel',
-      ),
-      (
-        'purchase',
-        Icons.local_shipping_outlined,
-        'Purchase bills',
-        'All purchase records from dealers (CSV). $_taxLabel worked out from rates',
-      ),
-    ];
+    final on = {'zip': true, 'csv': true, 'purchase': true};
     // Every bill in the period, not just the taxable ones the register lists.
-    final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
-    String? section;
-    final choice = await showDialog<String>(
+    final (from, to, periodLabel) = _gstRangeFor(_gstPeriod);
+    // Files are named for the month they cover, e.g. "November 2026 GST
+    // Report". A custom range across months names both ends.
+    final fromMonth = '${_gstMonths[from.month - 1]} ${from.year}';
+    final toMonth = '${_gstMonths[to.month - 1]} ${to.year}';
+    final baseName =
+        '${fromMonth == toMonth ? fromMonth : '$fromMonth to $toMonth'}'
+        ' $_taxLabel Report';
+    final go = await showDialog<bool>(
       context: context,
       builder: (dialogCtx) => StatefulBuilder(
         builder: (dialogCtx, setLocal) {
-          Widget tile((String, IconData, String, String) e, VoidCallback onTap) =>
-              Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GestureDetector(
-                    onTap: onTap,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 12,
-                      ),
-                      decoration: BoxDecoration(
-                        color: AppColors.surfaceVariant,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: AppColors.border),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(e.$2, size: 22, color: AppColors.primary),
-                          const SizedBox(width: 14),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  e.$3,
-                                  style: GoogleFonts.inter(
-                                    fontSize: 13.5,
-                                    fontWeight: FontWeight.w600,
-                                    color: AppColors.textDark,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  e.$4,
-                                  style: GoogleFonts.inter(
-                                    fontSize: 11.5,
-                                    color: AppColors.textMuted,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              );
-
-          final onSales = section == 'sales';
+          final count = on.values.where((v) => v).length;
           return Dialog(
             backgroundColor: Colors.white,
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(14),
             ),
             child: SizedBox(
-              width: 380,
+              width: 400,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -25443,7 +26596,7 @@ end tell
                   Padding(
                     padding: const EdgeInsets.fromLTRB(20, 18, 20, 4),
                     child: Text(
-                      onSales ? 'Export sales bills' : 'Export $_taxLabel record',
+                      'Export $_taxLabel record',
                       style: GoogleFonts.manrope(
                         fontSize: 16,
                         fontWeight: FontWeight.w700,
@@ -25463,20 +26616,48 @@ end tell
                   ),
                   const Divider(height: 1, color: AppColors.border),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
                     child: Column(
                       children: [
-                        if (onSales)
-                          for (final e in items)
-                            tile(e, () => Navigator.pop(dialogCtx, e.$1))
-                        else
-                          for (final s in sections)
-                            tile(
-                              s,
-                              () => s.$1 == 'sales'
-                                  ? setLocal(() => section = 'sales')
-                                  : Navigator.pop(dialogCtx, 'purchase'),
+                        for (final e in options)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Container(
+                              padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
+                              decoration: BoxDecoration(
+                                color: AppColors.surfaceVariant,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: AppColors.border),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    e.$2,
+                                    size: 22,
+                                    color: AppColors.primary,
+                                  ),
+                                  const SizedBox(width: 14),
+                                  Expanded(
+                                    child: Text(
+                                      e.$3,
+                                      style: GoogleFonts.inter(
+                                        fontSize: 13.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: AppColors.textDark,
+                                      ),
+                                    ),
+                                  ),
+                                  Switch(
+                                    value: on[e.$1]!,
+                                    activeThumbColor: Colors.white,
+                                    activeTrackColor: AppColors.accent,
+                                    onChanged: (v) =>
+                                        setLocal(() => on[e.$1] = v),
+                                  ),
+                                ],
+                              ),
                             ),
+                          ),
                       ],
                     ),
                   ),
@@ -25484,15 +26665,25 @@ end tell
                     padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
                     child: Row(
                       children: [
-                        if (onSales)
-                          TextButton(
-                            onPressed: () => setLocal(() => section = null),
-                            child: const Text('Back'),
-                          ),
                         const Spacer(),
                         TextButton(
                           onPressed: () => Navigator.pop(dialogCtx),
                           child: const Text('Cancel'),
+                        ),
+                        const SizedBox(width: 6),
+                        TextButton(
+                          onPressed: count == 0
+                              ? null
+                              : () => Navigator.pop(dialogCtx, true),
+                          child: Text(
+                            count == 0 ? 'Export' : 'Export ($count)',
+                            style: GoogleFonts.inter(
+                              fontWeight: FontWeight.w700,
+                              color: count == 0
+                                  ? AppColors.textMuted
+                                  : AppColors.accentBlue,
+                            ),
+                          ),
                         ),
                       ],
                     ),
@@ -25504,13 +26695,76 @@ end tell
         },
       ),
     );
-    // Run the export after the box has closed, so the Save box opens over
-    // the BillCat window rather than this dialog.
-    if (!mounted || choice == null) return;
-    if (choice == 'zip') _zipAllInvoices(_gstTaxableBills().$1, periodLabel);
-    if (choice == 'csv') _exportGstCsv();
-    if (choice == 'pdf') _saveGstPdf();
-    if (choice == 'purchase') _exportPurchaseCsv();
+    // Run the exports after the box has closed, so each Save box opens over
+    // the BillCat window rather than this dialog. Awaited in turn so only
+    // one Save box is open at a time.
+    if (!mounted || go != true) return;
+    // Everything ticked goes into ONE file, "November 2026 GST Report.zip":
+    // one Save box, and the bill PDFs and both reports sit inside it.
+    final path = await _pickSavePath(
+      'report',
+      periodLabel,
+      'zip',
+      fileName: baseName,
+    );
+    if (path == null || !mounted) return;
+    final bundle = Archive();
+    // Each part reports its own "nothing in this period" and adds nothing,
+    // so the bundle holds whatever had something to export.
+    final missing = <String>[];
+    // Bills go in a folder of their own, "November 2026 Bills"; the sales
+    // and purchase reports are an Excel file each beside it.
+    if (on['zip']!) {
+      final bills = _gstTaxableBills().$1;
+      final before = bundle.length;
+      await _zipAllInvoices(
+        bills,
+        periodLabel,
+        into: bundle,
+        folder: baseName.replaceFirst(RegExp(' $_taxLabel Report\$'), ' Bills'),
+      );
+      if (bundle.length - before < bills.length) missing.add('some bills');
+    }
+    if (!mounted) return;
+    final sheets = <String, String>{};
+    if (on['csv']!) {
+      await _exportGstCsv(sheets: sheets);
+      if (!sheets.containsKey('Sales')) missing.add('sales report');
+    }
+    if (!mounted) return;
+    if (on['purchase']!) {
+      await _exportPurchaseCsv(sheets: sheets);
+      if (!sheets.containsKey('Purchase')) missing.add('purchase report');
+    }
+    if (!mounted) return;
+    // One Excel file per report, e.g. "November 2026 Sales Report.xlsx",
+    // named like the bills folder beside them.
+    final month = baseName.replaceFirst(RegExp(' $_taxLabel Report\$'), '');
+    for (final e in sheets.entries) {
+      bundle.addFile(
+        ArchiveFile.bytes(
+          '$month ${e.key} Report.xlsx',
+          _xlsxBytes({e.key: _parseCsv(e.value)}),
+        ),
+      );
+    }
+    if (bundle.isEmpty) {
+      _showToast('Nothing to export for $periodLabel', isError: true);
+      return;
+    }
+    final withExt = path.toLowerCase().endsWith('.zip') ? path : '$path.zip';
+    try {
+      await File(withExt).writeAsBytes(ZipEncoder().encodeBytes(bundle));
+      if (!mounted) return;
+      _showToast(
+        missing.isEmpty
+            ? 'Saved $withExt'
+            : 'Saved $withExt — no ${missing.join(', ')} in this period',
+        isError: missing.isNotEmpty,
+      );
+    } catch (e) {
+      if (mounted) _showToast('Could not save: $e', isError: true);
+    }
   }
 
   /// The purchase records for the period the GST page is showing, as a CSV in
@@ -25531,7 +26785,10 @@ end tell
   ///
   /// The register itself is built by [_purchaseRegister], which the GST page's
   /// Purchase tab shows on screen, so the file and the screen always agree.
-  Future<void> _exportPurchaseCsv() async {
+  Future<void> _exportPurchaseCsv({
+    String? fileName,
+    Map<String, String>? sheets,
+  }) async {
     final (_, _, periodLabel) = _gstRangeFor(_gstPeriod);
     final rows = await _purchaseRegister();
     if (rows.isEmpty) {
@@ -25579,9 +26836,20 @@ end tell
       );
     }
 
+    // Part of the GST report bundle: becomes the Purchase Excel file of
+    // the bundle instead of being saved here.
+    if (sheets != null) {
+      sheets['Purchase'] = b.toString();
+      return;
+    }
     // Named for the period it covers, like every other export here, so two
     // months' files cannot be mistaken for each other.
-    final withExt = await _pickSavePath('purchases', periodLabel, 'csv');
+    final withExt = await _pickSavePath(
+      'purchases',
+      periodLabel,
+      'csv',
+      fileName: fileName,
+    );
     if (withExt == null) return;
     try {
       await File(withExt).writeAsString(b.toString());
@@ -25755,9 +27023,11 @@ end tell
           storeState.isNotEmpty &&
           dealerState != storeState;
       // One row per GST rate AND HSN code, so each row names a single HSN.
-      // Slabs worth nothing (zero stock or no buying price) are skipped.
+      // Slabs worth nothing (zero stock or no buying price) are skipped, and
+      // so is stock with GST off (a tax-free product, 0%): the owner wants
+      // only goods that carry GST in the purchase report.
       final slabs = inv.byRate.entries
-          .where((e) => e.value.abs() >= 0.005)
+          .where((e) => e.value.abs() >= 0.005 && e.key.$1 > 0)
           .toList()
         ..sort((a, b) {
           final c = a.key.$1.compareTo(b.key.$1);
@@ -26178,18 +27448,6 @@ end tell
             ),
           ),
           const SizedBox(height: 16),
-          Text(
-            'Lines marked "estimated" come from stock entered without a '
-            'supplier invoice number: one invoice per dealer and purchase day, '
-            'valued at buying price. Stock switched out of the GST report in '
-            'Bulk Add is not shown. IGST applies when the supplier\'s GSTIN is '
-            'from another state than the shop\'s.',
-            style: GoogleFonts.inter(
-              fontSize: 11.5,
-              height: 1.5,
-              color: AppColors.textMuted,
-            ),
-          ),
         ],
       ),
     );
@@ -26646,33 +27904,6 @@ end tell
               ),
             ),
           if (delta.abs() >= 0.5) const SizedBox(height: 12),
-          if (excludedBills > 0) ...[
-            Text(
-              '$excludedBills bill${excludedBills == 1 ? '' : 's'} in this '
-              'period carried no $_taxLabel or '
-              '${excludedBills == 1 ? 'was' : 'were'} marked not GST billed, '
-              'and ${excludedBills == 1 ? 'is' : 'are'} not included above, '
-              'in the exports, or in the ZIP.',
-              style: GoogleFonts.inter(
-                fontSize: 11.5,
-                height: 1.5,
-                color: AppColors.textMuted,
-              ),
-            ),
-            const SizedBox(height: 8),
-          ],
-          Text(
-            'CGST and SGST are shown as an equal half of the tax, the same split '
-            'your invoices print. Place of supply is not recorded, so inter-state '
-            'sales are not separated out. HSN codes are not stored, so no HSN '
-            'summary is available. Bills made before per-item rates existed are '
-            'counted at the current store rate of $_taxRateDisplay%.',
-            style: GoogleFonts.inter(
-              fontSize: 11.5,
-              height: 1.5,
-              color: AppColors.textMuted,
-            ),
-          ),
           const SizedBox(height: 8),
         ],
       ),
@@ -26872,7 +28103,164 @@ end tell
       ? '"${v.replaceAll('"', '""')}"'
       : v;
 
-  Future<void> _exportGstCsv() async {
+  /// Reads back CSV text written with [_csvCell]: quoted cells may hold
+  /// commas, newlines and doubled quotes.
+  static List<List<String>> _parseCsv(String text) {
+    final rows = <List<String>>[];
+    var row = <String>[];
+    final cell = StringBuffer();
+    var quoted = false;
+    for (var i = 0; i < text.length; i++) {
+      final ch = text[i];
+      if (quoted) {
+        if (ch == '"') {
+          if (i + 1 < text.length && text[i + 1] == '"') {
+            cell.write('"');
+            i++;
+          } else {
+            quoted = false;
+          }
+        } else {
+          cell.write(ch);
+        }
+      } else if (ch == '"') {
+        quoted = true;
+      } else if (ch == ',') {
+        row.add(cell.toString());
+        cell.clear();
+      } else if (ch == '\n' || ch == '\r') {
+        if (ch == '\r' && i + 1 < text.length && text[i + 1] == '\n') i++;
+        row.add(cell.toString());
+        cell.clear();
+        rows.add(row);
+        row = <String>[];
+      } else {
+        cell.write(ch);
+      }
+    }
+    if (cell.isNotEmpty || row.isNotEmpty) {
+      row.add(cell.toString());
+      rows.add(row);
+    }
+    return rows;
+  }
+
+  /// A real Excel workbook (.xlsx), one sheet per entry, built with the
+  /// archive package BillCat already ships (an .xlsx is a ZIP of XML), so no
+  /// spreadsheet package is needed. The first row of each sheet is the
+  /// header: bold and frozen. A cell that is a plain number is stored as a
+  /// number so Excel can total it; anything else (GSTIN, invoice no., date,
+  /// an HSN code with a leading zero) stays text exactly as written.
+  static List<int> _xlsxBytes(Map<String, List<List<String>>> sheets) {
+    String esc(String v) => v
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    String col(int i) {
+      var n = i + 1;
+      var s = '';
+      while (n > 0) {
+        final r = (n - 1) % 26;
+        s = String.fromCharCode(65 + r) + s;
+        n = (n - 1) ~/ 26;
+      }
+      return s;
+    }
+
+    final number = RegExp(r'^-?(0|[1-9]\d*)(\.\d+)?$');
+    const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+    const main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    const rel =
+        'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    const pkg = 'http://schemas.openxmlformats.org/package/2006/relationships';
+    final names = sheets.keys.toList();
+    final zip = Archive();
+    void add(String path, String xml) =>
+        zip.addFile(ArchiveFile.bytes(path, utf8.encode(head + xml)));
+
+    add(
+      '[Content_Types].xml',
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          '<Default Extension="xml" ContentType="application/xml"/>'
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+          '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+          '${[for (var i = 0; i < names.length; i++) '<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'].join()}'
+          '</Types>',
+    );
+    add(
+      '_rels/.rels',
+      '<Relationships xmlns="$pkg">'
+          '<Relationship Id="rId1" Type="$rel/officeDocument" Target="xl/workbook.xml"/>'
+          '</Relationships>',
+    );
+    add(
+      'xl/workbook.xml',
+      '<workbook xmlns="$main" xmlns:r="$rel"><sheets>'
+          '${[for (var i = 0; i < names.length; i++) '<sheet name="${esc(names[i])}" sheetId="${i + 1}" r:id="rId${i + 1}"/>'].join()}'
+          '</sheets></workbook>',
+    );
+    add(
+      'xl/_rels/workbook.xml.rels',
+      '<Relationships xmlns="$pkg">'
+          '${[for (var i = 0; i < names.length; i++) '<Relationship Id="rId${i + 1}" Type="$rel/worksheet" Target="worksheets/sheet${i + 1}.xml"/>'].join()}'
+          '<Relationship Id="rId${names.length + 1}" Type="$rel/styles" Target="styles.xml"/>'
+          '</Relationships>',
+    );
+    add(
+      'xl/styles.xml',
+      '<styleSheet xmlns="$main">'
+          '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+          '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+          '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+          '<fill><patternFill patternType="gray125"/></fill></fills>'
+          '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+          '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+          '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+          '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>'
+          '</styleSheet>',
+    );
+    for (var i = 0; i < names.length; i++) {
+      final rows = sheets[names[i]]!;
+      final width = rows.fold<int>(0, (m, r) => r.length > m ? r.length : m);
+      final b = StringBuffer()
+        ..write('<worksheet xmlns="$main"><sheetViews><sheetView workbookViewId="0">')
+        ..write('<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>')
+        ..write('</sheetView></sheetViews>');
+      // Wide enough that dates and amounts never show as ######.
+      if (width > 0) {
+        b.write('<cols><col min="1" max="$width" width="18" customWidth="1"/></cols>');
+      }
+      b.write('<sheetData>');
+      for (var r = 0; r < rows.length; r++) {
+        b.write('<row r="${r + 1}">');
+        for (var c = 0; c < rows[r].length; c++) {
+          final v = rows[r][c];
+          if (v.isEmpty) continue;
+          final ref = '${col(c)}${r + 1}';
+          final style = r == 0 ? ' s="1"' : '';
+          if (r > 0 && number.hasMatch(v)) {
+            b.write('<c r="$ref"$style><v>$v</v></c>');
+          } else {
+            b.write(
+              '<c r="$ref" t="inlineStr"$style><is><t xml:space="preserve">'
+              '${esc(v)}</t></is></c>',
+            );
+          }
+        }
+        b.write('</row>');
+      }
+      b.write('</sheetData></worksheet>');
+      add('xl/worksheets/sheet${i + 1}.xml', b.toString());
+    }
+    return ZipEncoder().encodeBytes(zip);
+  }
+
+  Future<void> _exportGstCsv({
+    String? fileName,
+    Map<String, String>? sheets,
+  }) async {
     final (taxable, _) = _gstTaxableBills();
     // A bill sold with GST switched off stores no rate on any line and no tax.
     // _gstFallbackRate would price it at today's store rate, so leave it out
@@ -26945,9 +28333,15 @@ end tell
     final slug = periodLabel
         .replaceAll(RegExp(r'[^A-Za-z0-9]+'), '-')
         .toLowerCase();
+    // Part of the GST report bundle: becomes the Sales Excel file of
+    // the bundle instead of being saved here.
+    if (sheets != null) {
+      sheets['Sales'] = b.toString();
+      return;
+    }
     final path = await FilePicker.platform.saveFile(
       dialogTitle: 'Save $_taxLabel summary',
-      fileName: 'gst-$slug.csv',
+      fileName: fileName != null ? '$fileName.csv' : 'gst-$slug.csv',
       type: FileType.custom,
       allowedExtensions: ['csv'],
       lockParentWindow: true,
@@ -26968,6 +28362,10 @@ end tell
     final customers = await LocalDbService.getCustomers();
     if (mounted) setState(() => _reportCustomers = customers);
   }
+
+  /// Sales page: every bill, or only bills marked "GST billed" at Confirm
+  /// Payment. The cards, the cash/bank split and the history all follow it.
+  bool _salesGstOnly = false;
 
   Widget _buildReportsView() {
     return SingleChildScrollView(
@@ -27031,21 +28429,27 @@ end tell
     final isToday = _reportSalesPeriod == 'Today';
     final isWeek = _reportSalesPeriod == 'This Week';
 
-    final txList = isCustom
+    final periodTx = isCustom
         ? _customTxList
         : isToday
         ? _txListToday
         : isWeek
         ? _txListWeek
         : _txListMonth;
+    // "GST bills" leaves out bills marked not GST billed at Confirm Payment
+    // (and their returns, which carry the original's mark).
+    final txList = _salesGstOnly
+        ? periodTx.where((t) => t.gstBilled).toList()
+        : periodTx;
 
     final double revenue;
     final int txCount;
     final int items;
     final double profit;
-    if (isCustom) {
+    if (isCustom || _salesGstOnly) {
       // Compute the same figures the dashboard precomputes, but for whatever
-      // day/month/year the owner picked.
+      // day/month/year the owner picked — or for the GST bills alone, which
+      // the dashboard's all-bill totals cannot give.
       final buying = {for (final p in _products) p.id: p.buyingPrice};
       revenue = txList.fold(0.0, (s, t) => s + t.total);
       txCount = txList.length;
@@ -27059,8 +28463,8 @@ end tell
           0.0,
           (a, i) => a + (buying[i.productId] ?? 0) * i.quantity,
         );
-        // Same rule as the dashboard: GST out before cost of goods.
-        return s + ((t.total - t.taxAmount) - cogs);
+        // Same rule as the dashboard: bill total less cost, GST left in.
+        return s + (t.total - cogs);
       });
     } else {
       revenue = isToday
@@ -27168,12 +28572,18 @@ end tell
       children: [
         Row(
           children: [
+            // Tap to switch between every bill and the GST bills alone; the
+            // whole page follows.
             _reportSummaryCard(
-              'Total Sales',
+              _salesGstOnly ? '$_taxLabel Sales' : 'Total Sales',
               fmtAmt(revenue),
               Icons.attach_money_rounded,
               AppColors.accent,
               currencyIcon: _currencySymbol,
+              onTap: () => setState(() => _salesGstOnly = !_salesGstOnly),
+              tooltip: _salesGstOnly
+                  ? 'Showing $_taxLabel bills only — tap for all bills'
+                  : 'Tap to show $_taxLabel bills only',
             ),
             const SizedBox(width: 16),
             _reportSummaryCard(
@@ -29854,9 +31264,11 @@ end tell
     final outOfStock = _products.where((p) => p.stock == 0).length;
     // What the stock on hand earns if it all sells at the listed price.
     // A product with no recorded cost is skipped rather than counted at its
-    // full value, which would report the whole sale price as profit.
+    // full value, which would report the whole sale price as profit; and a
+    // product with no selling price yet is skipped too, rather than counted
+    // as a total loss of its cost.
     final totalProfit = _products
-        .where((p) => p.buyingPrice > 0)
+        .where((p) => p.buyingPrice > 0 && p.price > 0)
         .fold<double>(
           0,
           (sum, p) => sum + (p.price - p.buyingPrice) * p.stock,
@@ -29955,6 +31367,10 @@ end tell
                     Expanded(flex: 2, child: _dashColHeader('BUYING')),
                     Expanded(flex: 2, child: _dashColHeader('PRICE')),
                     Expanded(flex: 1, child: _dashColHeader('STOCK')),
+                    Expanded(
+                      flex: 2,
+                      child: _dashColHeader('SOLD', right: true),
+                    ),
                     Expanded(
                       flex: 2,
                       child: _dashColHeader('VALUE', right: true),
@@ -30130,6 +31546,27 @@ end tell
                                     color: stockColor,
                                   ),
                                 ),
+                              ),
+                            ),
+                            Expanded(
+                              flex: 2,
+                              // Sold out of the total ever stocked: what is
+                              // on the shelf now plus what has gone out.
+                              child: Builder(
+                                builder: (_) {
+                                  final raw = _soldByProduct[p.id] ?? 0;
+                                  final sold = raw < 0 ? 0 : raw;
+                                  final had = sold + (p.stock < 0 ? 0 : p.stock);
+                                  return Text(
+                                    '$sold / $had',
+                                    textAlign: TextAlign.right,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: AppColors.textDark,
+                                    ),
+                                  );
+                                },
                               ),
                             ),
                             Expanded(
@@ -30420,16 +31857,22 @@ end tell
     IconData icon,
     Color color, {
     String? currencyIcon,
+    // When set, the whole card is a button (with [tooltip] on hover), and
+    // [highlighted] outlines it in its colour to show it is switched on.
+    VoidCallback? onTap,
+    String? tooltip,
+    bool highlighted = false,
   }) {
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: AppColors.border),
-        ),
-        child: Row(
+    final card = Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: highlighted
+            ? Border.all(color: color, width: 1.5)
+            : Border.all(color: AppColors.border),
+      ),
+      child: Row(
           children: [
             Container(
               width: 40,
@@ -30476,6 +31919,15 @@ end tell
             ),
           ],
         ),
+    );
+    if (onTap == null) return Expanded(child: card);
+    // Tappable, but drawn exactly like the other cards — no hand cursor or
+    // button styling; the label says which view is showing.
+    return Expanded(
+      child: Tooltip(
+        message: tooltip ?? '',
+        waitDuration: const Duration(milliseconds: 800),
+        child: GestureDetector(onTap: onTap, child: card),
       ),
     );
   }
@@ -32460,22 +33912,33 @@ class _InventoryCatChipState extends State<_InventoryCatChip> {
 
 class _BarcodePainter extends CustomPainter {
   final String data;
-  _BarcodePainter(this.data);
+  // A square QR code, centred, instead of 1D bars.
+  final bool qr;
+  _BarcodePainter(this.data, {this.qr = false});
 
   @override
   void paint(Canvas canvas, Size size) {
-    final barcode = bc.Barcode.code128();
-    final elements = barcode.make(
-      data,
-      width: size.width,
-      height: size.height,
-      drawText: false,
-    );
+    final side = size.shortestSide;
+    final dx = qr ? (size.width - side) / 2 : 0.0;
+    final dy = qr ? (size.height - side) / 2 : 0.0;
+    final Iterable<bc.BarcodeElement> elements;
+    try {
+      elements = qr
+          ? bc.Barcode.qrCode().make(data, width: side, height: side)
+          : bc.Barcode.code128().make(
+              data,
+              width: size.width,
+              height: size.height,
+              drawText: false,
+            );
+    } catch (_) {
+      return; // a value the symbology cannot hold: leave the preview blank
+    }
     final paint = Paint()..color = Colors.black;
     for (final el in elements) {
       if (el is bc.BarcodeBar && el.black) {
         canvas.drawRect(
-          Rect.fromLTWH(el.left, el.top, el.width, el.height),
+          Rect.fromLTWH(el.left + dx, el.top + dy, el.width, el.height),
           paint,
         );
       }
@@ -32483,7 +33946,8 @@ class _BarcodePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_BarcodePainter old) => old.data != data;
+  bool shouldRepaint(_BarcodePainter old) =>
+      old.data != data || old.qr != qr;
 }
 
 /// Keyboard-only passcode entry: four dots, no on-screen pad. An offstage
@@ -32732,6 +34196,22 @@ typedef _PurchaseRegRow = ({
   double sgst,
   double net,
 });
+
+/// Everything typed into Bulk Add Products, kept on the screen between
+/// openings so closing the dialog — or going off to Billing and back — does
+/// not lose it. Dropped once the entry is saved; "Clear products" empties the
+/// rows.
+class _BulkAddDraft {
+  _BulkAddDraft(String category)
+    : rows = [for (var i = 0; i < 3; i++) _BulkProductRow(category: category)];
+
+  final List<_BulkProductRow> rows;
+  final dealerCtrl = TextEditingController();
+  final invoiceCtrl = TextEditingController();
+  final reportAmtCtrl = TextEditingController();
+  DateTime? purchaseDate = DateTime.now();
+  bool gstBill = true;
+}
 
 /// One in-progress line of the Bulk Add Products grid. Each row owns its
 /// controllers so it keeps whatever was typed while other rows are added or
