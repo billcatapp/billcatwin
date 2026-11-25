@@ -21,15 +21,39 @@ const SERVICE_ROLE_KEY = Deno.env.get("SERVICE_ROLE_KEY") ?? "";
 
 const GRAPH = "https://graph.facebook.com/v19.0";
 
-/// The template approved on BillCat's WhatsApp Business Account. Only this one
-/// is ever sent — the app cannot ask for arbitrary message content.
-const TEMPLATE_NAME = "invoice_receipts";
-const TEMPLATE_LANGUAGE = "en";
+/// A template on BillCat's WhatsApp Business Account and the language it was
+/// created in. Meta treats English, English (IND) etc. as different languages:
+/// a name sent with the wrong one "does not exist" (132001).
+type Template = { name: string; language: string };
 
-/// Same template plus a second URL button, "Join our WhatsApp group", whose
-/// URL is https://chat.whatsapp.com/{{1}}. Used when the shop sends its group
-/// invite link; until Meta has approved it, sends fall back to TEMPLATE_NAME.
-const GROUP_TEMPLATE_NAME = "invoice_receipts_group";
+/// The e-bill templates, tried in order until Meta accepts one. Only these are
+/// ever sent — the app cannot ask for arbitrary message content. View Bill is
+/// https://billcat.in/invoices/{{1}}, filled with the bill's code.
+/// billcat_invoice was created in English (IND), en_IN; plain English is kept
+/// after it in case it is ever recreated that way.
+const TEMPLATES: Template[] = [
+  { name: "billcat_invoice", language: "en_IN" },
+  { name: "billcat_invoice", language: "en" },
+];
+
+/// The same plus a second URL button, "Join our WhatsApp group", whose URL is
+/// https://chat.whatsapp.com/{{1}}. Used when the shop has the group button on
+/// (the app then sends its invite link); if none is available, the bill goes
+/// out on TEMPLATES instead. The approved one is spelt "billlcat" (three l's;
+/// Meta cannot rename a template); the correct spelling is tried after it.
+const GROUP_TEMPLATES: Template[] = [
+  { name: "billlcat_invoice_and_group", language: "en" },
+  { name: "billcat_invoice_and_group", language: "en" },
+];
+
+/// Meta's answers when a template can't be used at all — not created, not
+/// approved yet (in review), paused or disabled — so the next one is tried.
+const UNAVAILABLE = new Set([132001, 132015, 132016]);
+
+/// Meta's answers when the values sent don't fit the template's slots — e.g.
+/// View Bill is still a fixed link while its edit to {{1}} is in review, or
+/// already {{1}} for an app too old to send the bill code.
+const PARAM_MISMATCH = new Set([132000, 132012, 131008, 131009, 100]);
 
 /// The invite code out of a WhatsApp group link, e.g. "HhYVvBIQr5FH0n33" from
 /// https://chat.whatsapp.com/HhYVvBIQr5FH0n33. Empty when it is not one.
@@ -201,7 +225,7 @@ Deno.serve(async (req) => {
     },
   ];
 
-  const sendTemplate = (name: string, components: unknown[]) =>
+  const sendTemplate = (template: Template, components: unknown[]) =>
     fetch(`${GRAPH}/${WA_PHONE_NUMBER_ID}/messages`, {
       method: "POST",
       headers: {
@@ -213,46 +237,92 @@ Deno.serve(async (req) => {
         to: phone,
         type: "template",
         template: {
-          name,
-          language: { code: TEMPLATE_LANGUAGE },
+          name: template.name,
+          language: { code: template.language },
           components,
         },
       }),
     });
 
-  // With the shop's group link, the group template adds a "Join our WhatsApp
-  // group" button under View Bill (button index 1; View Bill is index 0).
+  const errorCode = (text: string): number | undefined => {
+    try {
+      return JSON.parse(text)?.error?.code;
+    } catch {
+      return undefined;
+    }
+  };
+
+  // View Bill (button index 0) opens https://billcat.in/invoices/{{1}}, so it
+  // carries the bill's code. Codes are lowercase letters and digits only.
+  const billCode = String(body.billCode ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const urlButton = (index: string, text: string) => ({
+    type: "button",
+    sub_type: "url",
+    index,
+    parameters: [{ type: "text", text }],
+  });
+
+  // Sends one template, first with the View Bill code and, if Meta says the
+  // values don't fit (View Bill still a fixed link), again without it. An app
+  // too old to send a code tries without first, then with a stand-in.
+  const sendWithViewBill = async (template: Template, extra: unknown[]) => {
+    const tries = billCode
+      ? [[urlButton("0", billCode)], []]
+      : [[], [urlButton("0", "bill")]];
+    let res = await sendTemplate(template, [...baseComponents, ...tries[0], ...extra]);
+    let text = await res.text();
+    if (!res.ok && PARAM_MISMATCH.has(errorCode(text) ?? 0)) {
+      res = await sendTemplate(template, [...baseComponents, ...tries[1], ...extra]);
+      text = await res.text();
+    }
+    return { res, text };
+  };
+
+  // Every template that couldn't be used (name/language unknown to Meta, in
+  // review, paused), so a failure can say exactly what was tried.
+  const unavailable: string[] = [];
+
+  // Sends on the first template in [list] Meta accepts. Only "can't use this
+  // template" moves on to the next one; any other refusal (wrong values,
+  // invalid number, ...) is the answer, since the next would get it too.
+  const sendFirstAvailable = async (list: Template[], extra: unknown[]) => {
+    let last = { res: new Response(null, { status: 502 }), text: "" };
+    for (const template of list) {
+      last = await sendWithViewBill(template, extra);
+      if (last.res.ok || !UNAVAILABLE.has(errorCode(last.text) ?? 0)) return last;
+      unavailable.push(`${template.name} (${template.language})`);
+    }
+    return last;
+  };
+
+  // With the shop's group link (sent only when its group button is on), a
+  // group template adds "Join our WhatsApp group" under View Bill (button
+  // index 1). Without it, or when none is available, a plain one.
   const code = groupCode(body.groupLink);
   let send: Response;
   let sendBody: string;
   if (code) {
-    send = await sendTemplate(GROUP_TEMPLATE_NAME, [
-      ...baseComponents,
-      {
-        type: "button",
-        sub_type: "url",
-        index: "1",
-        parameters: [{ type: "text", text: code }],
-      },
-    ]);
-    sendBody = await send.text();
-    // Template not created or not approved yet (Meta 132001): nothing was
-    // delivered, so the bill goes out on the plain template instead of
-    // failing. Any other error is reported as it is.
-    let missingTemplate = false;
-    try {
-      missingTemplate = JSON.parse(sendBody)?.error?.code === 132001;
-    } catch { /* not JSON: report below */ }
-    if (!send.ok && missingTemplate) {
-      console.warn(`whatsapp-send: ${GROUP_TEMPLATE_NAME} unavailable, sent without group button`);
-      send = await sendTemplate(TEMPLATE_NAME, baseComponents);
-      sendBody = await send.text();
+    ({ res: send, text: sendBody } = await sendFirstAvailable(GROUP_TEMPLATES, [
+      urlButton("1", code),
+    ]));
+    // No group template can be used: nothing was delivered, so the bill goes
+    // out without the group button instead of failing.
+    if (!send.ok && UNAVAILABLE.has(errorCode(sendBody) ?? 0)) {
+      console.warn("whatsapp-send: no group template available, sent without group button");
+      ({ res: send, text: sendBody } = await sendFirstAvailable(TEMPLATES, []));
     }
   } else {
-    send = await sendTemplate(TEMPLATE_NAME, baseComponents);
-    sendBody = await send.text();
+    ({ res: send, text: sendBody } = await sendFirstAvailable(TEMPLATES, []));
   }
-  if (!send.ok) return json(502, { ok: false, error: describe(send.status, sendBody) });
+  if (!send.ok) {
+    // Every template was unusable: name the ones tried, which is what the
+    // shop (or BillCat) has to fix in WhatsApp Manager.
+    const error = UNAVAILABLE.has(errorCode(sendBody) ?? 0)
+      ? `No approved WhatsApp e-bill template (tried ${unavailable.join(", ")}). ` +
+        describe(send.status, sendBody)
+      : describe(send.status, sendBody);
+    return json(502, { ok: false, error });
+  }
 
   // Record the send for the cap. A failure here must not fail a bill that has
   // already gone out, so the error is swallowed deliberately.

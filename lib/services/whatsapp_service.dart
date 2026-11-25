@@ -17,6 +17,23 @@ class WhatsAppService {
   /// can say WHY — "send failed" alone gives the shopkeeper nothing to act on.
   String? lastError;
 
+  /// What [lastError] says when this PC has no internet, instead of the
+  /// socket error text.
+  static const offlineMessage = 'Connect to the internet to send e-bills';
+
+  /// Whether the last send failed only because this PC has no internet.
+  bool get offline => lastError == offlineMessage;
+
+  /// True when [e] means this PC has no internet: the server's name can't be
+  /// looked up, or there is no network route at all. Windows codes: 10050
+  /// network down, 10051 network unreachable, 10065 host unreachable, 11001
+  /// host not found, 11002 lookup try-again, 11004 no address data.
+  static bool _isOffline(SocketException e) {
+    if (e.message.contains('Failed host lookup')) return true;
+    const codes = {10050, 10051, 10065, 11001, 11002, 11004};
+    return codes.contains(e.osError?.errorCode);
+  }
+
   // Without these a half-open connection never resolves: the send Future hangs
   // forever, no success or failure toast ever fires, and the bill is silently
   // lost. Upload gets longer — the PDF is bigger.
@@ -399,6 +416,9 @@ class WhatsAppService {
     } on TimeoutException {
       lastError = 'WhatsApp timed out — check the internet connection';
       return false;
+    } on SocketException catch (e) {
+      lastError = _isOffline(e) ? offlineMessage : 'WhatsApp relay — $e';
+      return false;
     } catch (e) {
       lastError = 'WhatsApp relay — $e';
       return false;
@@ -424,7 +444,8 @@ class WhatsAppService {
     required String amount,
     required String date,
     String docType = 'Invoice',
-    // Not part of the approved template; kept so callers are unchanged.
+    // The bill's page on billcat.in. Its last part (the bill code) goes to
+    // the relay for the View Bill button: https://billcat.in/invoices/{{1}}.
     String? invoiceLink,
     String dialCode = '91',
     // The shop's WhatsApp group invite link. Sent to the relay, which adds a
@@ -451,6 +472,8 @@ class WhatsAppService {
         'date': date,
         'docType': docType,
         if (groupLink.trim().isNotEmpty) 'groupLink': groupLink.trim(),
+        if ((invoiceLink ?? '').trim().isNotEmpty)
+          'billCode': Uri.parse(invoiceLink!.trim()).pathSegments.last,
       });
     }
 

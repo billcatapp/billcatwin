@@ -241,6 +241,10 @@ class CartProvider extends ChangeNotifier {
     double? amountPaid,
     String salesperson = '',
     bool gstBilled = true,
+    // The record id the bill's printed copy and e-bill link already carry
+    // (reserved when it was first printed or sent), so the saved bill is the
+    // one its View Bill link opens. Without it a new id is made, as before.
+    String? id,
   }) async {
     // Default to full payment; anything less is recorded as a balance owed.
     final paid = amountPaid ?? total;
@@ -249,7 +253,7 @@ class CartProvider extends ChangeNotifier {
     // break a hybrid bill down. Zero for every other method.
     final isHybrid = paymentMethod == PaymentMethod.hybrid;
     final record = TransactionRecord(
-      id: const Uuid().v4(),
+      id: id ?? const Uuid().v4(),
       // The Mac-format code, shared with the printed preview.
       invoiceNumber: invoiceNumber,
       balanceDue: balanceDue,

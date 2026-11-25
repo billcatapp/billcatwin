@@ -100,7 +100,22 @@ class LabelPrinter {
   static const int _dpmm = 8;
 
   /// Horizontal gap between side-by-side labels on the web, in mm.
-  static const double _colGapMm = 2.5;
+  static const double _colGapMm = 0;
+
+  /// Print width of a 4-inch, 203 dpi head (832 dots), in mm. Desktop label
+  /// printers hold the roll centred under the head, so a row of stickers
+  /// narrower than this sits in the middle of it.
+  static const double _headWmm = 104;
+
+  /// The page set-up width: the whole head, so every printer (one that obeys
+  /// SIZE and one that keeps its own) puts x = 0 at the same place.
+  static double _pageWmm(double webWmm) =>
+      webWmm > _headWmm ? webWmm : _headWmm;
+
+  /// How far in from the head's left edge the centred row of stickers
+  /// starts, in dots.
+  static int _leftDots(double webWmm) =>
+      ((_pageWmm(webWmm) - webWmm) / 2 * _dpmm).round();
 
   /// Prints [labels] (one entry per physical sticker, in print order) on a
   /// TSPL label printer. Labels are laid out [perRow] across; the printer's
@@ -127,19 +142,41 @@ class LabelPrinter {
     // Printed across the top of every sticker, so a label on a shelf says
     // whose shop it came from. Empty keeps the old layout untouched.
     final store = _tsplSafe(storeName.trim());
-    final buf = StringBuffer();
+    final snbc = _needsSnbcFix(printerName, labelHmm);
+    final job = StringBuffer();
+    var allSent = true;
 
     for (var start = 0; start < labels.length; start += perRow) {
       final row = labels.sublist(
         start,
         (start + perRow).clamp(0, labels.length),
       );
-      buf
-        ..write(_setup(webWmm, labelHmm, rowGapMm, shiftMm))
-        ..write('CLS\r\n');
+      final lastRow = start + perRow >= labels.length;
+      // Other printers take every row in one job. An SNBC with stickers
+      // taller than it keeps gets one job per row instead (see [_isSnbc]).
+      final buf = snbc ? StringBuffer() : job;
+      buf.write(
+        _setup(
+          _pageWmm(webWmm),
+          labelHmm,
+          rowGapMm,
+          snbc ? _snbcShiftMm(labelHmm) : shiftMm,
+        ),
+      );
+      if (snbc) {
+        buf.write('SET TEAR ${lastRow ? 'ON' : 'OFF'}\r\n');
+      } else if (_isSnbc(printerName)) {
+        // Short stickers on an SNBC: plain tear-off, in case a taller
+        // print left it switched off.
+        buf.write('SET TEAR ON\r\n');
+      }
+      buf.write('CLS\r\n');
       for (var col = 0; col < row.length; col++) {
         final label = row[col];
-        final cellX = (col * (labelWmm + _colGapMm) * _dpmm).round();
+        // Centred on the head, so the print sits in the middle of the roll.
+        final cellX =
+            _leftDots(webWmm) +
+            (col * (labelWmm + _colGapMm) * _dpmm).round();
         final cellW = (labelWmm * _dpmm).round();
         final barcodeVal = _tsplSafe(
           label.barcode.isNotEmpty ? label.barcode : label.sku,
@@ -235,9 +272,35 @@ class LabelPrinter {
         ); // price
       }
       buf.write('PRINT 1\r\n');
+      if (snbc && !sendRaw(printerName, buf.toString())) allSent = false;
     }
-    return sendRaw(printerName, buf.toString());
+    return snbc ? allSent : sendRaw(printerName, job.toString());
   }
+
+  /// SNBC printers (seen on a TVSE LP46 Dlite with the BPLE driver) keep
+  /// their own label length and ignore TSPL SIZE. Within one job they feed
+  /// every row after the first about 10 mm off its sticker, and between
+  /// jobs the tear-off advance skips a whole sticker. So each row goes as
+  /// its own job, tear-off stays off until the last row, and the print is
+  /// moved up by [_snbcShiftMm], measured on that printer.
+  static bool _isSnbc(String printerName) {
+    final n = printerName.toLowerCase();
+    return n.contains('snbc') || n.contains('bple');
+  }
+
+  /// The label length SNBC printers keep for themselves (1 inch), in mm.
+  /// Stickers no taller than this print right in one ordinary job.
+  static const double _snbcKeptLenMm = 25.4;
+
+  /// Whether a print needs the SNBC workaround: an SNBC printer and a
+  /// sticker taller than the length it keeps.
+  static bool _needsSnbcFix(String printerName, double labelHmm) =>
+      _isSnbc(printerName) && labelHmm > _snbcKeptLenMm;
+
+  /// Vertical correction for SNBC printers, in mm (negative = up). Measured
+  /// as 12.5 mm on 35 mm stickers; it grows with how much taller the sticker
+  /// is than the 1 inch the printer keeps.
+  static double _snbcShiftMm(double labelHmm) => -(labelHmm - 22.5);
 
   /// One 2D sticker, in the shop's design: the business name large across
   /// the top; below it, product name, variant and a big price on the left
@@ -360,8 +423,10 @@ class LabelPrinter {
     double gapMm,
     double shiftMm,
   ) =>
-      'SIZE ${webWmm.round()} mm,${labelHmm.round()} mm\r\n'
-      'GAP ${gapMm.round()} mm,0 mm\r\n'
+      // A space after each comma, exactly as the TSPL manual writes them,
+      // for emulations (SNBC) that parse the line strictly.
+      'SIZE ${webWmm.round()} mm, ${labelHmm.round()} mm\r\n'
+      'GAP ${gapMm.round()} mm, 0 mm\r\n'
       'DIRECTION 1\r\n'
       'REFERENCE 0,0\r\n'
       'SHIFT ${(shiftMm * _dpmm).round()}\r\n';
@@ -406,10 +471,20 @@ class LabelPrinter {
     final h = (labelHmm * _dpmm).round();
     const m = 1 * _dpmm;
     final buf = StringBuffer()
-      ..write(_setup(webWmm, labelHmm, gapMm, shiftMm))
+      ..write(
+        _setup(
+          _pageWmm(webWmm),
+          labelHmm,
+          gapMm,
+          _needsSnbcFix(printerName, labelHmm)
+              ? _snbcShiftMm(labelHmm)
+              : shiftMm,
+        ),
+      )
       ..write('CLS\r\n');
     for (var col = 0; col < perRow; col++) {
-      final x = (col * (labelWmm + _colGapMm) * _dpmm).round();
+      final x =
+          _leftDots(webWmm) + (col * (labelWmm + _colGapMm) * _dpmm).round();
       final size =
           '${labelWmm.toStringAsFixed(0)} x ${labelHmm.toStringAsFixed(0)} mm';
       buf

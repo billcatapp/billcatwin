@@ -291,6 +291,23 @@ class _BillingScreenState extends State<BillingScreen> {
   String _salesSearchQuery = '';
   String _customerSearchQuery = '';
   List<Customer> _reportCustomers = [];
+  /// Total still owed on credit bills, for the Customers page's top card,
+  /// and the unpaid bills it adds up (who owes what).
+  double _reportCreditDue = 0;
+  List<({String name, String phone, double due})> _reportCreditRows =
+      const [];
+
+  /// Customers page: everyone, or only the customers with credit due.
+  bool _customersDueOnly = false;
+
+  /// What [c] still owes, matched to bills the way their popup matches them:
+  /// by name, or by phone when they have one.
+  double _creditDueOf(Customer c) {
+    final phone = c.phone ?? '';
+    return _reportCreditRows
+        .where((r) => r.name == c.name || (phone.isNotEmpty && r.phone == phone))
+        .fold(0.0, (s, r) => s + r.due);
+  }
   List<Customer> _savedCustomers = [];
   List<Customer> _nameAcOptions = [];
   List<Customer> _phoneAcOptions = [];
@@ -424,6 +441,10 @@ class _BillingScreenState extends State<BillingScreen> {
   Printer? _activePrinter;
   String _paperSize = 'A4';
   bool _autoPrint = false;
+  /// Whether printed bills carry the pay-by-UPI QR (Printer Settings).
+  bool _printUpiQr = true;
+  /// The shop's saved UPI IDs, to switch the bill QR between (this PC).
+  List<String> _upiIds = [];
   // Remembered state of the Print Bill dialog's toggles between opens.
   bool _sendToPrinterPref = false;
   bool _sendWhatsAppPref = false;
@@ -435,8 +456,6 @@ class _BillingScreenState extends State<BillingScreen> {
   String _barcodePrinter = 'System Default';
   /// '1d' (linear barcode) or '2d' (QR code) on printed labels.
   String _barcodeType = '1d';
-  /// Label printer position correction, mm: + moves the print down.
-  double _barcodeShiftMm = 0;
 
   // Bulk barcode print view
   Map<String, int> _bulkPrintQtys = {};
@@ -547,6 +566,9 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Group invite link, pasted from WhatsApp. Sent to customers so they can
   /// join themselves — the only route WhatsApp allows.
   String _waGroupLink = '';
+  /// Whether e-bills carry the "Join our WhatsApp group" button (needs
+  /// [_waGroupLink]). On unless the shop switched it off.
+  bool _waGroupButtonOn = true;
   String _editWaGroupLink = '';
 
   /// The approved Cloud API template the group invite is sent with, and its
@@ -608,6 +630,7 @@ class _BillingScreenState extends State<BillingScreen> {
     _loadDashboardData();
     _loadSavedCustomers();
     ConnectivityService.instance.addListener(_onSyncComplete);
+    _cartForTxId = context.read<CartProvider>()..addListener(_onCartChanged);
     _checkForUpdate();
     _wasOnlineForUpdateCheck = ConnectivityService.instance.isOnline;
     _updateCheckTimer = Timer.periodic(
@@ -689,8 +712,6 @@ class _BillingScreenState extends State<BillingScreen> {
           int.tryParse(s['barcode_per_row'] ?? '') ?? _barcodePerRow;
       _barcodePrinter = s['barcode_printer'] ?? _barcodePrinter;
       _barcodeType = s['barcode_type'] == '2d' ? '2d' : '1d';
-      _barcodeShiftMm =
-          double.tryParse(s['barcode_shift_mm'] ?? '') ?? _barcodeShiftMm;
       _printOrientation = s['print_orientation'] ?? _printOrientation;
       final savedLayout = s['invoice_layout'] ?? _invoiceLayout;
       const _validLayouts = [
@@ -726,6 +747,15 @@ class _BillingScreenState extends State<BillingScreen> {
           ? s['logo_url']!
           : metaLogoUrl);
       _autoPrint = (s['auto_print'] ?? '0') == '1';
+      _printUpiQr = (s['print_upi_qr'] ?? '1') == '1';
+      try {
+        final raw = s['upi_ids'] ?? '';
+        _upiIds = raw.isEmpty
+            ? []
+            : List<String>.from(jsonDecode(raw) as List);
+      } catch (_) {
+        _upiIds = [];
+      }
       _sendToPrinterPref = (s['print_send_to_printer'] ?? '0') == '1';
       _sendWhatsAppPref = (s['print_send_whatsapp'] ?? '0') == '1';
       _storeUpiId = s['store_upi_id'] ?? _storeUpiId;
@@ -735,6 +765,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _waPhoneNumberId = s['wa_phone_number_id'] ?? '';
       _waAccessToken = s['wa_access_token'] ?? '';
       _waGroupLink = s['wa_group_link'] ?? '';
+      _waGroupButtonOn = s['wa_group_button'] != '0';
       _summaryOpen = (s['cart_summary_open'] ?? '1') != '0';
       _waInviteTemplate = s['wa_invite_template'] ?? '';
       final lang = (s['wa_template_lang'] ?? '').trim();
@@ -1008,6 +1039,16 @@ class _BillingScreenState extends State<BillingScreen> {
       return false;
     }
     if (HardwareKeyboard.instance.isControlPressed) {
+      // Ctrl+N puts the cursor in the cart's Customer Name field, text
+      // selected so typing replaces any name already there.
+      if (key == LogicalKeyboardKey.keyN) {
+        _customerNameFocus.requestFocus();
+        _customerNameCtrl.selection = TextSelection(
+          baseOffset: 0,
+          extentOffset: _customerNameCtrl.text.length,
+        );
+        return true;
+      }
       if (key == LogicalKeyboardKey.keyB) {
         final cart = context.read<CartProvider>();
         if (cart.items.isNotEmpty && !_isPrinting) _showPrintBillDialog(cart);
@@ -1770,6 +1811,7 @@ class _BillingScreenState extends State<BillingScreen> {
     _scanFlushTimer?.cancel();
     _updateCheckTimer?.cancel();
     ConnectivityService.instance.removeListener(_onSyncComplete);
+    _cartForTxId?.removeListener(_onCartChanged);
     _searchController.dispose();
     _searchFocus.dispose();
     _customerNameCtrl.dispose();
@@ -4339,8 +4381,21 @@ class _BillingScreenState extends State<BillingScreen> {
   /// The ROUND OFF box: type the final amount to round the bill down, e.g.
   /// 1040 for a 1047 bill. Empty means the usual nearest-rupee rounding. A
   /// figure above the bill, or 0, is refused: red outline, bill unchanged.
-  Widget _roundOffBox(CartProvider cart) {
+  /// The ROUND OFF box takes the amount to come off the nearest-rupee total:
+  /// "4" or "-4" turns 1000 into 996. Returns that final total, or null when
+  /// the box is empty or the amount can't be used (0, or the whole bill or
+  /// more). The cart is still given the final figure, as before, so the tax
+  /// on a rounded bill works out exactly as it did.
+  double? _roundedFinal(CartProvider cart, String text) {
+    final t = text.trim();
+    final off = double.tryParse(t.startsWith('-') ? t.substring(1) : t);
     final normal = cart.rawTotal.roundToDouble();
+    if (off == null || off <= 0 || off >= normal) return null;
+    // Whole paise, so the saved total carries no floating-point tail.
+    return ((normal - off) * 100).round() / 100;
+  }
+
+  Widget _roundOffBox(CartProvider cart) {
     // The cart forgets a typed figure once items or the discount change;
     // clear the box to match, unless the cashier is typing in it right now.
     if (cart.roundedTo == null &&
@@ -4355,9 +4410,9 @@ class _BillingScreenState extends State<BillingScreen> {
       });
     }
     final text = _roundCtrl.text.trim();
-    final typed = double.tryParse(text);
+    // A lone "-" is the start of an amount, not a mistake.
     final bad =
-        text.isNotEmpty && (typed == null || typed <= 0 || typed > normal);
+        text.isNotEmpty && text != '-' && _roundedFinal(cart, text) == null;
     // Styled like the discount control beside it: 28px, 6px corners, a thin
     // border on white; blue when focused, red when the figure is refused.
     OutlineInputBorder border(Color c, [double w = 1]) => OutlineInputBorder(
@@ -4373,7 +4428,7 @@ class _BillingScreenState extends State<BillingScreen> {
         enabled: cart.items.isNotEmpty,
         keyboardType: const TextInputType.numberWithOptions(decimal: true),
         inputFormatters: [
-          FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d{0,2}')),
+          FilteringTextInputFormatter.allow(RegExp(r'^-?\d*\.?\d{0,2}')),
         ],
         textAlign: TextAlign.right,
         style: GoogleFonts.inter(
@@ -4381,24 +4436,21 @@ class _BillingScreenState extends State<BillingScreen> {
           fontWeight: FontWeight.w600,
           color: AppColors.textDark,
         ),
-        onChanged: (v) {
-          final x = double.tryParse(v.trim());
-          cart.setRoundedTotal(x != null && x > 0 && x <= normal ? x : null);
-        },
+        onChanged: (v) => cart.setRoundedTotal(_roundedFinal(cart, v)),
         // Enter puts the cursor back on the search box for the next item.
         onSubmitted: (_) => _searchFocus.requestFocus(),
         decoration: InputDecoration(
-          hintText: 'final',
+          hintText: 'off',
           hintStyle: GoogleFonts.inter(
             fontSize: 11.5,
             color: AppColors.textMuted.withValues(alpha: 0.6),
           ),
           // A prefix icon, not prefixText: prefixText only appears once the
-          // box is focused.
+          // box is focused. "−₹": what's typed comes off the total.
           prefixIcon: Padding(
             padding: const EdgeInsets.only(left: 8, right: 2),
             child: Text(
-              _currencySymbol,
+              '−$_currencySymbol',
               style: GoogleFonts.inter(
                 fontSize: 12,
                 color: AppColors.textMuted,
@@ -4756,8 +4808,13 @@ class _BillingScreenState extends State<BillingScreen> {
                   onPressed: cart.items.isEmpty
                       ? null
                       : () {
+                          // The customer goes with the bill, the same as when
+                          // a bill is closed — it used to stay filled in.
+                          _customerNameCtrl.clear();
+                          _customerPhoneCtrl.clear();
                           cart.clearCart();
                           _pendingInvoiceNumber = null;
+                          _pendingTxId = null;
 
                         },
                   icon: const Icon(Icons.delete_sweep_outlined, size: 16),
@@ -4880,6 +4937,7 @@ class _BillingScreenState extends State<BillingScreen> {
   // Every billing shortcut, in the order a cashier meets them. Keep this in
   // step with _handleGlobalKey — it is the only place they are written down.
   static const List<(String, String)> _billingShortcuts = [
+    ('Ctrl + N', 'Customer name'),
     ('Ctrl + B', 'Print Bill'),
     ('Ctrl + C', 'Paid - Close Bill'),
     ('Ctrl + P', 'Next payment method'),
@@ -10646,6 +10704,54 @@ class _BillingScreenState extends State<BillingScreen> {
             (v) => setState(() => _editWaGroupLink = v),
             hint: 'https://chat.whatsapp.com/...',
           ),
+          _settingsDivider(),
+          // Right under the link it uses: whether e-bills carry the group
+          // button. Saved at once; has nothing to send without a link.
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Group button on e-bills',
+                        style: GoogleFonts.inter(
+                          fontSize: 13.5,
+                          color: const Color(0xFF3C3C43),
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        _editWaGroupLink.trim().isEmpty
+                            ? 'Add the group invite link above to use it'
+                            : '"Join our WhatsApp group" under View Bill',
+                        style: GoogleFonts.inter(
+                          fontSize: 11,
+                          color: const Color(0xFF6E6E73),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value:
+                      _waGroupButtonOn && _editWaGroupLink.trim().isNotEmpty,
+                  activeThumbColor: Colors.white,
+                  activeTrackColor: AppColors.primary,
+                  onChanged: _editWaGroupLink.trim().isEmpty
+                      ? null
+                      : (v) {
+                          setState(() => _waGroupButtonOn = v);
+                          LocalDbService.saveSettings({
+                            'wa_group_button': v ? '1' : '0',
+                          });
+                        },
+                ),
+              ],
+            ),
+          ),
         ]),
       ],
     );
@@ -11289,6 +11395,16 @@ class _BillingScreenState extends State<BillingScreen> {
     // Regular = A4/A5, Thermal = 80mm roll (stored as a thermal paper size).
     bool isThermal = !['A4', 'A5'].contains(paper);
     bool autoPrint = _autoPrint;
+    // The UPI ID printed as the bill QR, chosen from the saved ones; empty
+    // = None (no QR on the bill).
+    final upiList = <String>[
+      ..._upiIds,
+      if (_storeUpiId.trim().isNotEmpty && !_upiIds.contains(_storeUpiId.trim()))
+        _storeUpiId.trim(),
+    ];
+    var chosenUpi = _printUpiQr ? _storeUpiId.trim() : '';
+    final addUpiCtrl = TextEditingController();
+    var addingUpi = false;
 
     Widget printerRow(
       String name, {
@@ -11616,40 +11732,202 @@ class _BillingScreenState extends State<BillingScreen> {
                   const Divider(height: 1, color: AppColors.border),
                   const SizedBox(height: 16),
 
-                  // Auto-print toggle
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                  // Which UPI ID the bill's pay-by-UPI QR uses, picked from
+                  // the shop's saved IDs; None prints no QR. (Auto-print was
+                  // removed: closing a bill only saves it; PRINT BILL prints.)
+                  _dialogSectionLabel('UPI ID ON BILL'),
+                  const SizedBox(height: 10),
+                  // One field that opens upward (it sits at the bottom of the
+                  // window): the saved UPI IDs, None, and Add UPI ID. The
+                  // bill's pay-by-UPI QR is generated from the one chosen.
+                  Builder(
+                    builder: (_) {
+                      void addTyped() {
+                        final id = addUpiCtrl.text.trim();
+                        // A UPI ID is name@bank: one @, nothing blank.
+                        if (!RegExp(r'^[\w.\-]+@[\w.\-]+$').hasMatch(id)) {
+                          _showToast(
+                            'Enter a UPI ID like name@bank',
+                            isError: true,
+                          );
+                          return;
+                        }
+                        setLocal(() {
+                          if (!upiList.contains(id)) upiList.add(id);
+                          chosenUpi = id;
+                          addingUpi = false;
+                          addUpiCtrl.clear();
+                        });
+                      }
+
+                      if (addingUpi) {
+                        return Row(
                           children: [
-                            Text(
-                              'Auto-print on Close Bill',
-                              style: GoogleFonts.inter(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w500,
-                                color: AppColors.textDark,
+                            Expanded(
+                              child: TextField(
+                                controller: addUpiCtrl,
+                                autofocus: true,
+                                style: GoogleFonts.inter(fontSize: 13),
+                                onSubmitted: (_) => addTyped(),
+                                decoration: _dlgInputDecor(
+                                  'New UPI ID, e.g. name@bank',
+                                ),
                               ),
                             ),
-                            Text(
-                              'Automatically print receipt when bill is closed',
-                              style: GoogleFonts.inter(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w300,
-                                color: AppColors.textMuted,
+                            const SizedBox(width: 8),
+                            TextButton(
+                              onPressed: () =>
+                                  setLocal(() => addingUpi = false),
+                              child: const Text('Cancel'),
+                            ),
+                            ElevatedButton(
+                              onPressed: addTyped,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: AppColors.primary,
+                                foregroundColor: Colors.white,
+                                elevation: 0,
                               ),
+                              child: const Text('Add'),
                             ),
                           ],
+                        );
+                      }
+
+                      // Menu rows: None, each saved ID, then Add. Its height
+                      // decides how far up it opens.
+                      final rows = upiList.length + 2;
+                      return PopupMenuButton<String>(
+                        tooltip: '',
+                        position: PopupMenuPosition.over,
+                        offset: Offset(0, -(rows * 44.0 + 12)),
+                        constraints: const BoxConstraints(
+                          minWidth: 384,
+                          maxWidth: 384,
                         ),
-                      ),
-                      Switch(
-                        value: autoPrint,
-                        onChanged: (v) => setLocal(() => autoPrint = v),
-                        activeThumbColor: Colors.white,
-                        activeTrackColor: AppColors.primary,
-                      ),
-                    ],
+                        color: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        onSelected: (v) => setLocal(() {
+                          if (v == '\u0001add') {
+                            addingUpi = true;
+                          } else {
+                            chosenUpi = v;
+                          }
+                        }),
+                        itemBuilder: (_) => [
+                          for (final v in ['', ...upiList])
+                            PopupMenuItem<String>(
+                              value: v,
+                              height: 44,
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    chosenUpi == v
+                                        ? Icons.radio_button_checked
+                                        : Icons.radio_button_unchecked,
+                                    size: 16,
+                                    color: chosenUpi == v
+                                        ? AppColors.primary
+                                        : AppColors.textMuted,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      v.isEmpty ? 'None — no QR on bill' : v,
+                                      style: GoogleFonts.inter(
+                                        fontSize: 13,
+                                        color: AppColors.textDark,
+                                      ),
+                                    ),
+                                  ),
+                                  // A saved ID can be removed while not in use.
+                                  if (v.isNotEmpty && chosenUpi != v)
+                                    InkWell(
+                                      onTap: () {
+                                        Navigator.pop(ctx);
+                                        setLocal(() => upiList.remove(v));
+                                      },
+                                      child: const Padding(
+                                        padding: EdgeInsets.all(4),
+                                        child: Icon(
+                                          Icons.close_rounded,
+                                          size: 15,
+                                          color: AppColors.textMuted,
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          PopupMenuItem<String>(
+                            value: '\u0001add',
+                            height: 44,
+                            child: Row(
+                              children: [
+                                const Icon(
+                                  Icons.add_rounded,
+                                  size: 16,
+                                  color: AppColors.accentBlue,
+                                ),
+                                const SizedBox(width: 10),
+                                Text(
+                                  'Add UPI ID',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: AppColors.accentBlue,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                        child: Container(
+                          height: 44,
+                          padding: const EdgeInsets.symmetric(horizontal: 14),
+                          decoration: BoxDecoration(
+                            color: AppColors.surfaceVariant,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: AppColors.border),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.qr_code_2_rounded,
+                                size: 18,
+                                color: chosenUpi.isEmpty
+                                    ? AppColors.textMuted
+                                    : AppColors.primary,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  chosenUpi.isEmpty
+                                      ? 'None — no QR on bill'
+                                      : chosenUpi,
+                                  style: GoogleFonts.inter(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: chosenUpi.isEmpty
+                                        ? AppColors.textMuted
+                                        : AppColors.textDark,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              const Icon(
+                                Icons.keyboard_arrow_up_rounded,
+                                size: 18,
+                                color: AppColors.textMuted,
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
                   ),
+
 
                   const SizedBox(height: 24),
 
@@ -11672,11 +11950,20 @@ class _BillingScreenState extends State<BillingScreen> {
                               _selectedPrinter = printerName;
                               _paperSize = paper;
                               _autoPrint = autoPrint;
+                              _printUpiQr = chosenUpi.isNotEmpty;
+                              _upiIds = upiList;
+                              if (chosenUpi.isNotEmpty) {
+                                _storeUpiId = chosenUpi;
+                                _editStoreUpiId = chosenUpi;
+                              }
                             });
                             LocalDbService.saveSettings({
                               'selected_printer': printerName,
                               'paper_size': paper,
                               'auto_print': autoPrint ? '1' : '0',
+                              'print_upi_qr': chosenUpi.isNotEmpty ? '1' : '0',
+                              'upi_ids': jsonEncode(upiList),
+                              if (chosenUpi.isNotEmpty) 'store_upi_id': chosenUpi,
                             });
                             Navigator.pop(ctx);
                             _printRecord(
@@ -11715,11 +12002,20 @@ class _BillingScreenState extends State<BillingScreen> {
                               _selectedPrinter = printerName;
                               _paperSize = paper;
                               _autoPrint = autoPrint;
+                              _printUpiQr = chosenUpi.isNotEmpty;
+                              _upiIds = upiList;
+                              if (chosenUpi.isNotEmpty) {
+                                _storeUpiId = chosenUpi;
+                                _editStoreUpiId = chosenUpi;
+                              }
                             });
                             LocalDbService.saveSettings({
                               'selected_printer': printerName,
                               'paper_size': paper,
                               'auto_print': autoPrint ? '1' : '0',
+                              'print_upi_qr': chosenUpi.isNotEmpty ? '1' : '0',
+                              'upi_ids': jsonEncode(upiList),
+                              if (chosenUpi.isNotEmpty) 'store_upi_id': chosenUpi,
                             });
                             Navigator.pop(ctx);
                           },
@@ -11818,7 +12114,9 @@ class _BillingScreenState extends State<BillingScreen> {
     String? invoiceNumber,
     double balanceDue = 0,
   }) => TransactionRecord(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        // The id the bill will be saved with (see [_pendingTxId]), so the
+        // e-bill's View Bill link matches the saved sale.
+        id: _reserveTxId(),
         // Same number the saved bill will carry, so the printed preview and
         // the sale that lands in the list show one invoice number.
         invoiceNumber: invoiceNumber,
@@ -11864,6 +12162,23 @@ class _BillingScreenState extends State<BillingScreen> {
   /// the bill is printed and reused at checkout, so the number on the printed
   /// receipt always matches the saved sale. Cleared when closed or cleared.
   String? _pendingInvoiceNumber;
+
+  /// Record id for the bill currently being rung up, reserved the first time
+  /// it is printed or sent and saved with it at checkout. The e-bill's View
+  /// Bill link is built from this id, so a bill sent before it is closed
+  /// opens once it is saved. Kept and cleared with [_pendingInvoiceNumber].
+  String? _pendingTxId;
+  String _reserveTxId() => _pendingTxId ??= const Uuid().v4();
+
+  /// The cart watched by [_onCartChanged].
+  CartProvider? _cartForTxId;
+
+  /// A bill emptied any way other than CLEAR BILL (its lines removed one by
+  /// one) is gone: its reserved id is dropped, so it never passes to the next
+  /// customer's bill — whose View Bill link it would otherwise share.
+  void _onCartChanged() {
+    if (_cartForTxId?.items.isEmpty ?? false) _pendingTxId = null;
+  }
 
   // ── Return / exchange ────────────────────────────────────────────────────
   //
@@ -13663,7 +13978,8 @@ class _BillingScreenState extends State<BillingScreen> {
         layout: _invoiceLayout,
         storeTerms: _storeTerms,
         logoPath: _logoPath,
-        storeUpiId: _storeUpiId,
+        // Off in Printer Settings: the bill prints without the UPI QR.
+        storeUpiId: _printUpiQr ? _storeUpiId : '',
         docType: docType,
       );
 
@@ -13710,7 +14026,8 @@ class _BillingScreenState extends State<BillingScreen> {
             taxLabel: _taxLabel,
             taxRate: _taxRateDisplay,
             currencySymbol: _currencySymbol,
-            storeUpiId: _storeUpiId,
+            // Off in Printer Settings: the bill prints without the UPI QR.
+            storeUpiId: _printUpiQr ? _storeUpiId : '',
             logo: logo,
           );
           final printed = ThermalPrinter.rawPrint(target.name, escBytes);
@@ -13770,16 +14087,11 @@ class _BillingScreenState extends State<BillingScreen> {
   );
 
   void _closeBill(BuildContext context, CartProvider cart) {
-    bool sendWaAfterClose = false;
     // Guards against a doubled Enter checking the bill out twice.
     bool submitted = false;
     // On for every bill unless switched off here. Off keeps the bill out of
     // the GST page and its exports; nothing else about it changes.
     bool gstBilled = true;
-    final hasPhone = cart.customerPhone.isNotEmpty;
-    // Every signed-in shop can send e-bills, from the WhatsApp number built
-    // into BillCat (through the relay).
-    const hasWa = true;
     final paidCtrl = TextEditingController(text: cart.total.toStringAsFixed(2));
     final paidFocus = FocusNode();
 
@@ -13830,7 +14142,9 @@ class _BillingScreenState extends State<BillingScreen> {
               invoiceNumber: invNum,
               balanceDue: balanceDue,
             );
-            final phone = cart.customerPhone;
+            // Saved under the id its printed copy / e-bill link carry.
+            final txId = snapshot.id;
+            _pendingTxId = null;
             Navigator.pop(ctx);
             try {
               await cart.checkout(
@@ -13838,6 +14152,7 @@ class _BillingScreenState extends State<BillingScreen> {
                 amountPaid: paid,
                 salesperson: _salesperson,
                 gstBilled: gstBilled,
+                id: txId,
               );
 
             } catch (e) {
@@ -13845,6 +14160,7 @@ class _BillingScreenState extends State<BillingScreen> {
               // cart and the number intact for a clean retry and tell the
               // user, instead of leaving a dead-looking button.
               _pendingInvoiceNumber = invNum;
+              _pendingTxId = txId;
               // Guard on the State, not on `context`: that one belongs to
               // the cart's Consumer, which is unmounted whenever the view
               // swaps (opening Settings mid-checkout) — and dropping the
@@ -13863,13 +14179,9 @@ class _BillingScreenState extends State<BillingScreen> {
             _loadDashboardData();
             if (!context.mounted) return;
             _showToast('Payment successful!');
-            if (_autoPrint) {
-              await _printRecord(snapshot, amountTendered: paid);
-            }
+            // Closing a bill only saves it; receipts print from PRINT BILL.
+            // (Auto-print on close was removed at the owner's request.)
             _autoSavePdf(snapshot, amountTendered: paid);
-            if (sendWaAfterClose) {
-              _sendInvoiceViaWhatsApp(snapshot, phone);
-            }
           }
 
           _dialogEnterAction = confirm;
@@ -14114,64 +14426,6 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                 ),
               ],
-              if (hasPhone && hasWa) ...[
-                const SizedBox(height: 14),
-                InkWell(
-                  onTap: () =>
-                      setLocal(() => sendWaAfterClose = !sendWaAfterClose),
-                  borderRadius: BorderRadius.circular(8),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                    decoration: BoxDecoration(
-                      color: sendWaAfterClose
-                          ? const Color(0xFF25D366).withValues(alpha: 0.08)
-                          : const Color(0xFFF5F5F5),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: sendWaAfterClose
-                            ? const Color(0xFF25D366)
-                            : const Color(0xFFE0E0E0),
-                      ),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.chat_bubble_outline_rounded,
-                          size: 15,
-                          color: sendWaAfterClose
-                              ? const Color(0xFF1AAD56)
-                              : AppColors.textMuted,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            'Send invoice via WhatsApp',
-                            style: GoogleFonts.inter(
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w500,
-                              color: sendWaAfterClose
-                                  ? const Color(0xFF1AAD56)
-                                  : AppColors.textMuted,
-                            ),
-                          ),
-                        ),
-                        Switch(
-                          value: sendWaAfterClose,
-                          onChanged: (v) =>
-                              setLocal(() => sendWaAfterClose = v),
-                          activeTrackColor: const Color(0xFF25D366),
-                          activeThumbColor: Colors.white,
-                          materialTapTargetSize:
-                              MaterialTapTargetSize.shrinkWrap,
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
             ],
           ),
           actions: [
@@ -14242,16 +14496,21 @@ class _BillingScreenState extends State<BillingScreen> {
         _pendingInvoiceNumber ?? await LocalDbService.nextInvoiceNumber();
     _pendingInvoiceNumber = null;
     final snapshot = _snapshotCart(cart, invoiceNumber: invNum);
+    // Saved under the id its printed copy / e-bill link carry.
+    final txId = snapshot.id;
+    _pendingTxId = null;
     final phone = cart.customerPhone;
     try {
       await cart.checkout(
         invoiceNumber: invNum,
         amountPaid: total,
         salesperson: _salesperson,
+        id: txId,
       );
 
     } catch (e) {
       _pendingInvoiceNumber = invNum;
+      _pendingTxId = txId;
       if (!mounted) return;
       _showToast('Could not save the bill: $e', isError: true);
       return;
@@ -14376,12 +14635,15 @@ class _BillingScreenState extends State<BillingScreen> {
         docType: docType,
         invoiceLink: invoiceLink,
         dialCode: dial.isEmpty ? '91' : dial,
-        groupLink: _waGroupLink,
+        groupLink: _waGroupButtonOn ? _waGroupLink : '',
       );
       if (mounted) {
         _showToast(
           ok
               ? 'Invoice sent via WhatsApp!'
+              // No internet: just say so, not the socket error.
+              : svc.offline
+              ? _wa.WhatsAppService.offlineMessage
               : 'WhatsApp send failed: ${svc.lastError ?? 'unknown error'}',
           isError: !ok,
         );
@@ -14687,16 +14949,6 @@ class _BillingScreenState extends State<BillingScreen> {
       ),
     );
     final perRowCtrl = TextEditingController(text: '$_barcodePerRow');
-    // Position correction; saved as it is typed, so the next print uses it.
-    final shiftCtrl = TextEditingController(
-      text: _barcodeShiftMm == 0 ? '0' : _barcodeShiftMm.toString(),
-    );
-    shiftCtrl.addListener(() {
-      final v = double.tryParse(shiftCtrl.text.trim());
-      if (v == null || v < -10 || v > 10 || v == _barcodeShiftMm) return;
-      _barcodeShiftMm = v;
-      LocalDbService.saveSettings({'barcode_shift_mm': v.toString()});
-    });
     final searchCtrl = TextEditingController();
     final qtys = Map<String, int>.from(_bulkPrintQtys);
     final selected = Map<String, bool>.from(_bulkPrintSelected);
@@ -15361,7 +15613,6 @@ class _BillingScreenState extends State<BillingScreen> {
                     labelWCtrl: labelWCtrl,
                     labelHCtrl: labelHCtrl,
                     perRowCtrl: perRowCtrl,
-                    shiftCtrl: shiftCtrl,
                     printers: printers,
                     printer: printer,
                     onPrinter: (v) => setLocal(() => printer = v),
@@ -15394,7 +15645,6 @@ class _BillingScreenState extends State<BillingScreen> {
     required TextEditingController labelWCtrl,
     required TextEditingController labelHCtrl,
     required TextEditingController perRowCtrl,
-    required TextEditingController shiftCtrl,
     required List<String> printers,
     required String printer,
     required ValueChanged<String> onPrinter,
@@ -15524,7 +15774,17 @@ class _BillingScreenState extends State<BillingScreen> {
                 label('Per row'),
                 const SizedBox(width: 10),
                 _miniNumField(perRowCtrl, '', 50),
-                const SizedBox(width: 20),
+              ],
+            ),
+            const SizedBox(height: 12),
+            // Printer, with the test label beside it on TSPL printers: the
+            // test label shows where the print lands on the stickers. (No
+            // calibrate here: its GAPDETECT command froze this printer —
+            // calibration is done from the printer itself.)
+            Row(
+              children: [
+                label('Printer'),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Container(
                     padding: const EdgeInsets.symmetric(
@@ -15584,30 +15844,8 @@ class _BillingScreenState extends State<BillingScreen> {
                     ),
                   ),
                 ),
-              ],
-            ),
-            if (canCalibrate) ...[
-              const SizedBox(height: 12),
-              const Divider(height: 1, color: AppColors.border),
-              const SizedBox(height: 12),
-              // Label position on the sticker: the test label shows where the
-              // print lands; Position nudges it down (+) or up (−) in mm.
-              // (No calibrate here: its GAPDETECT command froze this
-              // printer — calibration is done from the printer itself.)
-              Row(
-                children: [
-                  label('Position (mm)'),
+                if (canCalibrate) ...[
                   const SizedBox(width: 10),
-                  _miniNumField(shiftCtrl, '', 50),
-                  const SizedBox(width: 6),
-                  Text(
-                    '+ down  − up',
-                    style: GoogleFonts.inter(
-                      fontSize: 10.5,
-                      color: AppColors.textMuted,
-                    ),
-                  ),
-                  const Spacer(),
                   OutlinedButton.icon(
                     onPressed: () {
                       final ok = LabelPrinter.printTestLabel(
@@ -15617,7 +15855,6 @@ class _BillingScreenState extends State<BillingScreen> {
                         labelHmm:
                             double.tryParse(labelHCtrl.text) ?? _barcodeLabelH,
                         perRow: int.tryParse(perRowCtrl.text) ?? _barcodePerRow,
-                        shiftMm: _barcodeShiftMm,
                       );
                       _showToast(
                         ok
@@ -15648,8 +15885,8 @@ class _BillingScreenState extends State<BillingScreen> {
                     ),
                   ),
                 ],
-              ),
-            ],
+              ],
+            ),
           ],
         ),
       ),
@@ -15723,9 +15960,9 @@ class _BillingScreenState extends State<BillingScreen> {
     final bold = pw.Font.ttf(boldData);
 
     final doc = pw.Document();
-    // labelW x labelH = ONE sticker; page = perRow stickers + gaps + side margins
-    const gapMm = 0.5;
-    const marginMm = 2.0;
+    // labelW x labelH = ONE sticker; page = exactly perRow stickers, no margins/gaps
+    const gapMm = 0.0;
+    const marginMm = 0.0;
     final gap = gapMm * PdfPageFormat.mm;
     final margin = marginMm * PdfPageFormat.mm;
     final cellW = labelW * PdfPageFormat.mm;
@@ -15975,7 +16212,6 @@ class _BillingScreenState extends State<BillingScreen> {
                                 currencySymbol: _currencySymbol,
                                 storeName: _storeName,
                                 qr: qr,
-                                shiftMm: _barcodeShiftMm,
                               );
                             } else {
                               ok = await Printing.directPrintPdf(
@@ -17404,9 +17640,9 @@ class _BillingScreenState extends State<BillingScreen> {
     final bold = pw.Font.ttf(boldData);
 
     final doc = pw.Document();
-    // labelW x labelH = ONE sticker; page = perRow stickers + gaps + side margins
-    const gapMm = 0.5;
-    const marginMm = 2.0;
+    // labelW x labelH = ONE sticker; page = exactly perRow stickers, no margins/gaps
+    const gapMm = 0.0;
+    const marginMm = 0.0;
     final gap = gapMm * PdfPageFormat.mm;
     final margin = marginMm * PdfPageFormat.mm;
     final cellW = labelW * PdfPageFormat.mm;
@@ -17575,9 +17811,9 @@ class _BillingScreenState extends State<BillingScreen> {
                     child: ElevatedButton.icon(
                       onPressed: () async {
                         Navigator.pop(ctx);
-                        // Sheet dimensions: side margins + perRow stickers + gaps
-                        const gapMm = 0.5;
-                        const marginMm = 2.0;
+                        // Sheet = exactly the entered size: perRow stickers, no margins/gaps
+                        const gapMm = 0.0;
+                        const marginMm = 0.0;
                         final sheetW =
                             marginMm * 2 +
                             labelsPerRow * labelW +
@@ -17634,7 +17870,6 @@ class _BillingScreenState extends State<BillingScreen> {
                                 currencySymbol: _currencySymbol,
                                 storeName: _storeName,
                                 qr: qr,
-                                shiftMm: _barcodeShiftMm,
                               );
                             } else {
                               ok = await Printing.directPrintPdf(
@@ -25504,7 +25739,12 @@ class _BillingScreenState extends State<BillingScreen> {
                   children: [
                     _pdfCell(t.createdAt.toString().substring(0, 16), regular),
                     _pdfCell(t.displayInvoice, regular),
-                    _pdfCell(t.customerName ?? '—', regular),
+                    _pdfCell(
+                      (t.customerName ?? '').trim().isEmpty
+                          ? 'WALK IN'
+                          : t.customerName!,
+                      regular,
+                    ),
                     _pdfCell(t.paymentMethod, regular),
                     _pdfCell(g == null ? '—' : _fmt(g.taxable), regular),
                     _pdfCell(g == null ? '—' : _fmt(g.tax / 2), regular),
@@ -27593,7 +27833,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       children: [
                         cell(_gstShortDateTime(r.date), 3),
                         cell(r.invoice, 3, bold: true),
-                        cell(r.customer.isEmpty ? '—' : r.customer, 4),
+                        cell(r.customer.isEmpty ? 'WALK IN' : r.customer, 4),
                         cell(_gstRatesLabel(r.rates), 2, right: true),
                         cell(_fmt(r.taxable), 3, right: true),
                         cell(_fmt(r.tax / 2), 3, right: true),
@@ -28360,7 +28600,14 @@ class _BillingScreenState extends State<BillingScreen> {
 
   Future<void> _loadReportCustomers() async {
     final customers = await LocalDbService.getCustomers();
-    if (mounted) setState(() => _reportCustomers = customers);
+    final creditRows = await LocalDbService.creditDueRows();
+    if (mounted) {
+      setState(() {
+        _reportCustomers = customers;
+        _reportCreditRows = creditRows;
+        _reportCreditDue = creditRows.fold(0.0, (s, r) => s + r.due);
+      });
+    }
   }
 
   /// Sales page: every bill, or only bills marked "GST billed" at Confirm
@@ -28513,17 +28760,11 @@ class _BillingScreenState extends State<BillingScreen> {
         ? span(now.subtract(Duration(days: now.weekday - 1)), now)
         : '${_monthName(now.month)} ${now.year}';
 
+    // Grouped like the bill rows below: lakh/crore for ₹ (₹5,71,287.00).
     String fmtAmt(double v) {
-      final parts = v.abs().toStringAsFixed(2).split('.');
-      final intPart = parts[0];
-      final buf = StringBuffer();
-      for (int i = 0; i < intPart.length; i++) {
-        if (i > 0 && (intPart.length - i) % 3 == 0) buf.write(',');
-        buf.write(intPart[i]);
-      }
+      final s = _moneyFmt(_currencySymbol, v.abs());
       // Sign goes before the currency symbol, not inside the grouped digits.
-      final sign = v < 0 ? '-' : '';
-      return '$sign$_currencySymbol$buf.${parts[1]}';
+      return v < 0 ? '-$s' : s;
     }
 
     String fmtDate(DateTime dt) {
@@ -28790,7 +29031,7 @@ class _BillingScreenState extends State<BillingScreen> {
                     final isNegative = t.total < 0;
                     final customer = (t.customerName?.isNotEmpty == true)
                         ? t.customerName!
-                        : '—';
+                        : 'WALK IN';
                     final payLabel =
                         {
                           'cash': 'Cash',
@@ -29530,6 +29771,14 @@ class _BillingScreenState extends State<BillingScreen> {
                         ],
                       ),
                     ),
+                    // Rounded down by hand in the cart's ROUND OFF box: the
+                    // same line, and the same ₹0.50 rule, as the printed bill
+                    // (the automatic nearest-rupee rounding isn't shown).
+                    if (total - (t.subtotal - t.discountAmount) <= -0.5)
+                      _txDetailRow(
+                        'Round off',
+                        '-${_fmt((t.subtotal - t.discountAmount) - total)}',
+                      ),
                     const SizedBox(height: 6),
                     Row(
                       children: [
@@ -29781,6 +30030,8 @@ class _BillingScreenState extends State<BillingScreen> {
     final txs = await LocalDbService.getTransactionsByCustomer(c.name, c.phone);
     if (!mounted) return;
     final totalSpent = txs.fold<double>(0, (s, t) => s + t.total);
+    // What this customer still owes across their credit bills.
+    final creditDue = txs.fold<double>(0, (s, t) => s + t.balanceDue);
 
     showDialog(
       context: context,
@@ -29854,6 +30105,45 @@ class _BillingScreenState extends State<BillingScreen> {
                             color: AppColors.textMuted,
                           ),
                         ),
+                        if (creditDue > 0.005) ...[
+                          const SizedBox(height: 6),
+                          // Opens the customer's credit bills to clear them.
+                          InkWell(
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showCreditBills(c, txs);
+                            },
+                            borderRadius: BorderRadius.circular(20),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFFEF3C7),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    'Credit due ${_fmt(creditDue)}',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                      color: const Color(0xFF92400E),
+                                    ),
+                                  ),
+                                  const Icon(
+                                    Icons.chevron_right_rounded,
+                                    size: 14,
+                                    color: Color(0xFF92400E),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ],
@@ -29995,6 +30285,17 @@ class _BillingScreenState extends State<BillingScreen> {
                                             ),
                                           ),
                                         ),
+                                        if (t.isCredit) ...[
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            'Due ${_fmt(t.balanceDue)}',
+                                            style: GoogleFonts.inter(
+                                              fontSize: 10.5,
+                                              fontWeight: FontWeight.w700,
+                                              color: const Color(0xFF92400E),
+                                            ),
+                                          ),
+                                        ],
                                       ],
                                     ),
                                     const SizedBox(width: 6),
@@ -30116,6 +30417,247 @@ class _BillingScreenState extends State<BillingScreen> {
         ),
       ),
     );
+  }
+
+  /// A customer's unpaid credit bills, each clearable once paid back. Closing
+  /// returns to the customer popup, reread so its totals are current.
+  void _showCreditBills(Customer c, List<TransactionRecord> txs) {
+    final open = txs.where((t) => t.isCredit).toList();
+    bool busy = false;
+
+    Future<void> clear(
+      List<TransactionRecord> bills,
+      void Function(void Function()) setLocal,
+    ) async {
+      if (busy || bills.isEmpty) return;
+      setLocal(() => busy = true);
+      try {
+        for (final t in bills) {
+          await LocalDbService.clearTransactionCredit(t.id);
+        }
+        setLocal(() {
+          open.removeWhere((t) => bills.any((b) => b.id == t.id));
+          busy = false;
+        });
+        ConnectivityService.instance.syncNow();
+        _loadDashboardData();
+        // The Customers page's Credit Due card drops by what was cleared.
+        _loadReportCustomers();
+        _showToast(
+          bills.length == 1 ? 'Credit cleared' : 'All credit cleared',
+        );
+      } catch (e) {
+        setLocal(() => busy = false);
+        _showToast('Could not clear credit: $e', isError: true);
+      }
+    }
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          final due = open.fold<double>(0, (s, t) => s + t.balanceDue);
+          return Dialog(
+            backgroundColor: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: SizedBox(
+              width: 480,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 16),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Credit Bills',
+                                style: GoogleFonts.manrope(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w800,
+                                  color: AppColors.textDark,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                c.name,
+                                style: GoogleFonts.inter(
+                                  fontSize: 12,
+                                  color: AppColors.textMuted,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text(
+                              _fmt(due),
+                              style: GoogleFonts.manrope(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w800,
+                                color: const Color(0xFF92400E),
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              'total due',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                color: AppColors.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1, color: AppColors.border),
+                  if (open.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 32),
+                      child: Center(
+                        child: Text(
+                          'No credit due',
+                          style: GoogleFonts.inter(
+                            fontSize: 13,
+                            color: AppColors.textMuted,
+                          ),
+                        ),
+                      ),
+                    )
+                  else
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 340),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          children: [
+                            for (final t in open) ...[
+                              // Tap the bill for its full invoice details.
+                              InkWell(
+                                onTap: () => _showTransactionDetail(t),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 24,
+                                    vertical: 12,
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              t.invoiceNumber ?? '—',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 12.5,
+                                                fontWeight: FontWeight.w600,
+                                                color: AppColors.textDark,
+                                              ),
+                                            ),
+                                            const SizedBox(height: 3),
+                                            Text(
+                                              '${_fmtDate(t.createdAt)} · '
+                                              'Bill ${_fmt(t.total)}',
+                                              style: GoogleFonts.inter(
+                                                fontSize: 11.5,
+                                                color: AppColors.textMuted,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      Text(
+                                        'Due ${_fmt(t.balanceDue)}',
+                                        style: GoogleFonts.manrope(
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w700,
+                                          color: const Color(0xFF92400E),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      OutlinedButton(
+                                        onPressed: busy
+                                            ? null
+                                            : () => clear([t], setLocal),
+                                        style: OutlinedButton.styleFrom(
+                                          foregroundColor: AppColors.primary,
+                                          side: const BorderSide(
+                                            color: AppColors.border,
+                                          ),
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 12,
+                                          ),
+                                          minimumSize: const Size(0, 32),
+                                        ),
+                                        child: Text(
+                                          'Clear',
+                                          style: GoogleFonts.inter(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      const Icon(
+                                        Icons.chevron_right_rounded,
+                                        size: 16,
+                                        color: AppColors.textMuted,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const Divider(
+                                height: 1,
+                                color: AppColors.border,
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+                    child: Row(
+                      children: [
+                        if (open.length > 1)
+                          ElevatedButton(
+                            onPressed: busy
+                                ? null
+                                : () => clear(List.of(open), setLocal),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.primary,
+                              foregroundColor: Colors.white,
+                              elevation: 0,
+                            ),
+                            child: const Text('Clear All'),
+                          ),
+                        const Spacer(),
+                        OutlinedButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          child: const Text('Close'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    ).then((_) {
+      // Back to the customer, with the cleared bills reread.
+      if (mounted) _showCustomerDetail(c);
+    });
   }
 
   Widget _custStatChip(IconData icon, String label) {
@@ -30356,6 +30898,23 @@ class _BillingScreenState extends State<BillingScreen> {
               Icons.person_add_alt_1_outlined,
               const Color(0xFF8B5CF6),
             ),
+            const SizedBox(width: 16),
+            // What customers still owe on credit bills, all of them. Tap:
+            // the list below shows only the customers who owe.
+            _reportSummaryCard(
+              'Credit Due',
+              _fmt(_reportCreditDue),
+              Icons.account_balance_wallet_outlined,
+              const Color(0xFFF59E0B),
+              currencyIcon: _currencySymbol,
+              onTap: () =>
+                  setState(() => _customersDueOnly = !_customersDueOnly),
+              tooltip: _customersDueOnly
+                  ? 'Showing customers with credit due — tap for everyone'
+                  : 'Tap to show customers with credit due',
+              highlighted: _customersDueOnly,
+              actionLabel: _customersDueOnly ? 'Show everyone' : 'Show all',
+            ),
           ],
         ),
         const SizedBox(height: 24),
@@ -30384,7 +30943,9 @@ class _BillingScreenState extends State<BillingScreen> {
                           ),
                         ),
                         Text(
-                          '${_reportCustomers.length} records',
+                          _customersDueOnly
+                              ? '${_reportCustomers.where((c) => _creditDueOf(c) > 0.005).length} with credit due'
+                              : '${_reportCustomers.length} records',
                           style: GoogleFonts.inter(
                             fontSize: 12,
                             fontWeight: FontWeight.w300,
@@ -30489,6 +31050,10 @@ class _BillingScreenState extends State<BillingScreen> {
                     Expanded(flex: 4, child: _dashColHeader('NAME')),
                     Expanded(flex: 3, child: _dashColHeader('PHONE')),
                     Expanded(
+                      flex: 2,
+                      child: _dashColHeader('DUE', right: true),
+                    ),
+                    Expanded(
                       flex: 3,
                       child: _dashColHeader('ADDED ON', right: true),
                     ),
@@ -30511,9 +31076,15 @@ class _BillingScreenState extends State<BillingScreen> {
                 )
               else
                 ...(() {
-                  final filtered = _customerSearchQuery.isEmpty
+                  // The Credit Due card's filter first, then the search.
+                  final base = _customersDueOnly
                       ? _reportCustomers
-                      : _reportCustomers.where((c) {
+                            .where((c) => _creditDueOf(c) > 0.005)
+                            .toList()
+                      : _reportCustomers;
+                  final filtered = _customerSearchQuery.isEmpty
+                      ? base
+                      : base.where((c) {
                           final q = _customerSearchQuery.toLowerCase();
                           return c.name.toLowerCase().contains(q) ||
                               (c.phone?.toLowerCase().contains(q) ?? false);
@@ -30524,7 +31095,9 @@ class _BillingScreenState extends State<BillingScreen> {
                         padding: const EdgeInsets.symmetric(vertical: 32),
                         child: Center(
                           child: Text(
-                            'No results for "$_customerSearchQuery"',
+                            _customerSearchQuery.isEmpty
+                                ? 'No customers with credit due'
+                                : 'No results for "$_customerSearchQuery"',
                             style: GoogleFonts.inter(
                               fontSize: 13,
                               color: AppColors.textMuted,
@@ -30579,6 +31152,29 @@ class _BillingScreenState extends State<BillingScreen> {
                                       fontSize: 12,
                                       color: AppColors.textMuted,
                                     ),
+                                  ),
+                                ),
+                                // What they still owe on credit bills.
+                                Expanded(
+                                  flex: 2,
+                                  child: Builder(
+                                    builder: (_) {
+                                      final due = _creditDueOf(c);
+                                      final owes = due > 0.005;
+                                      return Text(
+                                        owes ? _fmt(due) : '—',
+                                        textAlign: TextAlign.right,
+                                        style: GoogleFonts.inter(
+                                          fontSize: 12.5,
+                                          fontWeight: owes
+                                              ? FontWeight.w700
+                                              : FontWeight.w400,
+                                          color: owes
+                                              ? const Color(0xFF92400E)
+                                              : AppColors.textMuted,
+                                        ),
+                                      );
+                                    },
                                   ),
                                 ),
                                 Expanded(
@@ -31862,6 +32458,9 @@ class _BillingScreenState extends State<BillingScreen> {
     VoidCallback? onTap,
     String? tooltip,
     bool highlighted = false,
+    // A small link at the right of the card, e.g. "Show all", for a card
+    // whose tap filters the list below.
+    String? actionLabel,
   }) {
     final card = Container(
       padding: const EdgeInsets.all(20),
@@ -31917,6 +32516,17 @@ class _BillingScreenState extends State<BillingScreen> {
                 ),
               ],
             ),
+            if (actionLabel != null) ...[
+              const Spacer(),
+              Text(
+                actionLabel,
+                style: GoogleFonts.inter(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                ),
+              ),
+            ],
           ],
         ),
     );

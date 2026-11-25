@@ -1757,6 +1757,38 @@ class LocalDbService {
     );
   }
 
+  /// Every unpaid credit bill's customer and the amount still owed, for the
+  /// Customers page (its Credit Due total and due-customers filter). Read
+  /// only; deleted bills don't count.
+  static Future<List<({String name, String phone, double due})>>
+  creditDueRows() async {
+    final database = await db;
+    final rows = await database.rawQuery(
+      'SELECT customer_name, customer_phone, balance_due FROM transactions '
+      'WHERE deleted = 0 AND balance_due > 0',
+    );
+    return rows
+        .map(
+          (r) => (
+            name: (r['customer_name'] as String?) ?? '',
+            phone: (r['customer_phone'] as String?) ?? '',
+            due: (r['balance_due'] as num?)?.toDouble() ?? 0,
+          ),
+        )
+        .toList();
+  }
+
+  /// Marks a credit bill as paid back: its balance due goes to zero. Nothing
+  /// else on the bill changes. Unsynced + rev bump so it pushes to the cloud.
+  static Future<void> clearTransactionCredit(String id) async {
+    final database = await db;
+    await database.rawUpdate(
+      'UPDATE transactions SET balance_due = 0, synced = 0, rev = rev + 1 '
+      'WHERE id = ?',
+      [id],
+    );
+  }
+
   /// Records a return or exchange. Identical atomic write to a sale, except
   /// the record's item quantities are negative, so the same arithmetic puts
   /// the goods back into stock instead of taking them out. The customer is
