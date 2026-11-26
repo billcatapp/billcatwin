@@ -33,10 +33,17 @@ class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
       await Supabase.instance.client.auth.updateUser(
         UserAttributes(password: _passwordController.text),
       );
+      // The reset code (or link) signed the user in only to change the
+      // password: sign out, so they come back in with the new one. The
+      // password is already saved, so a failed sign-out isn't reported as
+      // a failed update.
+      try {
+        await Supabase.instance.client.auth.signOut();
+      } catch (_) {}
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Password updated successfully!',
+          content: Text('Password updated. Sign in with your new password.',
               style: GoogleFonts.inter(color: Colors.white)),
           backgroundColor: AppColors.success,
           behavior: SnackBarBehavior.floating,

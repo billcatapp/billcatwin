@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -35,6 +36,7 @@ import '../../services/thermal_logo.dart';
 import '../../services/thermal_printer.dart';
 import '../../services/whatsapp_service.dart' as _wa;
 import '../auth/login_screen.dart';
+import '../auth/reset_password_screen.dart';
 
 /// Sentinel for the picker's "None" row — an empty value cannot be a
 /// PopupMenuItem value and still be distinguishable from no selection.
@@ -393,6 +395,9 @@ class _BillingScreenState extends State<BillingScreen> {
   DateTimeRange? _customSalesRange;
   List<TransactionRecord> _customTxList = [];
   String _customPeriodLabel = 'Custom';
+  // The custom period came from the ‹ › day arrows, not the Custom picker:
+  // the Custom box then stays plain "Custom" (the date shows under Sales).
+  bool _salesDayStep = false;
   List<TransactionRecord> _txListToday = [];
   List<TransactionRecord> _txListWeek = [];
   List<TransactionRecord> _txListMonth = [];
@@ -547,6 +552,15 @@ class _BillingScreenState extends State<BillingScreen> {
   String _editStorePhone = '';
   String _editStoreEmail = '';
   String _editStoreGstin = '';
+  // Owner name, nationality, city and pincode live on the BillCat account
+  // (set at sign-up), not in the store settings: edited on the Profile
+  // page, saved when Settings is left.
+  String _editOwnerName = '';
+  String _editCountry = '';
+  String _editCity = '';
+  String _editPincode = '';
+  // What the account held when Settings opened, by metadata key.
+  Map<String, String> _savedAccountInfo = const {};
   String _editStoreState = '';
   String _editInvoiceLayout = 'Classic';
   String _editPrintOrientation = 'Portrait';
@@ -569,6 +583,10 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Whether e-bills carry the "Join our WhatsApp group" button (needs
   /// [_waGroupLink]). On unless the shop switched it off.
   bool _waGroupButtonOn = true;
+  /// How e-bills go out, chosen in Settings → WhatsApp and kept on this PC:
+  /// 'api' sends from BillCat's number through the relay; 'link' opens a
+  /// wa.me chat from the shop's own WhatsApp for the cashier to send.
+  String _waSendMode = 'api';
   String _editWaGroupLink = '';
 
   /// The approved Cloud API template the group invite is sent with, and its
@@ -766,6 +784,7 @@ class _BillingScreenState extends State<BillingScreen> {
       _waAccessToken = s['wa_access_token'] ?? '';
       _waGroupLink = s['wa_group_link'] ?? '';
       _waGroupButtonOn = s['wa_group_button'] != '0';
+      _waSendMode = s['wa_send_mode'] == 'link' ? 'link' : 'api';
       _summaryOpen = (s['cart_summary_open'] ?? '1') != '0';
       _waInviteTemplate = s['wa_invite_template'] ?? '';
       final lang = (s['wa_template_lang'] ?? '').trim();
@@ -2437,8 +2456,13 @@ class _BillingScreenState extends State<BillingScreen> {
       child: Container(
         color: Colors.white,
         padding: const EdgeInsets.all(28),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        // The search bar and category chips (the first four children) slide
+        // away while the products are scrolled down, and the grid takes their
+        // space; they stay while the search is typed in or the keyboard
+        // cursor is on the chips.
+        child: _CollapsingHeaderColumn(
+          headerCount: 4,
+          forceShow: _categoryCursor != null || _searchQuery.isNotEmpty,
           children: [
             // Search bar
             _HoverShadowBox(
@@ -5459,11 +5483,20 @@ class _BillingScreenState extends State<BillingScreen> {
                             (v) => _editStoreGstin = v,
                           ),
                           _settingsDivider(),
-                          _settingsTextField(
-                            'UPI ID',
-                            _editStoreUpiId,
-                            (v) => _editStoreUpiId = v,
-                          ),
+                          // Owner-only while Staff Mode is locked: bills'
+                          // pay-by-UPI QR pays this ID.
+                          if (_staffLocked)
+                            _lockedUpiRow(
+                              _editStoreUpiId,
+                              label: 'UPI ID',
+                              onUnlocked: () => setDlg(() {}),
+                            )
+                          else
+                            _settingsTextField(
+                              'UPI ID',
+                              _editStoreUpiId,
+                              (v) => _editStoreUpiId = v,
+                            ),
                           _settingsDivider(),
                           _settingsTextField(
                             'Branch Number',
@@ -5725,9 +5758,59 @@ class _BillingScreenState extends State<BillingScreen> {
       _editLogoUrl = _logoUrl;
       _editStoreUpiId = _storeUpiId;
       _editBranchNumber = _branchNumber;
+      final meta =
+          Supabase.instance.client.auth.currentUser?.userMetadata ??
+          const <String, dynamic>{};
+      String saved(String key) => '${meta[key] ?? ''}'.trim();
+      _editOwnerName = saved('owner_name');
+      _editCountry = saved('country');
+      _editCity = saved('city');
+      _editPincode = saved('postal_code');
+      _savedAccountInfo = _accountInfoEdits();
+      // A search left in "Find a setting" would still filter the pages
+      // while its box shows empty.
+      _settingsSearch = '';
       _settingsPage = 'General';
       _showSettings = true;
     });
+  }
+
+  /// The Profile page's account details, under the metadata keys sign-up
+  /// saves them with.
+  Map<String, String> _accountInfoEdits() => {
+    'owner_name': _editOwnerName.trim(),
+    'country': _editCountry.trim(),
+    'city': _editCity.trim(),
+    'postal_code': _editPincode.trim(),
+  };
+
+  /// Saves the Profile page's owner name, nationality, city and pincode to
+  /// the BillCat account when changed (the store details save with the rest
+  /// of Settings).
+  Future<void> _saveAccountInfoIfChanged() async {
+    final edits = _accountInfoEdits();
+    final changed = {
+      for (final e in edits.entries)
+        if (e.value != _savedAccountInfo[e.key]) e.key: e.value,
+    };
+    if (changed.isEmpty) return;
+    // Settings can be opened again while this is on its way; that visit
+    // takes its own snapshot, which a late success must not replace, or its
+    // Back would send the old values back.
+    final base = _savedAccountInfo;
+    try {
+      await Supabase.instance.client.auth.updateUser(
+        UserAttributes(data: changed),
+      );
+      if (identical(_savedAccountInfo, base)) _savedAccountInfo = edits;
+    } catch (_) {
+      if (mounted) {
+        _showToast(
+          'Could not save the profile — check the internet connection',
+          isError: true,
+        );
+      }
+    }
   }
 
   void _saveSettings() {
@@ -5799,91 +5882,71 @@ class _BillingScreenState extends State<BillingScreen> {
 
   static const _settingsNavItems = [
     (icon: Icons.storefront_outlined, label: 'General'),
-    (icon: Icons.percent_rounded, label: 'Tax'),
     (icon: Icons.print_outlined, label: 'Printer'),
-    (icon: Icons.person_outline_rounded, label: 'Account'),
     (icon: Icons.shield_outlined, label: 'Security'),
     (icon: Icons.chat_bubble_outline_rounded, label: 'WhatsApp'),
     (icon: Icons.storage_outlined, label: 'Data'),
   ];
 
+  /// Words each Settings page answers to in "Find a setting", beyond its name.
+  static const _settingsKeywords = {
+    'General': 'currency rupee update version app',
+    'Printer':
+        'print printer paper receipt thermal a4 layout logo upi qr terms footer',
+    'Security': 'passcode password staff owner lock access',
+    'WhatsApp': 'whatsapp e-bill ebill group invite link',
+    'Data': 'reset delete clear recycle bin data',
+  };
+
+  /// Each page's icon colour in the Settings sidebar, Windows-style.
+  static const _settingsNavColors = {
+    'General': Color(0xFF2563EB),
+    'Printer': Color(0xFF0D9488),
+    'Security': Color(0xFF475569),
+    'WhatsApp': Color(0xFF22A35A),
+    'Data': Color(0xFF7C3AED),
+  };
+
+  /// Text typed in the Settings sidebar's "Find a setting" box.
+  String _settingsSearch = '';
+
+  List<({IconData icon, String label})> _settingsNavMatches() {
+    final q = _settingsSearch.trim().toLowerCase();
+    if (q.isEmpty) return _settingsNavItems;
+    return [
+      for (final item in _settingsNavItems)
+        if (item.label.toLowerCase().contains(q) ||
+            (_settingsKeywords[item.label] ?? '').contains(q))
+          item,
+    ];
+  }
+
+  // Settings is laid out like Windows 11 Settings: the account, a search box
+  // and the pages down the left; a big page title and one white tile per
+  // setting on a light grey background.
   Widget _buildSettingsPanel() {
     return Container(
       key: const ValueKey('settings'),
-      color: const Color(0xFFF2F2F7),
-      child: Column(
+      color: const Color(0xFFF3F3F3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // ── header bar ──
-          Container(
-            height: 64,
-            decoration: const BoxDecoration(
-              color: Colors.white,
-              border: Border(bottom: BorderSide(color: Color(0xFFE0E0E0))),
-            ),
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: Row(
-              children: [
-                TextButton.icon(
-                  onPressed: () => setState(() => _showSettings = false),
-                  icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 14),
-                  label: Text(
-                    'Back',
-                    style: GoogleFonts.inter(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                  style: TextButton.styleFrom(
-                    foregroundColor: AppColors.primary,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                ),
-                const Spacer(),
-                Text(
-                  'Settings',
-                  style: GoogleFonts.manrope(
-                    fontSize: 17,
-                    fontWeight: FontWeight.w700,
-                    color: const Color(0xFF1D1D1F),
-                  ),
-                ),
-                const Spacer(),
-                FilledButton(
-                  onPressed: _saveSettings,
-                  style: FilledButton.styleFrom(
-                    backgroundColor: AppColors.primary,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 20,
-                      vertical: 10,
-                    ),
-                  ),
-                  child: Text(
-                    'Done',
-                    style: GoogleFonts.inter(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          // ── body: sidebar + content ──
+          _buildSettingsSidebar(),
           Expanded(
-            child: Row(
+            child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                _buildSettingsSidebar(),
-                Container(width: 1, color: const Color(0xFFD8D8DC)),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(36, 30, 36, 18),
+                  child: Text(
+                    _settingsPage,
+                    style: GoogleFonts.manrope(
+                      fontSize: 28,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ),
                 Expanded(child: _buildSettingsContent()),
               ],
             ),
@@ -5894,61 +5957,233 @@ class _BillingScreenState extends State<BillingScreen> {
   }
 
   Widget _buildSettingsSidebar() {
-    return Container(
-      width: 200,
-      color: const Color(0xFFF5F5F7),
-      padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: _settingsNavItems.map((item) {
-          final selected = _settingsPage == item.label;
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 2),
-            child: MouseRegion(
-              cursor: SystemMouseCursors.click,
-              child: GestureDetector(
-                onTap: () => setState(() => _settingsPage = item.label),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 120),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 9,
-                  ),
-                  decoration: BoxDecoration(
-                    color: selected
-                        ? AppColors.primary.withValues(alpha: 0.10)
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        item.icon,
-                        size: 16,
-                        color: selected
-                            ? AppColors.primary
-                            : const Color(0xFF8E8E93),
+    final email = Supabase.instance.client.auth.currentUser?.email ?? '';
+    final name = _storeName.trim().isNotEmpty ? _storeName.trim() : 'BillCat';
+    final items = _settingsNavMatches();
+    return SizedBox(
+      width: 300,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 14, 10, 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // ← Settings: back to billing, like Windows' title bar. There's
+            // no Save button: going back saves what was changed (the old
+            // Done), the way Windows Settings keeps changes as they're made.
+            // The arrow and the word together are the one Back button.
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Tooltip(
+                message: 'Back',
+                child: Material(
+                  color: Colors.transparent,
+                  borderRadius: BorderRadius.circular(6),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(6),
+                    hoverColor: const Color(0xFFE6E6E6),
+                    onTap: () {
+                      _saveAccountInfoIfChanged();
+                      _saveSettings();
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
                       ),
-                      const SizedBox(width: 10),
-                      Text(
-                        item.label,
-                        style: GoogleFonts.inter(
-                          fontSize: 13,
-                          fontWeight: selected
-                              ? FontWeight.w600
-                              : FontWeight.w400,
-                          color: selected
-                              ? AppColors.primary
-                              : const Color(0xFF3C3C43),
-                        ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.arrow_back_rounded,
+                            size: 18,
+                            color: AppColors.textDark,
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            'Settings',
+                            style: GoogleFonts.inter(
+                              fontSize: 13.5,
+                              color: AppColors.textDark,
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
                 ),
               ),
             ),
-          );
-        }).toList(),
+            const SizedBox(height: 14),
+            // The account, the way Windows shows the signed-in user. Click
+            // it for the Profile page (the store's details).
+            Material(
+              color: _settingsPage == 'Profile'
+                  ? const Color(0xFFE6E6E6)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(8),
+                hoverColor: const Color(0xFFEDEDED),
+                onTap: () => setState(() => _settingsPage = 'Profile'),
+                child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(
+                children: [
+                  _settingsAvatar(name, radius: 30, fontSize: 24),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: GoogleFonts.inter(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                            color: AppColors.textDark,
+                          ),
+                        ),
+                        if (email.isNotEmpty)
+                          Text(
+                            email,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: GoogleFonts.inter(
+                              fontSize: 12.5,
+                              color: AppColors.textMuted,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            // Find a setting: narrows the pages below; Enter opens the first.
+            SizedBox(
+              height: 36,
+              child: TextField(
+                onChanged: (v) => setState(() => _settingsSearch = v),
+                onSubmitted: (_) {
+                  final m = _settingsNavMatches();
+                  if (m.isNotEmpty) _openSettingsPage(m.first.label);
+                },
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  color: AppColors.textDark,
+                ),
+                decoration: InputDecoration(
+                  hintText: 'Find a setting',
+                  hintStyle: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: AppColors.textMuted,
+                  ),
+                  suffixIcon: const Icon(
+                    Icons.search_rounded,
+                    size: 17,
+                    color: AppColors.textMuted,
+                  ),
+                  isDense: true,
+                  filled: true,
+                  fillColor: Colors.white,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(6),
+                    borderSide: const BorderSide(color: Color(0xFFE0E0E0)),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(6),
+                    borderSide: const BorderSide(color: Color(0xFFE0E0E0)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(6),
+                    borderSide: const BorderSide(
+                      color: AppColors.primary,
+                      width: 1.5,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (items.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(10),
+                child: Text(
+                  'No matching setting',
+                  style: GoogleFonts.inter(
+                    fontSize: 12.5,
+                    color: AppColors.textMuted,
+                  ),
+                ),
+              ),
+            for (final item in items)
+              Builder(
+                builder: (_) {
+                  final selected = _settingsPage == item.label;
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 2),
+                    child: Material(
+                      color: selected
+                          ? const Color(0xFFE6E6E6)
+                          : Colors.transparent,
+                      borderRadius: BorderRadius.circular(6),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(6),
+                        hoverColor: const Color(0xFFEDEDED),
+                        onTap: () => _openSettingsPage(item.label),
+                        child: SizedBox(
+                          height: 38,
+                          child: Row(
+                            children: [
+                              // Accent pill on the page that's open.
+                              Container(
+                                width: 3,
+                                height: 16,
+                                decoration: BoxDecoration(
+                                  color: selected
+                                      ? AppColors.primary
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(2),
+                                ),
+                              ),
+                              const SizedBox(width: 11),
+                              Icon(
+                                item.icon,
+                                size: 19,
+                                color:
+                                    _settingsNavColors[item.label] ??
+                                    AppColors.textMuted,
+                              ),
+                              const SizedBox(width: 14),
+                              Text(
+                                item.label,
+                                style: GoogleFonts.inter(
+                                  fontSize: 13.5,
+                                  fontWeight: selected
+                                      ? FontWeight.w600
+                                      : FontWeight.w400,
+                                  color: AppColors.textDark,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -5956,11 +6191,13 @@ class _BillingScreenState extends State<BillingScreen> {
   Widget _buildSettingsContent() {
     if (_settingsPage == 'Printer') return _buildSettingsPrinter();
     return SingleChildScrollView(
-      padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 32),
-      child: Center(
+      padding: const EdgeInsets.fromLTRB(36, 4, 36, 40),
+      child: Align(
+        alignment: Alignment.topLeft,
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 500),
+          constraints: const BoxConstraints(maxWidth: 1000),
           child: switch (_settingsPage) {
+            'Profile' => _buildSettingsProfile(),
             'General' => _buildSettingsStore(),
             'Tax' => _buildSettingsTax(),
             'Account' => _buildSettingsAccount(),
@@ -7153,21 +7390,8 @@ class _BillingScreenState extends State<BillingScreen> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _settingsPageTitle('General', Icons.storefront_outlined),
-        const SizedBox(height: 24),
-        _settingsCard([
-          _settingsTextField(
-            'Store Name',
-            _editStoreName,
-            (v) => setState(() => _editStoreName = v),
-          ),
-          _settingsDivider(),
-          _settingsTextField(
-            'Store Address',
-            _editStoreAddress,
-            (v) => setState(() => _editStoreAddress = v),
-          ),
-        ]),
-        const SizedBox(height: 24),
+        const SizedBox(height: 8),
+        // The store's name and address are on the Profile page.
         _settingsSectionHeader('CURRENCY'),
         const SizedBox(height: 8),
         _settingsCard([
@@ -7242,141 +7466,148 @@ class _BillingScreenState extends State<BillingScreen> {
           ),
         ]),
         const SizedBox(height: 24),
-        _settingsSectionHeader('REGION'),
+        _settingsSectionHeader('APP'),
         const SizedBox(height: 8),
-        _settingsCard([
-          MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: GestureDetector(
-              onTap: () async {
-                final picked = await _showDialCodePicker(
-                  context,
-                  _editDialCode,
-                );
-                if (picked != null) setState(() => _editDialCode = picked);
-              },
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 14,
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.language_rounded,
-                      size: 20,
-                      color: AppColors.textMuted,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Country Dial Code',
-                            style: GoogleFonts.inter(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
-                              color: const Color(0xFF1D1D1F),
-                            ),
-                          ),
-                          Text(
-                            'Used for WhatsApp: $_editDialCode',
-                            style: GoogleFonts.inter(
-                              fontSize: 12,
-                              color: const Color(0xFF6E6E73),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Text(
-                      _editDialCode,
-                      style: GoogleFonts.inter(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: AppColors.primary,
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    const Icon(
-                      Icons.chevron_right_rounded,
-                      color: Color(0xFFC7C7CC),
-                      size: 20,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ]),
+        _settingsCard([_settingsUpdateTile(), _settingsVersionTile()]),
       ],
     );
   }
 
-  static const _dialCodes = [
-    ('+91', '🇮🇳', 'India'),
-    ('+1', '🇺🇸', 'United States'),
-    ('+44', '🇬🇧', 'United Kingdom'),
-    ('+971', '🇦🇪', 'UAE'),
-    ('+966', '🇸🇦', 'Saudi Arabia'),
-    ('+65', '🇸🇬', 'Singapore'),
-    ('+60', '🇲🇾', 'Malaysia'),
-    ('+92', '🇵🇰', 'Pakistan'),
-    ('+880', '🇧🇩', 'Bangladesh'),
-    ('+94', '🇱🇰', 'Sri Lanka'),
-    ('+977', '🇳🇵', 'Nepal'),
-    ('+61', '🇦🇺', 'Australia'),
-    ('+49', '🇩🇪', 'Germany'),
-    ('+33', '🇫🇷', 'France'),
-    ('+81', '🇯🇵', 'Japan'),
-    ('+86', '🇨🇳', 'China'),
-    ('+55', '🇧🇷', 'Brazil'),
-    ('+27', '🇿🇦', 'South Africa'),
-    ('+234', '🇳🇬', 'Nigeria'),
-    ('+254', '🇰🇪', 'Kenya'),
-  ];
-
-  Future<String?> _showDialCodePicker(
-    BuildContext context,
-    String current,
-  ) async {
-    return showModalBottomSheet<String>(
-      context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) => ListView(
+  /// General's "Update app" tile: the same check and install as the update
+  /// banner on the billing screen (which Settings covers), shown in place.
+  Widget _settingsUpdateTile() {
+    final info = _updateDismissed ? null : _updateInfo;
+    final progress = _downloadProgress;
+    final String status;
+    Widget? action;
+    if (_isCheckingUpdate) {
+      status = 'Checking for updates…';
+      action = const SizedBox(
+        width: 18,
+        height: 18,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    } else if (info != null && progress != null) {
+      status =
+          'Installing BillCat ${info.version}… ${(progress * 100).toInt()}%';
+    } else if (info != null) {
+      status = 'BillCat ${info.version} is available';
+      action = FilledButton(
+        onPressed: _lastUpdateFailed
+            ? () => launchUrl(
+                Uri.parse(UpdateService.releasePageFor(info.downloadUrl)),
+              )
+            : _installUpdate,
+        style: FilledButton.styleFrom(
+          backgroundColor: AppColors.primary,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        ),
+        child: Text(
+          _lastUpdateFailed ? 'Download installer' : 'Install update',
+          style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      );
+    } else {
+      status = 'Get the latest BillCat features and fixes';
+      action = OutlinedButton(
+        onPressed: _manualCheckForUpdate,
+        style: OutlinedButton.styleFrom(
+          foregroundColor: AppColors.textDark,
+          side: const BorderSide(color: Color(0xFFD0D0D0)),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        ),
+        child: Text(
+          'Check for updates',
+          style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Text(
-              'Select Country',
-              style: GoogleFonts.manrope(
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-              ),
+          const Icon(
+            Icons.system_update_alt_rounded,
+            size: 20,
+            color: AppColors.textMuted,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Update app',
+                  style: GoogleFonts.inter(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    color: const Color(0xFF1D1D1F),
+                  ),
+                ),
+                Text(
+                  status,
+                  style: GoogleFonts.inter(
+                    fontSize: 12,
+                    color: const Color(0xFF6E6E73),
+                  ),
+                ),
+                if (info != null && progress != null) ...[
+                  const SizedBox(height: 6),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(2),
+                    child: LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 4,
+                      backgroundColor: const Color(0xFFE5E5E5),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        AppColors.primary,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
-          for (final (code, flag, name) in _dialCodes)
-            ListTile(
-              leading: Text(flag, style: const TextStyle(fontSize: 22)),
-              title: Text(name, style: GoogleFonts.inter(fontSize: 14)),
-              trailing: Text(
-                code,
-                style: GoogleFonts.inter(
-                  fontSize: 13,
-                  color: AppColors.textMuted,
-                ),
-              ),
-              selected: code == current,
-              selectedTileColor: AppColors.primary.withValues(alpha: 0.06),
-              onTap: () => Navigator.pop(ctx, code),
-            ),
+          if (action != null) ...[const SizedBox(width: 16), action],
         ],
       ),
     );
   }
+
+  /// General's "Version" tile: the BillCat version this PC runs.
+  Widget _settingsVersionTile() => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+    child: Row(
+      children: [
+        const Icon(
+          Icons.info_outline_rounded,
+          size: 20,
+          color: AppColors.textMuted,
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            'Version',
+            style: GoogleFonts.inter(
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              color: const Color(0xFF1D1D1F),
+            ),
+          ),
+        ),
+        Text(
+          'v${_appVersion()}',
+          style: GoogleFonts.inter(
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+            color: AppColors.textDark,
+          ),
+        ),
+      ],
+    ),
+  );
 
   // ── Tax ──
   Widget _buildSettingsTax() {
@@ -7649,11 +7880,20 @@ class _BillingScreenState extends State<BillingScreen> {
                     (v) => setState(() => _editStoreState = v),
                   ),
                   _settingsDivider(),
-                  _settingsTextField(
-                    'UPI ID',
-                    _editStoreUpiId,
-                    (v) => setState(() => _editStoreUpiId = v),
-                  ),
+                  // Bills' pay-by-UPI QR pays this ID: owner-only while
+                  // Staff Mode is locked.
+                  if (_staffLocked)
+                    _lockedUpiRow(
+                      _editStoreUpiId,
+                      label: 'UPI ID',
+                      onUnlocked: () {},
+                    )
+                  else
+                    _settingsTextField(
+                      'UPI ID',
+                      _editStoreUpiId,
+                      (v) => setState(() => _editStoreUpiId = v),
+                    ),
                   _settingsDivider(),
                   Padding(
                     padding: const EdgeInsets.symmetric(
@@ -10568,6 +10808,19 @@ class _BillingScreenState extends State<BillingScreen> {
                         ConnectivityService.instance.syncNow();
                       }
                     } else {
+                      // Locked to staff: the passcode first, or anyone at the
+                      // till could switch the lock off ("Forgot passcode?"
+                      // below is the way in when it's forgotten). The switch
+                      // stays on unless it's typed right.
+                      if (_ownerLockEnabled &&
+                          !_isOwnerMode &&
+                          _ownerPasscode.isNotEmpty) {
+                        final ok = await _confirmOwnerPasscode(
+                          title: 'Turn off Staff Mode',
+                          subtitle: 'Enter the owner passcode',
+                        );
+                        if (!ok || !mounted) return;
+                      }
                       setState(() {
                         _ownerLockEnabled = false;
                         _isOwnerMode = false;
@@ -10591,7 +10844,7 @@ class _BillingScreenState extends State<BillingScreen> {
             MouseRegion(
               cursor: SystemMouseCursors.click,
               child: GestureDetector(
-                onTap: () => _showSetPasscodeDialog(),
+                onTap: _changeOwnerPasscode,
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 16,
@@ -10635,62 +10888,253 @@ class _BillingScreenState extends State<BillingScreen> {
                 ),
               ),
             ),
+            // Under Change Passcode, as Windows puts "I forgot my PIN".
+            if (_ownerPasscode.isNotEmpty)
+              MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: GestureDetector(
+                  onTap: _forgotOwnerPasscode,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 14,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.help_outline_rounded,
+                          size: 18,
+                          color: Color(0xFF1D1D1F),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Forgot passcode?',
+                                style: GoogleFonts.inter(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w500,
+                                  color: const Color(0xFF1D1D1F),
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                'Get a code by email, then set a new passcode',
+                                style: GoogleFonts.inter(
+                                  fontSize: 11,
+                                  color: const Color(0xFF6E6E73),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const Icon(
+                          Icons.chevron_right_rounded,
+                          size: 18,
+                          color: Color(0xFFAAAAAA),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
           ]),
         ],
+        const SizedBox(height: 16),
+        _settingsSectionHeader('PASSWORD'),
+        const SizedBox(height: 12),
+        _settingsCard([_settingsResetPasswordTile()]),
       ],
     );
   }
 
+  /// Security's "Reset password" tile (see [_startPasswordReset]).
+  Widget _settingsResetPasswordTile() {
+    final email = Supabase.instance.client.auth.currentUser?.email ?? '';
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.lock_reset_rounded,
+            size: 18,
+            color: Color(0xFF1D1D1F),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Reset password',
+                  style: GoogleFonts.inter(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    color: const Color(0xFF1D1D1F),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  email.isEmpty
+                      ? 'A code is emailed to you to set a new password'
+                      : 'A code is emailed to $email to set a new password',
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    color: const Color(0xFF6E6E73),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 16),
+          OutlinedButton(
+            onPressed: email.isEmpty ? null : _startPasswordReset,
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppColors.textDark,
+              side: const BorderSide(color: Color(0xFFD0D0D0)),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(6),
+              ),
+            ),
+            child: Text(
+              'Reset password',
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Emails the account a 6-digit code, as "Forgot password" does, and asks
+  /// for it in a box with Cancel; the right code leads on to the new
+  /// password, after which BillCat signs out to come back in with it. Asking
+  /// for the emailed code is what stops staff changing the owner's password
+  /// from the shop PC.
+  Future<void> _startPasswordReset() async {
+    final email = (Supabase.instance.client.auth.currentUser?.email ?? '')
+        .trim()
+        .toLowerCase();
+    if (email.isEmpty) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: Text(
+          'Reset password',
+          style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w700),
+        ),
+        content: Text(
+          'A 6-digit code will be emailed to $email. Enter it in the next '
+          'box, then choose the new password. BillCat then signs out, and '
+          'you sign in again with the new password.',
+          style: GoogleFonts.inter(
+            fontSize: 13.5,
+            height: 1.4,
+            color: AppColors.textDark,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: GoogleFonts.inter(fontSize: 13)),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.primary),
+            child: Text(
+              'Send code',
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    final err = await _emailResetCode(email);
+    if (!mounted) return;
+    if (err != null) {
+      _showToast(err, isError: true);
+      return;
+    }
+    // Checked in a box with Cancel, so a slow email or a change of mind
+    // leaves the till as it was.
+    final verified = await _showEmailCodeDialog(
+      email,
+      title: 'Reset password',
+      then: 'choose the new password',
+    );
+    if (!verified || !mounted) return;
+    // The new-password screen ends by signing out to the sign-in screen, so
+    // save Settings now, as Back would, rather than lose edits.
+    _saveAccountInfoIfChanged();
+    _saveSettings();
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const ResetPasswordScreen()),
+    );
+  }
+
+  /// Emails the account the 6-digit code of "Forgot password" (Reset
+  /// password and Forgot passcode both use it). Null when it was sent, else
+  /// what went wrong, e.g. asking again too soon, which Supabase words.
+  Future<String?> _emailResetCode(String email) async {
+    try {
+      await SupabaseService.resetPassword(email);
+      return null;
+    } on AuthRetryableFetchException catch (e) {
+      // No status: the request never got through (offline). With one, it
+      // was Supabase's side.
+      return e.statusCode == null
+          ? 'Could not send the code — check the internet connection'
+          : 'Could not send the code right now — try again in a few minutes';
+    } on AuthException catch (e) {
+      return e.message;
+    } catch (_) {
+      return 'Could not send the code — check the internet connection';
+    }
+  }
+
   // ── WhatsApp Settings ──
-  // One WhatsApp number is built into BillCat for every shop: e-bills go
-  // through BillCat's relay, so there is nothing for a shop to set up and no
-  // Meta credentials are asked for here. Only the group invite link is the
-  // shop's own.
+  // E-bills go out one of two ways, chosen here ([_waSendMode]): from the one
+  // WhatsApp number built into BillCat, through BillCat's relay (no Meta
+  // credentials are asked for), or as a wa.me chat from the shop's own
+  // WhatsApp. The group invite link is the shop's own.
   Widget _buildSettingsWhatsApp() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _settingsPageTitle('WhatsApp', Icons.chat_bubble_outline_rounded),
         const SizedBox(height: 8),
-        Padding(
-          padding: const EdgeInsets.only(left: 2, bottom: 16),
-          child: Text(
-            'E-bills are sent on WhatsApp from BillCat\'s number, built into '
-            'the app. Nothing to set up.',
-            style: GoogleFonts.inter(
-              fontSize: 12.5,
-              color: const Color(0xFF6E6E73),
-            ),
+        _settingsSectionHeader('SEND E-BILLS WITH'),
+        const SizedBox(height: 12),
+        // Saved at once, on this PC.
+        _settingsCard([
+          _waSendModeTile(
+            'api',
+            Icons.send_rounded,
+            'BillCat WhatsApp',
+            'Sent automatically from BillCat\'s number, with the PDF and the '
+                'View Bill button',
           ),
-        ),
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: const Color(0xFFF0FFF4),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(
-              color: const Color(0xFF34C759).withValues(alpha: 0.4),
-            ),
+          _waSendModeTile(
+            'link',
+            Icons.link_rounded,
+            'WhatsApp web link',
+            'Opens a chat from your own WhatsApp with the bill link ready; '
+                'you press Send',
           ),
-          child: Row(
-            children: [
-              const Icon(
-                Icons.check_circle_rounded,
-                size: 16,
-                color: Color(0xFF1AAD56),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                'WhatsApp e-bills ready — sent from BillCat (+91 94890 47219)',
-                style: GoogleFonts.inter(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: const Color(0xFF1AAD56),
-                ),
-              ),
-            ],
-          ),
-        ),
+        ]),
         const SizedBox(height: 16),
         _settingsSectionHeader('GROUP INVITE'),
         const SizedBox(height: 12),
@@ -10757,67 +11201,507 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
+  /// One way of sending e-bills on the WhatsApp page, picked like a Windows
+  /// radio button; the choice is saved at once ([_waSendMode]).
+  Widget _waSendModeTile(
+    String mode,
+    IconData icon,
+    String title,
+    String subtitle,
+  ) {
+    final selected = _waSendMode == mode;
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () {
+          if (selected) return;
+          setState(() => _waSendMode = mode);
+          LocalDbService.saveSettings({'wa_send_mode': mode});
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          child: Row(
+            children: [
+              Icon(icon, size: 18, color: const Color(0xFF1D1D1F)),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: GoogleFonts.inter(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                        color: const Color(0xFF1D1D1F),
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: GoogleFonts.inter(
+                        fontSize: 11,
+                        color: const Color(0xFF6E6E73),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 16),
+              // Accent ring with a white centre when chosen, as Windows draws
+              // its radio buttons.
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                width: 20,
+                height: 20,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.white,
+                  border: Border.all(
+                    color: selected
+                        ? AppColors.primary
+                        : const Color(0xFF8A8A8A),
+                    width: selected ? 6 : 1.5,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   // ── Settings UI helpers ──
 
-  Widget _settingsPageTitle(String title, IconData icon) {
-    return Row(
+  /// The Settings header above the page already shows its title and what it
+  /// holds, so a page's own title isn't drawn again.
+  Widget _settingsPageTitle(String title, IconData icon) =>
+      const SizedBox.shrink();
+
+  /// Countries for the Profile page's Nationality, with flags: the ones
+  /// sign-up offers, plus the Gulf and neighbouring countries.
+  static const _nationalities = [
+    ('🇮🇳', 'India'),
+    ('🇦🇪', 'UAE'),
+    ('🇸🇦', 'Saudi Arabia'),
+    ('🇶🇦', 'Qatar'),
+    ('🇰🇼', 'Kuwait'),
+    ('🇴🇲', 'Oman'),
+    ('🇧🇭', 'Bahrain'),
+    ('🇱🇰', 'Sri Lanka'),
+    ('🇳🇵', 'Nepal'),
+    ('🇧🇩', 'Bangladesh'),
+    ('🇵🇰', 'Pakistan'),
+    ('🇸🇬', 'Singapore'),
+    ('🇲🇾', 'Malaysia'),
+    ('🇺🇸', 'United States'),
+    ('🇬🇧', 'United Kingdom'),
+    ('🇨🇦', 'Canada'),
+    ('🇦🇺', 'Australia'),
+    ('🇩🇪', 'Germany'),
+    ('🇫🇷', 'France'),
+    ('🇯🇵', 'Japan'),
+    ('🇨🇳', 'China'),
+    ('🇧🇷', 'Brazil'),
+    ('🇿🇦', 'South Africa'),
+    ('🇳🇬', 'Nigeria'),
+    ('🇰🇪', 'Kenya'),
+  ];
+
+  /// Indian states and union territories for the Profile page's State, by
+  /// name, each with its GST code (a GSTIN's first two digits). The name is
+  /// what's saved, and printed on bills as "State: …".
+  static final List<(String, String)> _gstStateOptions = [
+    for (final s
+        in _gstStates.entries.where((x) => x.key != '97').toList()
+          ..sort((a, b) => a.value.compareTo(b.value)))
+      (s.value, '${s.value} (${s.key})'),
+  ];
+
+  /// The store's logo in a circle — on the Settings account and the Profile
+  /// page — or the business name's first letter when there's no logo.
+  Widget _settingsAvatar(
+    String name, {
+    required double radius,
+    required double fontSize,
+  }) {
+    final logo = _editLogoPath;
+    if (logo.isNotEmpty && File(logo).existsSync()) {
+      return Container(
+        width: radius * 2,
+        height: radius * 2,
+        // Inset so a square logo's corners stay inside the circle.
+        padding: EdgeInsets.all(radius * 0.3),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          shape: BoxShape.circle,
+          border: Border.all(color: const Color(0xFFE5E5E5)),
+        ),
+        child: Image.file(File(logo), fit: BoxFit.contain, cacheWidth: 256),
+      );
+    }
+    return CircleAvatar(
+      radius: radius,
+      backgroundColor: AppColors.primary,
+      child: Text(
+        name.isEmpty ? 'B' : name.characters.first.toUpperCase(),
+        style: GoogleFonts.manrope(
+          fontSize: fontSize,
+          fontWeight: FontWeight.w800,
+          color: Colors.white,
+        ),
+      ),
+    );
+  }
+
+  /// True from a Profile logo pick until its upload is done: one at a time,
+  /// so an older pick's upload can't land last and win online.
+  bool _profileLogoBusy = false;
+
+  /// Picks a new store logo from the Profile page. It's uploaded right away
+  /// for online bills, and becomes the store's logo when Settings is left.
+  Future<void> _pickProfileLogo() async {
+    if (_profileLogoBusy) return;
+    _profileLogoBusy = true;
+    try {
+      final r = await FilePicker.platform.pickFiles(type: FileType.image);
+      final path = r?.files.single.path;
+      // Settings closed while the file dialog was open: it's not wanted now.
+      if (path == null || !mounted || !_showSettings) return;
+      final copied = await LocalDbService.copyImageToAppDir(path);
+      if (!mounted || !_showSettings) return;
+      setState(() => _editLogoPath = copied);
+      final url = await _uploadLogoToCloud(copied);
+      if (url.isEmpty || !mounted) return;
+      if (_editLogoPath == copied) _editLogoUrl = url;
+      // Settings was left before the upload finished: give the saved logo
+      // its online link now, saving just that key.
+      if (!_showSettings && _logoPath == copied && _logoUrl != url) {
+        _logoUrl = url;
+        await LocalDbService.saveSettings({'logo_url': url});
+        ConnectivityService.instance.syncNow();
+      }
+    } finally {
+      _profileLogoBusy = false;
+    }
+  }
+
+  /// The plan on the Profile page's header box. BillCat takes no payments
+  /// yet, so every shop is on the free trial; once it does, the server sets
+  /// the account's app_metadata plan to 'subscribed' (the app itself can't
+  /// change app_metadata) and this shows Subscribed.
+  Widget _planBadge(bool subscribed) {
+    final fg = subscribed ? const Color(0xFF15803D) : const Color(0xFFB45309);
+    final bg = subscribed ? const Color(0xFFE8F6EC) : const Color(0xFFFFF4E0);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        Icon(icon, size: 20, color: AppColors.primary),
-        const SizedBox(width: 10),
         Text(
-          title,
-          style: GoogleFonts.manrope(
-            fontSize: 20,
-            fontWeight: FontWeight.w700,
-            color: const Color(0xFF1D1D1F),
+          'Plan',
+          style: GoogleFonts.inter(fontSize: 12, color: AppColors.textMuted),
+        ),
+        const SizedBox(height: 4),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                subscribed
+                    ? Icons.verified_rounded
+                    : Icons.hourglass_top_rounded,
+                size: 15,
+                color: fg,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                subscribed ? 'Subscribed' : 'Free trial',
+                style: GoogleFonts.inter(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: fg,
+                ),
+              ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  Widget _settingsSectionHeader(String text) => Padding(
-    padding: const EdgeInsets.only(left: 2, bottom: 6),
-    child: Row(
+  /// The account's page, opened by clicking it at the top of the Settings
+  /// sidebar, like Windows' "Your info": the logo (click it to change), the
+  /// plan, and the store's details, each editable in its own tile. Store
+  /// details save with the rest of Settings on Back; owner name,
+  /// nationality, city and pincode save to the BillCat account
+  /// ([_saveAccountInfoIfChanged]).
+  Widget _buildSettingsProfile() {
+    final user = Supabase.instance.client.auth.currentUser;
+    final business = _editStoreName.trim().isNotEmpty
+        ? _editStoreName.trim()
+        : _storeName;
+    final hasLogo =
+        _editLogoPath.isNotEmpty && File(_editLogoPath).existsSync();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text(
-          text,
-          style: GoogleFonts.inter(
-            fontSize: 10.5,
-            fontWeight: FontWeight.w600,
-            color: const Color(0xFF8E8E93),
-            letterSpacing: 0.8,
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xFFE5E5E5)),
+          ),
+          child: Row(
+            children: [
+              // The logo: click it to choose a new one.
+              Tooltip(
+                message: hasLogo ? 'Change logo' : 'Add logo',
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GestureDetector(
+                    onTap: _pickProfileLogo,
+                    child: Stack(
+                      children: [
+                        _settingsAvatar(business, radius: 36, fontSize: 28),
+                        Positioned(
+                          right: 0,
+                          bottom: 0,
+                          child: Container(
+                            width: 26,
+                            height: 26,
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              shape: BoxShape.circle,
+                              border: Border.all(
+                                color: const Color(0xFFD0D0D0),
+                              ),
+                            ),
+                            child: const Icon(
+                              Icons.edit_outlined,
+                              size: 14,
+                              color: AppColors.textDark,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 18),
+              // The store's name, as typed below, over the sign-in email.
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      business,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.manrope(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w800,
+                        color: AppColors.textDark,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      user?.email ?? '',
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        color: AppColors.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 16),
+              _planBadge(user?.appMetadata['plan'] == 'subscribed'),
+            ],
           ),
         ),
-        const SizedBox(width: 8),
-        Expanded(child: Container(height: 0.5, color: const Color(0xFFD8D8DC))),
+        _settingsSectionHeader('BUSINESS DETAILS'),
+        // Each box saves on Back.
+        _settingsCard([
+          _settingsTextField(
+            'Business name',
+            _editStoreName,
+            (v) => setState(() => _editStoreName = v),
+            icon: Icons.storefront_outlined,
+          ),
+          _settingsTextField(
+            'Owner name',
+            _editOwnerName,
+            (v) => setState(() => _editOwnerName = v),
+            icon: Icons.person_outline_rounded,
+          ),
+          _settingsDropdownField(
+            'Nationality',
+            _editCountry,
+            [for (final (flag, name) in _nationalities) (name, '$flag  $name')],
+            (v) => setState(() => _editCountry = v),
+            icon: Icons.flag_outlined,
+          ),
+          _settingsTextField(
+            'Phone number',
+            _editStorePhone,
+            (v) => _editStorePhone = v,
+            keyboardType: TextInputType.phone,
+            icon: Icons.phone_outlined,
+          ),
+          _settingsTextField(
+            'Email',
+            _editStoreEmail,
+            (v) => _editStoreEmail = v,
+            keyboardType: TextInputType.emailAddress,
+            hint: 'Business email',
+            icon: Icons.alternate_email_rounded,
+          ),
+          _settingsTextField(
+            'Store address',
+            _editStoreAddress,
+            (v) => _editStoreAddress = v,
+            icon: Icons.location_on_outlined,
+          ),
+          _settingsTextField(
+            'City',
+            _editCity,
+            (v) => _editCity = v,
+            icon: Icons.location_city_outlined,
+          ),
+          _settingsTextField(
+            'Pincode',
+            _editPincode,
+            (v) => _editPincode = v,
+            keyboardType: TextInputType.number,
+            icon: Icons.markunread_mailbox_outlined,
+          ),
+          _settingsDropdownField(
+            'State',
+            _editStoreState,
+            _gstStateOptions,
+            (v) => setState(() => _editStoreState = v),
+            hint: 'Select state',
+            icon: Icons.map_outlined,
+          ),
+          _settingsTextField(
+            'GST number',
+            _editStoreGstin,
+            (v) => _editStoreGstin = v,
+            hint: 'GSTIN',
+            icon: Icons.receipt_long_outlined,
+          ),
+        ]),
       ],
-    ),
-  );
+    );
+  }
 
-  Widget _settingsCard(List<Widget> children) => Container(
-    decoration: BoxDecoration(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: const Color(0xFFE8E8ED), width: 0.5),
-      boxShadow: [
-        BoxShadow(
-          color: Colors.black.withValues(alpha: 0.03),
-          blurRadius: 6,
-          offset: const Offset(0, 1),
+  /// A group heading, Windows-style: "STAFF ACCESS CONTROL" reads as
+  /// "Staff access control", in bold.
+  Widget _settingsSectionHeader(String text) {
+    var t = text.toLowerCase().replaceAll('billcat', 'BillCat');
+    if (t.isNotEmpty) t = t[0].toUpperCase() + t.substring(1);
+    return Padding(
+      padding: const EdgeInsets.only(left: 2, top: 14, bottom: 8),
+      child: Text(
+        t,
+        style: GoogleFonts.inter(
+          fontSize: 14.5,
+          fontWeight: FontWeight.w600,
+          color: AppColors.textDark,
         ),
-      ],
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: children,
-    ),
+      ),
+    );
+  }
+
+  /// A group of settings, each in its own white tile with a small gap
+  /// between them, as Windows 11 Settings shows them.
+  Widget _settingsCard(List<Widget> children) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      for (final child in children)
+        // The tiles' gaps replace the old dividers between rows.
+        if (child is! _SettingsDividerMark)
+          Container(
+            margin: const EdgeInsets.only(bottom: 4),
+            constraints: const BoxConstraints(minHeight: 62),
+            alignment: Alignment.centerLeft,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFE5E5E5)),
+            ),
+            child: child,
+          ),
+    ],
   );
 
-  Widget _settingsDivider() => const Padding(
-    padding: EdgeInsets.symmetric(horizontal: 16),
-    child: Divider(height: 1, color: Color(0xFFF2F2F7)),
-  );
+  /// Between rows of a [_settingsCard]: each row is its own tile now, so
+  /// this draws nothing and the card leaves it out.
+  Widget _settingsDivider() => const _SettingsDividerMark();
+
+  /// A [_settingsTextField]-style tile with a list to pick from instead of a
+  /// box to type in ([_SettingsSelect]: typing in the open list jumps to the
+  /// entry starting with it). [items] are (value, shown as) pairs; a saved
+  /// [value] that isn't among them is still listed, so nothing is lost.
+  Widget _settingsDropdownField(
+    String label,
+    String value,
+    List<(String, String)> items,
+    ValueChanged<String> onChanged, {
+    String hint = 'Select',
+    IconData? icon,
+  }) {
+    final options = [
+      ...items,
+      if (value.isNotEmpty && !items.any((i) => i.$1 == value)) (value, value),
+    ];
+    return LayoutBuilder(
+      builder: (context, c) {
+        final boxWidth = (c.maxWidth * 0.5).clamp(200.0, 380.0);
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+          child: Row(
+            children: [
+              if (icon != null) ...[
+                Icon(icon, size: 19, color: AppColors.textMuted),
+                const SizedBox(width: 14),
+              ],
+              Expanded(
+                child: Text(
+                  label,
+                  style: GoogleFonts.inter(
+                    fontSize: 14,
+                    color: AppColors.textDark,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 16),
+              SizedBox(
+                width: boxWidth,
+                child: _SettingsSelect(
+                  value: value,
+                  options: options,
+                  hint: hint,
+                  onChanged: onChanged,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 
   Widget _settingsTextField(
     String label,
@@ -10827,43 +11711,55 @@ class _BillingScreenState extends State<BillingScreen> {
     int maxLines = 1,
     bool obscureText = false,
     String? hint,
+    // Shown before the name, as on the Profile page.
+    IconData? icon,
   }) {
-    return Container(
-      constraints: BoxConstraints(minHeight: maxLines > 1 ? 0 : 46),
-      padding: EdgeInsets.symmetric(
-        horizontal: 16,
-        vertical: maxLines > 1 ? 12 : 0,
-      ),
-      child: Row(
-        crossAxisAlignment: maxLines > 1
-            ? CrossAxisAlignment.start
-            : CrossAxisAlignment.center,
-        children: [
-          SizedBox(
-            width: 140,
-            child: Text(
-              label,
-              style: GoogleFonts.inter(
-                fontSize: 13.5,
-                color: const Color(0xFF3C3C43),
+    // Windows-style tile row: the name on the left, the box on the right.
+    return LayoutBuilder(
+      builder: (context, c) {
+        final boxWidth = (c.maxWidth * 0.5).clamp(200.0, 380.0);
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+          child: Row(
+            crossAxisAlignment: maxLines > 1
+                ? CrossAxisAlignment.start
+                : CrossAxisAlignment.center,
+            children: [
+              if (icon != null) ...[
+                Icon(icon, size: 19, color: AppColors.textMuted),
+                const SizedBox(width: 14),
+              ],
+              Expanded(
+                child: Padding(
+                  padding: EdgeInsets.only(top: maxLines > 1 ? 10 : 0),
+                  child: Text(
+                    label,
+                    style: GoogleFonts.inter(
+                      fontSize: 14,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ),
               ),
-            ),
+              const SizedBox(width: 16),
+              SizedBox(
+                width: boxWidth,
+                // Keyed so Flutter doesn't recycle one settings page's field
+                // state onto another page's field.
+                child: _SettingsInput(
+                  key: ValueKey('settings-field-$label'),
+                  value: value,
+                  onChanged: onChanged,
+                  keyboardType: keyboardType,
+                  maxLines: maxLines,
+                  obscureText: obscureText,
+                  hintText: hint ?? label,
+                ),
+              ),
+            ],
           ),
-          Expanded(
-            // Keyed so Flutter doesn't recycle one settings page's field state
-            // onto another page's field.
-            child: _SettingsInput(
-              key: ValueKey('settings-field-$label'),
-              value: value,
-              onChanged: onChanged,
-              keyboardType: keyboardType,
-              maxLines: maxLines,
-              obscureText: obscureText,
-              hintText: hint ?? label,
-            ),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 
@@ -11411,7 +12307,17 @@ class _BillingScreenState extends State<BillingScreen> {
       bool selected = false,
       required VoidCallback onTap,
       IconData icon = Icons.print_rounded,
+      // What Windows reports for the printer, shown as a dot and a word:
+      // green Ready, blue Printing, grey Not connected, red for a problem.
+      ({PrinterState state, String label})? status,
     }) {
+      final dot = switch (status?.state) {
+        PrinterState.ready => AppColors.success,
+        PrinterState.printing => AppColors.accentBlue,
+        PrinterState.offline => const Color(0xFF9CA3AF),
+        PrinterState.error => AppColors.error,
+        _ => null,
+      };
       return InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(8),
@@ -11453,6 +12359,28 @@ class _BillingScreenState extends State<BillingScreen> {
                   ),
                 ),
               ),
+              if (dot != null) ...[
+                const SizedBox(width: 8),
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: dot,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  status!.label,
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                    color: status.state == PrinterState.error
+                        ? AppColors.error
+                        : AppColors.textMuted,
+                  ),
+                ),
+              ],
             ],
           ),
         ),
@@ -11460,6 +12388,10 @@ class _BillingScreenState extends State<BillingScreen> {
     }
 
     bool _loadingPrinters = true;
+    // Each listed printer's state, read when the dialog opens and every few
+    // seconds while it stays open, so plugging one in turns its dot green.
+    Map<String, ({PrinterState state, String label})> printerStates = {};
+    var readingStates = false;
 
     // The printer list scrolls in its own fixed-height box.
     final printerListCtrl = ScrollController();
@@ -11490,6 +12422,31 @@ class _BillingScreenState extends State<BillingScreen> {
                     }
                   });
                 }
+                // The status dots: now, then every 3 seconds until the
+                // dialog closes (the timer stops itself after that).
+                Future<void> readStates() async {
+                  if (readingStates) return;
+                  readingStates = true;
+                  try {
+                    final states = await PrinterStatus.ofAll([
+                      for (final p in printers) p.name,
+                    ]);
+                    if (ctx.mounted) setLocal(() => printerStates = states);
+                  } catch (_) {
+                    // No dots is better than a broken dialog.
+                  } finally {
+                    readingStates = false;
+                  }
+                }
+
+                await readStates();
+                Timer.periodic(const Duration(seconds: 3), (t) {
+                  if (!ctx.mounted) {
+                    t.cancel();
+                    return;
+                  }
+                  readStates();
+                });
               } catch (_) {
                 if (ctx.mounted) setLocal(() {});
               }
@@ -11592,6 +12549,7 @@ class _BillingScreenState extends State<BillingScreen> {
                                 selected:
                                     !isPdfExport && selPrinter?.url == p.url,
                                 icon: Icons.print_rounded,
+                                status: printerStates[p.name],
                                 onTap: () => setLocal(() {
                                   selPrinter = p;
                                   isPdfExport = false;
@@ -11742,6 +12700,61 @@ class _BillingScreenState extends State<BillingScreen> {
                   // bill's pay-by-UPI QR is generated from the one chosen.
                   Builder(
                     builder: (_) {
+                      // Locked to staff: the UPI ID shows, but changing it
+                      // takes the owner passcode (bills' QR pays this ID).
+                      if (_staffLocked) {
+                        return Tooltip(
+                          message: 'Owner passcode needed to change the UPI ID',
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: () async {
+                              if (await _unlockOwnerAccess() && ctx.mounted) {
+                                setLocal(() {});
+                              }
+                            },
+                            child: Container(
+                              height: 44,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                              ),
+                              decoration: BoxDecoration(
+                                color: AppColors.surfaceVariant,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: AppColors.border),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.qr_code_2_rounded,
+                                    size: 18,
+                                    color: chosenUpi.isEmpty
+                                        ? AppColors.textMuted
+                                        : AppColors.primary,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      chosenUpi.isEmpty
+                                          ? 'None — no QR on bill'
+                                          : chosenUpi,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: GoogleFonts.inter(
+                                        fontSize: 13,
+                                        color: AppColors.textDark,
+                                      ),
+                                    ),
+                                  ),
+                                  const Icon(
+                                    Icons.lock_outline_rounded,
+                                    size: 16,
+                                    color: AppColors.textMuted,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      }
                       void addTyped() {
                         final id = addUpiCtrl.text.trim();
                         // A UPI ID is name@bank: one @, nothing blank.
@@ -12241,6 +13254,9 @@ class _BillingScreenState extends State<BillingScreen> {
     required Map<int, int> qtyByIndex,
     required String paymentMethod,
     required bool exchange,
+    // The id to save it under (Return/Exchange keeps one for the E-BILL
+    // link); a new one when not given.
+    String? id,
   }) {
     final origSub = original.subtotal;
     final discountFactor = origSub > 0
@@ -12308,7 +13324,7 @@ class _BillingScreenState extends State<BillingScreen> {
         ? original.discountAmount * (sub / origSub)
         : 0.0;
     return TransactionRecord(
-      id: const Uuid().v4(),
+      id: id ?? const Uuid().v4(),
       invoiceNumber: _reversalInvoice(original, exchange: exchange),
       customerName: original.customerName,
       customerPhone: original.customerPhone,
@@ -12334,6 +13350,9 @@ class _BillingScreenState extends State<BillingScreen> {
     String? invoiceNumber,
     String? customerName,
     String? customerPhone,
+    // The id to save it under (Return/Exchange keeps one for the E-BILL
+    // link); a new one when not given.
+    String? id,
   }) {
     final storeRate = double.tryParse(_taxRateDisplay) ?? 0;
     final items = <TransactionItem>[];
@@ -12359,7 +13378,7 @@ class _BillingScreenState extends State<BillingScreen> {
       );
     }
     return TransactionRecord(
-      id: const Uuid().v4(),
+      id: id ?? const Uuid().v4(),
       // Fixed number (shared between the printed preview and the saved sale)
       // so the receipt and the Sales row show one invoice number.
       invoiceNumber: invoiceNumber,
@@ -12441,6 +13460,11 @@ class _BillingScreenState extends State<BillingScreen> {
     // Fixed id for the exchange's new-sale row, so its #XXXXXX number is the
     // same whether the receipt is printed before or after completing.
     final exchangeSaleInvoice = await LocalDbService.nextInvoiceNumber();
+    // Fixed ids for the records COMPLETE saves, given to the preview too, so
+    // the E-BILL link (built from the id) opens the bill that gets saved
+    // rather than a throwaway one. An exchange's link opens its new sale.
+    final reversalId = const Uuid().v4();
+    final exchangeSaleId = const Uuid().v4();
     // Line index -> 'return' or 'exchange'. Absent means "keeping it".
     var mode = <int, String>{};
     var cap = <int, int>{};
@@ -12475,6 +13499,7 @@ class _BillingScreenState extends State<BillingScreen> {
               qtyByIndex: q,
               paymentMethod: payMethod,
               exchange: isExchange(),
+              id: reversalId,
             );
           }
 
@@ -12605,12 +13630,14 @@ class _BillingScreenState extends State<BillingScreen> {
                     invoiceNumber: exchangeSaleInvoice,
                     customerName: picked!.customerName,
                     customerPhone: picked!.customerPhone,
+                    id: exchangeSaleId,
                   );
             if (rev == null && sale == null) return null;
             if (sale == null) return rev; // pure refund
             if (rev == null) return sale; // adding only, nothing returned
             return TransactionRecord(
-              id: const Uuid().v4(),
+              // Never saved itself: its E-BILL link opens the new sale.
+              id: exchangeSaleId,
               invoiceNumber: _reversalInvoice(picked!, exchange: true),
               customerName: picked!.customerName,
               customerPhone: picked!.customerPhone,
@@ -12650,6 +13677,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       qtyByIndex: safe,
                       paymentMethod: payMethod,
                       exchange: isExchange(),
+                      id: reversalId,
                     );
               final sale = adds.isEmpty
                   ? null
@@ -12659,6 +13687,7 @@ class _BillingScreenState extends State<BillingScreen> {
                       invoiceNumber: exchangeSaleInvoice,
                       customerName: picked!.customerName,
                       customerPhone: picked!.customerPhone,
+                      id: exchangeSaleId,
                     );
 
               // Nothing left to record — the goods were returned elsewhere.
@@ -14592,6 +15621,22 @@ class _BillingScreenState extends State<BillingScreen> {
         'https://billcat.in/invoices/${first6(rawUid)}'
         '${_branchNumber.padLeft(2, '0')}${first6(tx.id)}';
 
+    // Web link (Settings → WhatsApp): a chat opens from the shop's own
+    // WhatsApp with the message and View Bill link ready, and the cashier
+    // presses Send. Only the link goes, no PDF. A quotation is never saved,
+    // so it has no bill page for that link to open: it still goes the
+    // BillCat WhatsApp way, with its PDF.
+    if (_waSendMode == 'link' && docType != 'Quotation') {
+      await _openEbillChat(
+        tx,
+        phone,
+        invoiceNo: invoiceNo,
+        invoiceLink: invoiceLink,
+        docType: docType,
+      );
+      return;
+    }
+
     // Sent through Meta's WhatsApp API with the approved invoice template, so
     // it reaches a customer who has never messaged the shop. Every shop uses
     // the one number built into BillCat, through BillCat's relay: the service
@@ -14651,6 +15696,55 @@ class _BillingScreenState extends State<BillingScreen> {
     } catch (e) {
       if (mounted) _showToast('WhatsApp error: $e', isError: true);
     }
+  }
+
+  /// Opens a WhatsApp chat (wa.me) to the customer with the e-bill message
+  /// ready to send from the shop's own WhatsApp: the bill's number, amount,
+  /// date and View Bill link, and the group link when that button is on.
+  Future<void> _openEbillChat(
+    TransactionRecord tx,
+    String phone, {
+    required String invoiceNo,
+    required String invoiceLink,
+    required String docType,
+  }) async {
+    final number = _waNumber(phone);
+    if (number.isEmpty) {
+      _showToast('No customer phone number to send to.', isError: true);
+      return;
+    }
+    final name = (tx.customerName ?? '').trim();
+    final store = _storeName.trim().isEmpty ? 'BillCat' : _storeName.trim();
+    final d = tx.createdAt;
+    final group = _waGroupButtonOn ? _waGroupLink.trim() : '';
+    final msg = [
+      'Hi ${name.isEmpty ? 'there' : name},',
+      'Thank you for shopping at $store!',
+      'Your $docType #$invoiceNo for ${_fmt(tx.total)} dated '
+          '${d.day}/${d.month}/${d.year}.',
+      '',
+      'View bill: $invoiceLink',
+      if (group.isNotEmpty) 'Join our WhatsApp group: $group',
+    ].join('\n');
+    var ok = false;
+    try {
+      // As the group invites do: a Uri so the message is encoded properly,
+      // opened externally so Windows hands it to WhatsApp Desktop, or
+      // WhatsApp Web when the app is not installed. Windows throws for most
+      // launch failures rather than returning false.
+      ok = await launchUrl(
+        Uri(
+          scheme: 'https',
+          host: 'wa.me',
+          path: '/$number',
+          queryParameters: {'text': msg},
+        ),
+        mode: LaunchMode.externalApplication,
+      );
+    } catch (_) {
+      ok = false;
+    }
+    if (!ok && mounted) _showToast('Could not open WhatsApp', isError: true);
   }
 
   void _showAddCustomerDialog(CartProvider cart) {
@@ -28614,6 +29708,35 @@ class _BillingScreenState extends State<BillingScreen> {
   /// Payment. The cards, the cash/bank split and the history all follow it.
   bool _salesGstOnly = false;
 
+  /// The Sales page's subtitle: the period being shown rather than today's
+  /// date — "Today", "This Week", the month's name, or a custom range's
+  /// dates ("1 Nov – 15 Nov 2026"; one day reads as that date).
+  String _salesPeriodTitle() {
+    const months = [
+      'January', 'February', 'March', 'April', 'May', 'June', 'July',
+      'August', 'September', 'October', 'November', 'December',
+    ];
+    final now = DateTime.now();
+    switch (_reportSalesPeriod) {
+      case 'Today':
+        return 'Today';
+      case 'This Week':
+        return 'This Week';
+      case 'This Month':
+        return '${months[now.month - 1]} ${now.year}';
+    }
+    final r = _customSalesRange;
+    if (r == null) return _customPeriodLabel;
+    final a = r.start, b = r.end;
+    if (a.year == b.year && a.month == b.month && a.day == b.day) {
+      return _fmtDMY(a);
+    }
+    return a.year == b.year
+        ? '${a.day} ${_monthName(a.month)} – ${b.day} ${_monthName(b.month)} '
+              '${b.year}'
+        : '${_fmtDMY(a)} – ${_fmtDMY(b)}';
+  }
+
   Widget _buildReportsView() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(28),
@@ -28633,19 +29756,36 @@ class _BillingScreenState extends State<BillingScreen> {
                       color: AppColors.textDark,
                     ),
                   ),
-                  Text(
-                    _fmtDate(DateTime.now()),
-                    style: GoogleFonts.inter(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w300,
-                      color: AppColors.textMuted,
+                  // Only Sales covers a period; Customers, Inventory and
+                  // Dealers show no date under their title.
+                  if (_reportView == 'Sales')
+                    Text(
+                      _salesPeriodTitle(),
+                      style: GoogleFonts.inter(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w300,
+                        color: AppColors.textMuted,
+                      ),
                     ),
-                  ),
                 ],
               ),
               const Spacer(),
               if (_reportView == 'Sales') ...[
+                // ‹ Today ›: the day before / after the one shown.
+                _dayStepBtn(
+                  Icons.chevron_left_rounded,
+                  'Previous day',
+                  () => _stepSalesDay(-1),
+                ),
+                const SizedBox(width: 4),
                 _reportPeriodBtn('Today'),
+                const SizedBox(width: 4),
+                _dayStepBtn(
+                  Icons.chevron_right_rounded,
+                  'Next day',
+                  // There's no day after today.
+                  _shownSalesDayIsToday() ? null : () => _stepSalesDay(1),
+                ),
                 const SizedBox(width: 6),
                 _reportPeriodBtn('This Week'),
                 const SizedBox(width: 6),
@@ -30820,6 +31960,360 @@ class _BillingScreenState extends State<BillingScreen> {
     ConnectivityService.instance.syncNow();
   }
 
+  /// Security's Change Passcode: the passcode in use first, so whoever is at
+  /// the till can't change it; "Forgot passcode?" under it is the way in
+  /// when it's forgotten ([_forgotOwnerPasscode]).
+  Future<void> _changeOwnerPasscode() async {
+    if (_ownerPasscode.isEmpty) {
+      _showSetPasscodeDialog();
+      return;
+    }
+    if (await _confirmOwnerPasscode() && mounted) _showSetPasscodeDialog();
+  }
+
+  /// Staff Mode is on and the owner hasn't unlocked: owner-only settings
+  /// (Data, the UPI ID on bills) ask for the passcode first.
+  bool get _staffLocked => _ownerLockEnabled && !_isOwnerMode;
+
+  /// The owner passcode, then owner access, as the top bar's lock does; true
+  /// when it's typed right, or when nothing is locked.
+  Future<bool> _unlockOwnerAccess() async {
+    if (!_staffLocked || _ownerPasscode.isEmpty) return true;
+    final ok = await _confirmOwnerPasscode(
+      title: 'Owner Access',
+      subtitle: 'Enter the owner passcode',
+    );
+    if (ok && mounted) setState(() => _isOwnerMode = true);
+    return ok;
+  }
+
+  /// Opens a Settings page from the sidebar or "Find a setting". Data (the
+  /// resets and the Recycle Bin) is owner-only while Staff Mode is locked.
+  Future<void> _openSettingsPage(String label) async {
+    if (label == 'Data' && !await _unlockOwnerAccess()) return;
+    if (mounted) setState(() => _settingsPage = label);
+  }
+
+  /// A UPI ID staff can see but not change while Staff Mode is locked (bills'
+  /// pay-by-UPI QR pays it). A click asks for the owner passcode, which
+  /// unlocks owner access; [onUnlocked] then redraws the editable field.
+  Widget _lockedUpiRow(
+    String upi, {
+    required String label,
+    required VoidCallback onUnlocked,
+  }) {
+    return Tooltip(
+      message: 'Owner passcode needed to change the UPI ID',
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: () async {
+            if (await _unlockOwnerAccess() && mounted) onUnlocked();
+          },
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    style: GoogleFonts.inter(
+                      fontSize: 14,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ),
+                Flexible(
+                  child: Text(
+                    upi.isEmpty ? 'Not set' : upi,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.inter(
+                      fontSize: 13.5,
+                      color: AppColors.textMuted,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                const Icon(
+                  Icons.lock_outline_rounded,
+                  size: 16,
+                  color: AppColors.textMuted,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Asks for the owner passcode in use now (Change Passcode, turning Staff
+  /// Mode off); true once it's typed right, false if the box is closed.
+  Future<bool> _confirmOwnerPasscode({
+    String title = 'Current Passcode',
+    String subtitle = 'Enter the passcode in use now',
+  }) async {
+    final enteredDigits = ValueNotifier<String>('');
+    // One check per four digits, however often the dialog rebuilds.
+    var checking = false;
+    final ok = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => ValueListenableBuilder<String>(
+        valueListenable: enteredDigits,
+        builder: (ctx, entered, _) {
+          if (entered.length == 4 && !checking) {
+            checking = true;
+            Future.microtask(() {
+              if (!ctx.mounted) return;
+              if (entered == _ownerPasscode) {
+                Navigator.pop(ctx, true);
+              } else {
+                checking = false;
+                enteredDigits.value = '';
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  const SnackBar(
+                    content: Text('Incorrect passcode'),
+                    duration: Duration(seconds: 1),
+                  ),
+                );
+              }
+            });
+          }
+          return _buildPasscodeDialog(title, subtitle, enteredDigits, ctx);
+        },
+      ),
+    );
+    return ok == true;
+  }
+
+  /// Security's "Forgot passcode?": proves it's the owner the Forgot password
+  /// way, with a 6-digit code emailed to the BillCat account, then sets a new
+  /// passcode without asking for the old one.
+  Future<void> _forgotOwnerPasscode() async {
+    final email = (Supabase.instance.client.auth.currentUser?.email ?? '')
+        .trim()
+        .toLowerCase();
+    if (email.isEmpty) return;
+    _showToast('Sending a code to $email…');
+    final err = await _emailResetCode(email);
+    if (!mounted) return;
+    if (err != null) {
+      _showToast(err, isError: true);
+      return;
+    }
+    if (await _showEmailCodeDialog(email) && mounted) _showSetPasscodeDialog();
+  }
+
+  /// Asks for the 6-digit code emailed to [email] and checks it with
+  /// Supabase; true once it's right. A right code signs the same account in
+  /// again, so the app carries on as it was. [then] is what comes next, for
+  /// the line under the [title].
+  Future<bool> _showEmailCodeDialog(
+    String email, {
+    String title = 'Forgot passcode',
+    String then = 'choose a new passcode',
+  }) async {
+    final ctrl = TextEditingController();
+    var busy = false;
+    String? error;
+    String? note;
+    final ok = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          Future<void> verify() async {
+            final code = ctrl.text.trim();
+            if (busy || code.length != 6) return;
+            setLocal(() {
+              busy = true;
+              error = null;
+              note = null;
+            });
+            try {
+              await SupabaseService.verifyRecoveryOtp(email, code);
+              // The right code swaps in a new session but tells live sync
+              // nothing (only a sign-in or refresh does), so it would keep
+              // the old token until it runs out. A refresh hands it on.
+              try {
+                await Supabase.instance.client.auth.refreshSession();
+              } catch (_) {}
+              if (ctx.mounted) Navigator.pop(ctx, true);
+            } on AuthRetryableFetchException catch (e) {
+              if (ctx.mounted) {
+                setLocal(() {
+                  busy = false;
+                  error = e.statusCode == null
+                      ? 'Could not check the code — check the internet '
+                            'connection'
+                      : 'Could not check the code right now — try again '
+                            'in a few minutes';
+                });
+              }
+            } on AuthException {
+              if (ctx.mounted) {
+                setLocal(() {
+                  busy = false;
+                  error = 'Wrong or expired code. Try again.';
+                });
+              }
+            } catch (_) {
+              if (ctx.mounted) {
+                setLocal(() {
+                  busy = false;
+                  error =
+                      'Could not check the code — check the internet '
+                      'connection';
+                });
+              }
+            }
+          }
+
+          Future<void> resend() async {
+            setLocal(() {
+              busy = true;
+              error = null;
+              note = null;
+            });
+            final err = await _emailResetCode(email);
+            if (!ctx.mounted) return;
+            setLocal(() {
+              busy = false;
+              if (err == null) {
+                note = 'A new code was sent';
+                ctrl.clear();
+              } else {
+                error = err;
+              }
+            });
+          }
+
+          return AlertDialog(
+            backgroundColor: Colors.white,
+            surfaceTintColor: Colors.transparent,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+            title: Text(
+              title,
+              style: GoogleFonts.manrope(
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            content: SizedBox(
+              width: 340,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    'Enter the 6-digit code emailed to $email, then $then.',
+                    style: GoogleFonts.inter(
+                      fontSize: 13.5,
+                      height: 1.4,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: ctrl,
+                    autofocus: true,
+                    readOnly: busy,
+                    keyboardType: TextInputType.number,
+                    maxLength: 6,
+                    textAlign: TextAlign.center,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    style: GoogleFonts.manrope(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 8,
+                      color: AppColors.textDark,
+                    ),
+                    decoration: InputDecoration(
+                      counterText: '',
+                      hintText: '000000',
+                      hintStyle: GoogleFonts.manrope(
+                        fontSize: 22,
+                        letterSpacing: 8,
+                        color: const Color(0xFFCCCCCC),
+                      ),
+                      errorText: error,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    onChanged: (_) {
+                      if (error != null || note != null) {
+                        setLocal(() {
+                          error = null;
+                          note = null;
+                        });
+                      }
+                    },
+                    onSubmitted: (_) => verify(),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      TextButton(
+                        onPressed: busy ? null : resend,
+                        child: Text(
+                          'Send the code again',
+                          style: GoogleFonts.inter(fontSize: 12.5),
+                        ),
+                      ),
+                      if (note != null)
+                        Text(
+                          note!,
+                          style: GoogleFonts.inter(
+                            fontSize: 12,
+                            color: AppColors.success,
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: busy ? null : () => Navigator.pop(ctx, false),
+                child: Text('Cancel', style: GoogleFonts.inter(fontSize: 13)),
+              ),
+              FilledButton(
+                onPressed: busy ? null : verify,
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.primary,
+                ),
+                child: busy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : Text(
+                        'Verify',
+                        style: GoogleFonts.inter(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    return ok == true;
+  }
+
   Widget _buildPasscodeDialog(
     String title,
     String subtitle,
@@ -32218,8 +33712,78 @@ class _BillingScreenState extends State<BillingScreen> {
     );
   }
 
+  /// The single day the Sales page shows: today on Today, or the day of a
+  /// one-day custom period. Null for a week, month or longer range.
+  DateTime? _shownSalesDay() {
+    final now = DateTime.now();
+    if (_reportSalesPeriod == 'Today') {
+      return DateTime(now.year, now.month, now.day);
+    }
+    final r = _customSalesRange;
+    if (_reportSalesPeriod == 'Custom' &&
+        r != null &&
+        r.start.year == r.end.year &&
+        r.start.month == r.end.month &&
+        r.start.day == r.end.day) {
+      return DateTime(r.start.year, r.start.month, r.start.day);
+    }
+    return null;
+  }
+
+  bool _shownSalesDayIsToday() {
+    final d = _shownSalesDay();
+    final now = DateTime.now();
+    return d != null &&
+        d.year == now.year &&
+        d.month == now.month &&
+        d.day == now.day;
+  }
+
+  /// ‹ / › beside Today: the day before or after the one shown (from a week,
+  /// month or range it starts from today). Coming back to today shows Today
+  /// again; there is no day after it.
+  Future<void> _stepSalesDay(int delta) async {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final base = _shownSalesDay() ?? today;
+    final day = DateTime(base.year, base.month, base.day + delta);
+    if (!day.isBefore(today)) {
+      setState(() => _reportSalesPeriod = 'Today');
+      return;
+    }
+    _salesDayStep = true;
+    await _applyCustomRange(day, day, _fmtDMY(day));
+  }
+
+  Widget _dayStepBtn(IconData icon, String tooltip, VoidCallback? onTap) {
+    return Tooltip(
+      message: tooltip,
+      waitDuration: const Duration(milliseconds: 600),
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 32,
+          height: 33,
+          decoration: BoxDecoration(
+            color: AppColors.surfaceVariant,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: AppColors.border),
+          ),
+          child: Icon(
+            icon,
+            size: 18,
+            color: onTap == null
+                ? AppColors.border
+                : AppColors.textMuted,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _customPeriodBtn() {
-    final active = _reportSalesPeriod == 'Custom';
+    // A day reached with ‹ › isn't a Custom pick: the box stays plain.
+    final active = _reportSalesPeriod == 'Custom' && !_salesDayStep;
     return GestureDetector(
       onTap: _pickCustomPeriod,
       child: Container(
@@ -32263,6 +33827,7 @@ class _BillingScreenState extends State<BillingScreen> {
       ),
     );
     if (result == null || !mounted) return;
+    _salesDayStep = false;
     await _applyCustomRange(result.range.start, result.range.end, result.label);
   }
 
@@ -32649,6 +34214,112 @@ class _NavHoverTabState extends State<_NavHoverTab> {
 }
 
 // Hover-aware category chip
+/// The billing screen's left column: the search bar and category chips over
+/// the product grid. While the products are scrolled down, the first
+/// [headerCount] children slide up out of sight and the grid below grows into
+/// their space; scrolling back up brings them back, and [forceShow] keeps
+/// them. Hidden, they stay built, so the search box keeps its focus and
+/// barcode scans still land in it.
+class _CollapsingHeaderColumn extends StatefulWidget {
+  const _CollapsingHeaderColumn({
+    required this.headerCount,
+    required this.forceShow,
+    required this.children,
+  });
+
+  final int headerCount;
+  final bool forceShow;
+  final List<Widget> children;
+
+  @override
+  State<_CollapsingHeaderColumn> createState() =>
+      _CollapsingHeaderColumnState();
+}
+
+class _CollapsingHeaderColumnState extends State<_CollapsingHeaderColumn> {
+  final _headerKey = GlobalKey();
+  bool _hidden = false;
+
+  @override
+  void didUpdateWidget(covariant _CollapsingHeaderColumn old) {
+    super.didUpdateWidget(old);
+    // Brought back by typing or the chips' cursor: stays back afterwards
+    // rather than sliding away again under the cashier.
+    if (widget.forceShow) _hidden = false;
+  }
+
+  void _show() {
+    if (_hidden) setState(() => _hidden = false);
+  }
+
+  // Only the grid's own vertical scrolling counts, not the chips' row.
+  bool _isGrid(ScrollMetrics m, int depth) =>
+      depth == 0 && m.axis == Axis.vertical;
+
+  bool _onScroll(ScrollNotification n) {
+    if (!_isGrid(n.metrics, n.depth)) return false;
+    if (n is UserScrollNotification) {
+      if (n.direction == ScrollDirection.reverse && !_hidden) {
+        // Only when the grid still scrolls with the header gone; otherwise
+        // the taller grid would snap back to the top and bring it back.
+        final header = _headerKey.currentContext?.size?.height ?? 0;
+        if (n.metrics.maxScrollExtent > header) {
+          setState(() => _hidden = true);
+        }
+      } else if (n.direction == ScrollDirection.forward) {
+        _show();
+      }
+    } else if (n is ScrollEndNotification &&
+        n.metrics.pixels <= n.metrics.minScrollExtent) {
+      _show();
+    }
+    return false;
+  }
+
+  // The products changed so the grid no longer scrolls, or it is back at
+  // the top: nothing would bring the header back, so show it now.
+  bool _onMetrics(ScrollMetricsNotification n) {
+    if (_isGrid(n.metrics, n.depth) &&
+        (n.metrics.maxScrollExtent <= 0 ||
+            n.metrics.pixels <= n.metrics.minScrollExtent)) {
+      _show();
+    }
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hidden = _hidden && !widget.forceShow;
+    return NotificationListener<ScrollMetricsNotification>(
+      onNotification: _onMetrics,
+      child: NotificationListener<ScrollNotification>(
+        onNotification: _onScroll,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ClipRect(
+              child: AnimatedAlign(
+                // Bottom-anchored, so the header slides up under the edge.
+                alignment: Alignment.bottomLeft,
+                heightFactor: hidden ? 0 : 1,
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOutCubic,
+                child: Column(
+                  key: _headerKey,
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: widget.children.sublist(0, widget.headerCount),
+                ),
+              ),
+            ),
+            ...widget.children.sublist(widget.headerCount),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _CategoryChip extends StatefulWidget {
   final String label;
   final bool selected;
@@ -33761,6 +35432,444 @@ class _CartRowState extends State<_CartRow> {
 // Settings row input. Uses a real controller (not `initialValue`) so the caret
 // isn't stuck at offset 0 — with right-aligned text that made typing insert
 // before the existing value instead of replacing it. Focusing selects all.
+/// What [_BillingScreenState._settingsDivider] returns: draws nothing, and
+/// a settings card leaves it out (each row is its own tile).
+class _SettingsDividerMark extends StatelessWidget {
+  const _SettingsDividerMark();
+  @override
+  Widget build(BuildContext context) => const SizedBox.shrink();
+}
+
+/// A Settings pick-list box (Profile's Nationality and State), drawn like
+/// [_SettingsInput]. Click it for the list; there, typing jumps to the first
+/// entry starting with what's typed, the same letter again steps to the next
+/// one, the arrows move, Enter picks and Esc closes, as in Windows lists.
+class _SettingsSelect extends StatefulWidget {
+  final String value;
+
+  /// (value, shown as) pairs, in list order.
+  final List<(String, String)> options;
+  final String hint;
+  final ValueChanged<String> onChanged;
+  const _SettingsSelect({
+    required this.value,
+    required this.options,
+    required this.hint,
+    required this.onChanged,
+  });
+  @override
+  State<_SettingsSelect> createState() => _SettingsSelectState();
+}
+
+class _SettingsSelectState extends State<_SettingsSelect> {
+  final _focus = FocusNode();
+  bool _open = false;
+  bool _hover = false;
+  bool _focused = false;
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
+  Future<void> _openList() async {
+    if (_open || widget.options.isEmpty) return;
+    final nav = Navigator.of(context);
+    final box = context.findRenderObject() as RenderBox?;
+    final overlay = nav.overlay?.context.findRenderObject() as RenderBox?;
+    if (box == null || overlay == null) return;
+    final anchor = box.localToGlobal(Offset.zero, ancestor: overlay) & box.size;
+    setState(() => _open = true);
+    // A route of its own, like Flutter's dropdown menus, so the billing
+    // screen's keyboard handling (scanner, grid arrows) stands aside while
+    // the list is up and the typed letters reach it.
+    final picked = await nav.push(
+      _SettingsSelectRoute(
+        anchor: anchor,
+        options: widget.options,
+        selected: widget.value,
+        barrierLabel: MaterialLocalizations.of(
+          context,
+        ).modalBarrierDismissLabel,
+      ),
+    );
+    if (!mounted) return;
+    setState(() => _open = false);
+    // Back on the box, as a Windows combo box keeps focus, so Tab and the
+    // arrows carry on from here rather than from the top of the page.
+    _focus.requestFocus();
+    if (picked != null && picked != widget.value) widget.onChanged(picked);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final shown = widget.options
+        .firstWhere(
+          (o) => o.$1 == widget.value,
+          orElse: () => (widget.value, widget.value),
+        )
+        .$2;
+    // Enter or Space on the focused box opens the list, as on Windows.
+    return FocusableActionDetector(
+      focusNode: _focus,
+      mouseCursor: SystemMouseCursors.click,
+      onShowHoverHighlight: (v) => setState(() => _hover = v),
+      onFocusChange: (v) => setState(() => _focused = v),
+      actions: {
+        ActivateIntent: CallbackAction<ActivateIntent>(
+          onInvoke: (_) {
+            _openList();
+            return null;
+          },
+        ),
+      },
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _openList,
+        child: InputDecorator(
+          isFocused: _open || _focused,
+          isHovering: _hover,
+          isEmpty: widget.value.isEmpty,
+          decoration: InputDecoration(
+            hintText: widget.hint,
+            hintStyle: GoogleFonts.inter(
+              fontSize: 13.5,
+              color: const Color(0xFFB0B7C3),
+            ),
+            isDense: true,
+            filled: true,
+            fillColor: Colors.white,
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 12,
+              vertical: 11,
+            ),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: AppColors.border),
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: AppColors.border),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(
+                color: AppColors.primary,
+                width: 1.5,
+              ),
+            ),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  shown,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  // On the theme's bodyLarge, as a TextField sets its text,
+                  // so the letter spacing and line height match the boxes.
+                  style: Theme.of(context).textTheme.bodyLarge?.merge(
+                        GoogleFonts.inter(
+                          fontSize: 13.5,
+                          color: AppColors.textDark,
+                        ),
+                      ) ??
+                      GoogleFonts.inter(
+                        fontSize: 13.5,
+                        color: AppColors.textDark,
+                      ),
+                ),
+              ),
+              const Icon(
+                Icons.keyboard_arrow_down_rounded,
+                size: 16,
+                color: AppColors.textMuted,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The open list of a [_SettingsSelect]: under its box (above it when the
+/// box is near the bottom of the window) and as wide as it.
+class _SettingsSelectRoute extends PopupRoute<String> {
+  _SettingsSelectRoute({
+    required this.anchor,
+    required this.options,
+    required this.selected,
+    required this.barrierLabel,
+  });
+
+  final Rect anchor;
+  final List<(String, String)> options;
+  final String selected;
+  @override
+  final String barrierLabel;
+
+  @override
+  Color? get barrierColor => null;
+
+  @override
+  bool get barrierDismissible => true;
+
+  @override
+  Duration get transitionDuration => const Duration(milliseconds: 100);
+
+  @override
+  Widget buildPage(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+  ) => _SettingsSelectList(
+    anchor: anchor,
+    options: options,
+    selected: selected,
+  );
+
+  @override
+  Widget buildTransitions(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) => FadeTransition(opacity: animation, child: child);
+}
+
+class _SettingsSelectList extends StatefulWidget {
+  final Rect anchor;
+  final List<(String, String)> options;
+  final String selected;
+  const _SettingsSelectList({
+    required this.anchor,
+    required this.options,
+    required this.selected,
+  });
+  @override
+  State<_SettingsSelectList> createState() => _SettingsSelectListState();
+}
+
+class _SettingsSelectListState extends State<_SettingsSelectList>
+    with WidgetsBindingObserver {
+  static const _rowHeight = 36.0;
+  static const _pad = 4.0;
+  static const _maxHeight = 360.0;
+
+  final _scroll = ScrollController();
+  // The entry Enter picks: the current choice at first, then wherever
+  // typing or the arrows move it.
+  late int _active = widget.options.indexWhere((o) => o.$1 == widget.selected);
+  String _typed = '';
+  DateTime _typedAt = DateTime(0);
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Open with the current choice in the middle of the list.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _active >= 0) _reveal(_active, center: true);
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  // The window was resized: the list would no longer sit under its box.
+  @override
+  void didChangeMetrics() {
+    if (ModalRoute.of(context)?.isCurrent == true) Navigator.pop(context);
+  }
+
+  /// Scrolls entry [i] into view: to the middle when the list opens, to the
+  /// top after a typed jump, and only as far as needed for the arrows.
+  void _reveal(int i, {bool center = false, bool top = false}) {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    final y = _pad + i * _rowHeight;
+    double? to;
+    if (center) {
+      to = y - (pos.viewportDimension - _rowHeight) / 2;
+    } else if (top || y < pos.pixels) {
+      to = y - _pad;
+    } else if (y + _rowHeight > pos.pixels + pos.viewportDimension) {
+      to = y + _rowHeight + _pad - pos.viewportDimension;
+    }
+    if (to != null) {
+      pos.jumpTo(to.clamp(pos.minScrollExtent, pos.maxScrollExtent));
+    }
+  }
+
+  void _moveTo(int i, {bool jump = false}) {
+    setState(() => _active = i);
+    _reveal(i, top: jump);
+  }
+
+  /// Letters typed close together spell the start of an entry; the same
+  /// letter again steps to the next entry starting with it.
+  void _typeAhead(String ch) {
+    final now = DateTime.now();
+    if (now.difference(_typedAt) > const Duration(seconds: 1)) _typed = '';
+    _typedAt = now;
+    // A space only counts inside a word ("Tamil N…").
+    if (_typed.isEmpty && ch.trim().isEmpty) return;
+    _typed += ch.toLowerCase();
+    final names = [for (final o in widget.options) o.$1.toLowerCase()];
+    final first = _typed[0];
+    var hit = -1;
+    if (_typed.split('').every((c) => c == first)) {
+      for (var k = 1; k <= names.length; k++) {
+        final i = (_active + k) % names.length;
+        if (names[i].startsWith(first)) {
+          hit = i;
+          break;
+        }
+      }
+    } else {
+      hit = names.indexWhere((n) => n.startsWith(_typed));
+    }
+    if (hit >= 0) _moveTo(hit, jump: true);
+  }
+
+  KeyEventResult _onKey(FocusNode node, KeyEvent e) {
+    if (e is KeyUpEvent) return KeyEventResult.ignored;
+    final last = widget.options.length - 1;
+    final key = e.logicalKey;
+    if (key == LogicalKeyboardKey.arrowDown) {
+      _moveTo((_active + 1).clamp(0, last));
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) {
+      _moveTo((_active - 1).clamp(0, last));
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.home || key == LogicalKeyboardKey.end) {
+      _moveTo(key == LogicalKeyboardKey.home ? 0 : last);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter) {
+      if (e is KeyDownEvent && _active >= 0) {
+        Navigator.pop(context, widget.options[_active].$1);
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.escape) {
+      if (e is KeyDownEvent) Navigator.pop(context);
+      return KeyEventResult.handled;
+    }
+    final ch = e.character;
+    if (e is KeyDownEvent &&
+        ch != null &&
+        ch.length == 1 &&
+        !HardwareKeyboard.instance.isControlPressed &&
+        !HardwareKeyboard.instance.isAltPressed) {
+      _typeAhead(ch);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Widget _row(int i) {
+    final (value, shown) = widget.options[i];
+    final isCurrent = value == widget.selected;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      child: Material(
+        color: i == _active ? const Color(0xFFE9E9E9) : Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          canRequestFocus: false,
+          borderRadius: BorderRadius.circular(6),
+          hoverColor: const Color(0xFFF2F2F2),
+          onTap: () => Navigator.pop(context, value),
+          child: Row(
+            children: [
+              // Accent pill on the current choice, as in the Settings menu.
+              Container(
+                width: 3,
+                height: 16,
+                margin: const EdgeInsets.only(left: 2, right: 9),
+                decoration: BoxDecoration(
+                  color: isCurrent ? AppColors.primary : Colors.transparent,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              Expanded(
+                child: Text(
+                  shown,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.inter(
+                    fontSize: 13.5,
+                    fontWeight: isCurrent ? FontWeight.w600 : FontWeight.w400,
+                    color: AppColors.textDark,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, c) {
+        final a = widget.anchor;
+        final want = (widget.options.length * _rowHeight + _pad * 2).clamp(
+          0.0,
+          _maxHeight,
+        );
+        final below = c.maxHeight - a.bottom - 12;
+        final above = a.top - 12;
+        final down = below >= want || below >= above;
+        final height = (down ? below : above).clamp(0.0, want);
+        return Stack(
+          children: [
+            Positioned(
+              left: a.left,
+              top: down ? a.bottom + 4 : a.top - 4 - height,
+              width: a.width,
+              height: height,
+              child: Focus(
+                autofocus: true,
+                onKeyEvent: _onKey,
+                child: Material(
+                  color: Colors.white,
+                  elevation: 8,
+                  shadowColor: Colors.black38,
+                  clipBehavior: Clip.antiAlias,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: const BorderSide(color: Color(0xFFE5E5E5)),
+                  ),
+                  child: ListView.builder(
+                    controller: _scroll,
+                    padding: const EdgeInsets.symmetric(vertical: _pad),
+                    itemExtent: _rowHeight,
+                    itemCount: widget.options.length,
+                    itemBuilder: (context, i) => _row(i),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 class _SettingsInput extends StatefulWidget {
   final String value;
   final ValueChanged<String> onChanged;
@@ -33827,20 +35936,34 @@ class _SettingsInputState extends State<_SettingsInput> {
       keyboardType: widget.keyboardType,
       maxLines: widget.obscureText ? 1 : widget.maxLines,
       obscureText: widget.obscureText,
-      style: GoogleFonts.inter(fontSize: 13.5, color: const Color(0xFF1D1D1F)),
+      style: GoogleFonts.inter(fontSize: 13.5, color: AppColors.textDark),
+      // An outlined box under its label (Settings' clean layout).
       decoration: InputDecoration(
-        border: InputBorder.none,
         hintText: widget.hintText,
         hintStyle: GoogleFonts.inter(
           fontSize: 13.5,
-          color: const Color(0xFFC7C7CC),
+          color: const Color(0xFFB0B7C3),
         ),
         isDense: true,
-        contentPadding: widget.maxLines > 1
-            ? const EdgeInsets.symmetric(vertical: 4)
-            : EdgeInsets.zero,
+        filled: true,
+        fillColor: Colors.white,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 12,
+          vertical: 11,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: AppColors.border),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: AppColors.border),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: AppColors.primary, width: 1.5),
+        ),
       ),
-      textAlign: TextAlign.right,
     );
   }
 }

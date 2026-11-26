@@ -25,6 +25,16 @@ static Future<AuthResponse> signIn(String email, String password) async {
     await client.auth.resetPasswordForEmail(email.trim().toLowerCase());
   }
 
+  /// Checks the 6-digit code from a password-reset email. A right code signs
+  /// the user in for the reset, so the new password can then be saved.
+  static Future<void> verifyRecoveryOtp(String email, String token) async {
+    await client.auth.verifyOTP(
+      email: email.trim().toLowerCase(),
+      token: token.trim(),
+      type: OtpType.recovery,
+    );
+  }
+
   static Future<bool> emailExists(String email) async {
     final result = await client.rpc(
       'check_email_exists',

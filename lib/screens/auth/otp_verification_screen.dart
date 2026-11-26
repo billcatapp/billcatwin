@@ -6,13 +6,22 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../constants/app_colors.dart';
 import '../../services/supabase_service.dart';
 import 'complete_profile_screen.dart';
+import 'forgot_password_screen.dart';
 import 'login_screen.dart';
+import 'reset_password_screen.dart';
 
 class OtpVerificationScreen extends StatefulWidget {
   final String? email;
   final String? phone;
-  const OtpVerificationScreen({super.key, this.email, this.phone})
-      : assert(email != null || phone != null,
+  /// The code is from a password-reset email: a right code leads on to
+  /// setting a new password instead of finishing sign-up.
+  final bool passwordReset;
+  const OtpVerificationScreen({
+    super.key,
+    this.email,
+    this.phone,
+    this.passwordReset = false,
+  }) : assert(email != null || phone != null,
             'Either email or phone must be provided');
 
   bool get isPhone => phone != null;
@@ -80,13 +89,19 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     try {
       if (widget.isPhone) {
         await SupabaseService.verifyPhoneOtp(widget.phone!, code);
+      } else if (widget.passwordReset) {
+        await SupabaseService.verifyRecoveryOtp(widget.email!, code);
       } else {
         await SupabaseService.verifyOtp(widget.email!, code);
       }
       if (!mounted) return;
       Navigator.pushAndRemoveUntil(
         context,
-        MaterialPageRoute(builder: (_) => const CompleteProfileScreen()),
+        MaterialPageRoute(
+          builder: (_) => widget.passwordReset
+              ? const ResetPasswordScreen()
+              : const CompleteProfileScreen(),
+        ),
         (route) => false,
       );
     } on AuthException catch (e) {
@@ -107,6 +122,9 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
     try {
       if (widget.isPhone) {
         await SupabaseService.resendPhoneOtp(widget.phone!);
+      } else if (widget.passwordReset) {
+        // A reset code is resent by asking for a new reset email.
+        await SupabaseService.resetPassword(widget.email!);
       } else {
         await SupabaseService.resendOtp(widget.email!);
       }
@@ -226,7 +244,10 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
                     ),
                     child: Column(
                       children: [
-                        Text('Verification',
+                        Text(
+                            widget.passwordReset
+                                ? 'Reset Password'
+                                : 'Verification',
                             style: GoogleFonts.manrope(
                               fontSize: 24,
                               fontWeight: FontWeight.w800,
@@ -361,10 +382,13 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
                   const SizedBox(height: 24),
                   // Change Email / Number
                   GestureDetector(
+                    // A password reset goes back to entering the email.
                     onTap: () => Navigator.pushAndRemoveUntil(
                       context,
                       MaterialPageRoute(
-                          builder: (_) => const LoginScreen()),
+                          builder: (_) => widget.passwordReset
+                              ? const ForgotPasswordScreen()
+                              : const LoginScreen()),
                       (route) => false,
                     ),
                     child: Row(

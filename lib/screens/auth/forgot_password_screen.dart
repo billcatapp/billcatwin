@@ -4,6 +4,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../constants/app_colors.dart';
 import '../../services/supabase_service.dart';
 import 'login_screen.dart';
+import 'otp_verification_screen.dart';
 
 class ForgotPasswordScreen extends StatefulWidget {
   const ForgotPasswordScreen({super.key});
@@ -16,12 +17,26 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   bool _isLoading = false;
-  bool _emailSent = false;
 
   @override
   void dispose() {
     _emailController.dispose();
     super.dispose();
+  }
+
+  /// The reset email carries a 6-digit code; it is entered on the next
+  /// screen, which then leads on to setting the new password.
+  void _goToCode() {
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => OtpVerificationScreen(
+          email: _emailController.text.trim().toLowerCase(),
+          passwordReset: true,
+        ),
+      ),
+    );
   }
 
   void _submit() async {
@@ -35,16 +50,14 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
         return;
       }
       await SupabaseService.resetPassword(_emailController.text);
-      if (!mounted) return;
-      setState(() => _emailSent = true);
+      _goToCode();
     } on AuthException catch (e) {
       _showError(e.message);
     } catch (_) {
       // If RPC not set up, try sending reset anyway
       try {
         await SupabaseService.resetPassword(_emailController.text);
-        if (!mounted) return;
-        setState(() => _emailSent = true);
+        _goToCode();
       } catch (e) {
         _showError('Failed to send reset email. Please try again.');
       }
@@ -103,7 +116,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                           color: Colors.white,
                         )),
                     const SizedBox(height: 8),
-                    Text("We'll send you a reset link",
+                    Text("We'll email you a reset code",
                         style: GoogleFonts.inter(
                             fontSize: 15, color: Colors.white70)),
                   ],
@@ -118,7 +131,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                 padding: const EdgeInsets.all(48),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 400),
-                  child: _emailSent ? _buildSuccessState() : _buildFormState(),
+                  child: _buildFormState(),
                 ),
               ),
             ),
@@ -141,7 +154,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                 color: AppColors.textDark,
               )),
           const SizedBox(height: 8),
-          Text('Enter your email and we\'ll send you a reset link.',
+          Text('Enter your email and we\'ll send you a 6-digit code.',
               style: GoogleFonts.inter(
                   color: AppColors.textMuted, fontSize: 15, fontWeight: FontWeight.w300)),
           const SizedBox(height: 36),
@@ -200,7 +213,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                       height: 22,
                       child: CircularProgressIndicator(
                           color: Colors.white, strokeWidth: 2.5))
-                  : Text('Send Reset Link',
+                  : Text('Send Code',
                       style: GoogleFonts.inter(
                           fontSize: 15, fontWeight: FontWeight.w700)),
             ),
@@ -219,69 +232,6 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildSuccessState() {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Container(
-          width: 72,
-          height: 72,
-          decoration: BoxDecoration(
-            color: AppColors.success.withValues(alpha: 0.1),
-            shape: BoxShape.circle,
-          ),
-          child: const Icon(Icons.mark_email_read_rounded,
-              color: AppColors.success, size: 36),
-        ),
-        const SizedBox(height: 24),
-        Text('Check your inbox',
-            style: GoogleFonts.manrope(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-                color: AppColors.textDark)),
-        const SizedBox(height: 12),
-        Text(
-          'We sent a password reset link to\n${_emailController.text}',
-          textAlign: TextAlign.center,
-          style: GoogleFonts.inter(
-              color: AppColors.textMuted, fontSize: 14, height: 1.6),
-        ),
-        const SizedBox(height: 36),
-        SizedBox(
-          width: double.infinity,
-          height: 52,
-          child: ElevatedButton(
-            onPressed: () => Navigator.pushAndRemoveUntil(
-              context,
-              MaterialPageRoute(builder: (_) => const LoginScreen()),
-              (route) => false,
-            ),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.primary,
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-              elevation: 0,
-            ),
-            child: Text('Back to Sign In',
-                style: GoogleFonts.inter(
-                    fontSize: 15, fontWeight: FontWeight.w700)),
-          ),
-        ),
-        const SizedBox(height: 16),
-        GestureDetector(
-          onTap: () => setState(() {
-            _emailSent = false;
-            _emailController.clear();
-          }),
-          child: Text("Didn't receive it? Try again",
-              style: GoogleFonts.inter(
-                  color: AppColors.textMuted, fontSize: 13)),
-        ),
-      ],
     );
   }
 }

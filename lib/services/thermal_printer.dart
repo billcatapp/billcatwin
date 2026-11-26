@@ -1,4 +1,5 @@
 import 'dart:ffi';
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 import 'package:win32/win32.dart';
@@ -482,4 +483,107 @@ class ThermalPrinter {
       calloc.free(written);
     }
   }
+}
+
+/// How a Windows printer is doing right now, for the dot beside it in
+/// Printer Settings. [unknown] when Windows couldn't be asked.
+enum PrinterState { ready, printing, offline, error, unknown }
+
+/// A printer's state as the Windows spooler reports it (PRINTER_INFO_2), with
+/// a short label for it ("Ready", "Not connected", "Paper out"…).
+class PrinterStatus {
+  // Status bits, from winspool.h.
+  static const _paused = 0x1;
+  static const _error = 0x2;
+  static const _pendingDeletion = 0x4;
+  static const _paperJam = 0x8;
+  static const _paperOut = 0x10;
+  static const _paperProblem = 0x40;
+  static const _offline = 0x80;
+  static const _ioActive = 0x100;
+  static const _busy = 0x200;
+  static const _printing = 0x400;
+  static const _outputBinFull = 0x800;
+  static const _notAvailable = 0x1000;
+  static const _processing = 0x4000;
+  static const _noToner = 0x40000;
+  static const _userIntervention = 0x100000;
+  static const _outOfMemory = 0x200000;
+  static const _doorOpen = 0x400000;
+  static const _serverUnknown = 0x800000;
+
+  /// PRINTER_ATTRIBUTE_WORK_OFFLINE. Windows sets it when a USB printer is
+  /// unplugged or switched off, while its status still reads "Normal".
+  static const _workOffline = 0x400;
+
+  static ({PrinterState state, String label}) of(String name) {
+    const unknown = (state: PrinterState.unknown, label: '');
+    final pName = name.toNativeUtf16();
+    final phPrinter = calloc<HANDLE>();
+    final needed = calloc<DWORD>();
+    Pointer<Uint8> info = nullptr;
+    try {
+      if (OpenPrinter(pName, phPrinter, nullptr) == 0) {
+        return (state: PrinterState.offline, label: 'Not connected');
+      }
+      final hPrinter = phPrinter.value;
+      try {
+        GetPrinter(hPrinter, 2, nullptr, 0, needed);
+        if (needed.value == 0) return unknown;
+        info = calloc<Uint8>(needed.value);
+        if (GetPrinter(hPrinter, 2, info, needed.value, needed) == 0) {
+          return unknown;
+        }
+        final p = info.cast<PRINTER_INFO_2>().ref;
+        final s = p.Status;
+        if (p.Attributes & _workOffline != 0 ||
+            s & (_offline | _notAvailable | _serverUnknown) != 0) {
+          return (state: PrinterState.offline, label: 'Not connected');
+        }
+        String? problem;
+        if (s & _paperOut != 0) {
+          problem = 'Paper out';
+        } else if (s & _paperJam != 0) {
+          problem = 'Paper jam';
+        } else if (s & _doorOpen != 0) {
+          problem = 'Cover open';
+        } else if (s & _noToner != 0) {
+          problem = 'No ink';
+        } else if (s & _paused != 0) {
+          problem = 'Paused';
+        } else if (s &
+                (_error |
+                    _pendingDeletion |
+                    _paperProblem |
+                    _outputBinFull |
+                    _userIntervention |
+                    _outOfMemory) !=
+            0) {
+          problem = 'Error';
+        }
+        if (problem != null) {
+          return (state: PrinterState.error, label: problem);
+        }
+        if (s & (_printing | _processing | _busy | _ioActive) != 0) {
+          return (state: PrinterState.printing, label: 'Printing');
+        }
+        return (state: PrinterState.ready, label: 'Ready');
+      } finally {
+        ClosePrinter(hPrinter);
+      }
+    } catch (_) {
+      return unknown;
+    } finally {
+      calloc.free(pName);
+      calloc.free(phPrinter);
+      calloc.free(needed);
+      if (info != nullptr) calloc.free(info);
+    }
+  }
+
+  /// Every printer in [names] at once, off the UI thread: a network printer
+  /// can take seconds to answer.
+  static Future<Map<String, ({PrinterState state, String label})>> ofAll(
+    List<String> names,
+  ) => Isolate.run(() => {for (final n in names) n: of(n)});
 }

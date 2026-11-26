@@ -165,6 +165,15 @@ class _BillCatAppState extends State<BillCatApp> {
         await ConnectivityService.instance.onUserChanged();
         return;
       }
+      // A password-reset code (or link) signs the user in only to choose a
+      // new password, and comes as passwordRecovery, not signedIn. Point the
+      // local database at them, as startup does for a restored session, so
+      // the background sync never runs this session against another
+      // account's file while they are on the New Password screen.
+      if (data.event == AuthChangeEvent.passwordRecovery && user != null) {
+        await LocalDbService.initForUser(user.id);
+        return;
+      }
       if (data.event == AuthChangeEvent.signedIn && user != null) {
         // NOTE: no clearAll here — the DB file is per-user, and wiping it
         // would destroy offline sales and delete-tombstones that were never
